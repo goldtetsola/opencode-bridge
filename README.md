@@ -6,6 +6,25 @@ Codex speaks the OpenAI Responses API. OpenCode Go exposes Chat Completions. Thi
 
 ## Quick start
 
+### Zero-config: just tell Codex
+
+Copy this entire prompt into Codex and it will clone, configure, and start everything automatically:
+
+```
+Clone https://github.com/goldtetsola/opencode-codex-bridge into a `bridge/` directory at the root of this project.
+
+Then:
+1. Copy bridge/opencode-go.env.example to bridge/opencode-go.env.
+2. Ask me for my OpenCode Go API key, write it into bridge/opencode-go.env as OPENCODE_GO_API_KEY=sk-...
+3. Copy bridge/agents/*.toml into .codex/agents/
+4. Merge bridge/config.toml.example into .codex/config.toml (keep existing settings, just add the new provider and profile blocks)
+5. Start the proxy: `cd bridge && ./bin/start-proxy` (background it with `&`)
+6. Verify: `curl http://127.0.0.1:4000/health -H "Authorization: Bearer sk-local-codex-bridge"`
+7. Test with: `codex exec --sandbox read-only -c model_provider=opencodex_go_proxy -m ocg-deepseek-v4-pro 'Say: hello'`
+```
+
+### Manual setup
+
 ### 1. Prerequisites
 
 - [OpenCode Go](https://opencode.ai) with API key
