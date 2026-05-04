@@ -172,9 +172,66 @@ The bridge handles:
 
 Also accepts OpenCode-style `opencode-go/<model>` model IDs.
 
+## Model-task matrix
+
+What model to use for what kind of work, based on real usage:
+
+| Model | Best for | Real example | Rate limit |
+|---|---|---|---|
+| DeepSeek V4 Flash | Docs, summaries, mechanical edits, test inventories | "Write a changelog entry for the last 3 commits" | 31K req/5hr — effectively unlimited |
+| DeepSeek V4 Pro | Bounded implementation, debugging, feature work | "Add a test for canonicalizeGroundingValue following existing patterns" | 3.4K req/5hr |
+| Kimi K2.6 | Repo exploration, code review, drafts, fast navigation | "Find every place that calls getJobLifecycle and summarize the call patterns" | 1.1K req/5hr |
+| GPT-5.4 | Implementation where blast radius matters, cross-module changes | "Refactor the publish-bundle hydration to use the new artifact reader" | Usage-based |
+| GPT-5.5 | Architecture, final review, critical paths | "Review this recovery path change for safety" | Usage-based |
+
+## Orchestration pattern
+
+Here's how the models fit together in a Codex session:
+
+```
+┌─────────────────────────────────────┐
+│         GPT-5.5 (orchestrator)      │
+│    Architecture, final review,       │
+│    recovery/auth/schema decisions    │
+└──────────┬──────────┬───────────────┘
+           │          │
+    ┌──────▼───┐  ┌──▼──────────────┐
+    │ GPT-5.4  │  │ OSS via bridge  │
+    │ Bounded  │  │ (OpenCode Go)   │
+    │ impl │    │ │                 │
+    │ review   │  │ ┌─────────────┐ │
+    └──────────┘  │ │ DeepSeek    │ │
+                  │ │ V4 Pro      │ │
+                  │ │ impl, debug │ │
+                  │ └─────────────┘ │
+                  │ ┌─────────────┐ │
+                  │ │ Kimi K2.6   │ │
+                  │ │ explore,    │ │
+                  │ │ review      │ │
+                  │ └─────────────┘ │
+                  │ ┌─────────────┐ │
+                  │ │ DS V4 Flash │ │
+                  │ │ docs,       │ │
+                  │ │ summaries   │ │
+                  │ └─────────────┘ │
+                  └─────────────────┘
+
+GPT-5.5: orchestrator + final review (GPT credits)
+GPT-5.4: bounded implementation (GPT credits)
+OSS models: everything else ($10/month flat)
+```
+
+Three pre-built agent files are provided in `agents/`: copy them into your project's `.codex/agents/`.
+
 ## Agent TOMLs
 
 Three pre-built agent files are provided in `agents/`: copy them into your project's `.codex/agents/`.
+
+| Agent TOML | Model | Reasoning | Sandbox | Use case |
+|---|---|---|---|---|
+| `oss-deepseek-pro.toml` | deepseek-v4-pro | high | workspace-write | Implementation, debugging, analysis |
+| `oss-kimi-rapid.toml` | kimi-k2.6 | high | workspace-write | Fast navigation, review, drafts |
+| `oss-flash-support.toml` | deepseek-v4-flash | medium | read-only | Docs, summaries, mechanical |
 
 ### Creating your own agent
 
