@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  printf 'Usage: %s [--model opencode-go/kimi-k2.6] --task .ai/tasks/<task>.md\n' "$0" >&2
+}
+
+model="opencode-go/kimi-k2.6"
+task=""
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --model)
+      model="${2:-}"
+      shift 2
+      ;;
+    --task)
+      task="${2:-}"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      usage
+      exit 2
+      ;;
+  esac
+done
+
+if [ -z "$task" ] || [ ! -f "$task" ]; then
+  usage
+  exit 2
+fi
+
+task_id="$(basename "$task" .md)"
+result_dir=".ai/results"
+report="$result_dir/${task_id}.scout.report.md"
+mkdir -p "$result_dir"
+
+prompt="$(mktemp)"
+trap 'rm -f "$prompt"' EXIT
+
+{
+  printf 'You are an external OSS scout worker for the Rorschach repo.\n'
+  printf 'Mode: read-only. Do not edit files. Do not run destructive commands.\n'
+  printf 'Use repo tools only to inspect evidence. Prefer concise findings with file paths.\n'
+  printf 'Return markdown with these headings exactly:\n'
+  printf '# OSS Scout Report\nModel\nTask\nFiles inspected\nFindings\nConfidence\nCaveats\nVerification\nEscalation recommendation\n\n'
+  printf 'Task brief follows:\n\n'
+  sed -n '1,240p' "$task"
+} > "$prompt"
+
+pass-cli run --env-file .codex/agents/opencode-go.env -- \
+  opencode run --pure --dangerously-skip-permissions --model "$model" --title "oss-scout:$task_id" < "$prompt" > "$report"
+perl -0pi -e 's/\e\[[0-9;]*[A-Za-z]//g' "$report"
+
+printf '%s\n' "$report"

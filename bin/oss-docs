@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  printf 'Usage: %s [--model opencode-go/deepseek-v4-flash] --task .ai/tasks/<task>.md\n' "$0" >&2
+}
+
+model="opencode-go/deepseek-v4-flash"
+task=""
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --model)
+      model="${2:-}"
+      shift 2
+      ;;
+    --task)
+      task="${2:-}"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      usage
+      exit 2
+      ;;
+  esac
+done
+
+if [ -z "$task" ] || [ ! -f "$task" ]; then
+  usage
+  exit 2
+fi
+
+task_id="$(basename "$task" .md)"
+result_dir=".ai/results"
+report="$result_dir/${task_id}.docs.report.md"
+mkdir -p "$result_dir"
+
+prompt="$(mktemp)"
+trap 'rm -f "$prompt"' EXIT
+
+{
+  printf 'You are an external OSS documentation worker for the Rorschach repo.\n'
+  printf 'Default mode: report-only. Do not edit files unless the task explicitly assigns docs/ or markdown files.\n'
+  printf 'Return markdown with these headings exactly:\n'
+  printf '# OSS Docs Report\nModel\nTask\nFiles inspected\nDraft output\nConfidence\nCaveats\nVerification\nEscalation recommendation\n\n'
+  printf 'Task brief follows:\n\n'
+  sed -n '1,240p' "$task"
+} > "$prompt"
+
+pass-cli run --env-file .codex/agents/opencode-go.env -- \
+  opencode run --pure --dangerously-skip-permissions --model "$model" --title "oss-docs:$task_id" < "$prompt" > "$report"
+perl -0pi -e 's/\e\[[0-9;]*[A-Za-z]//g' "$report"
+
+printf '%s\n' "$report"

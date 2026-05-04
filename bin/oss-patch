@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  printf 'Usage: %s [--model opencode-go/deepseek-v4-pro] --task .ai/tasks/<task>.md\n' "$0" >&2
+}
+
+model="opencode-go/deepseek-v4-pro"
+task=""
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --model)
+      model="${2:-}"
+      shift 2
+      ;;
+    --task)
+      task="${2:-}"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      usage
+      exit 2
+      ;;
+  esac
+done
+
+if [ -z "$task" ] || [ ! -f "$task" ]; then
+  usage
+  exit 2
+fi
+
+task_id="$(basename "$task" .md)"
+result_dir=".ai/results"
+worktree_root=".ai/worktrees"
+worktree="$worktree_root/$task_id"
+report="$result_dir/${task_id}.patch.report.md"
+patch="$result_dir/${task_id}.patch.diff"
+mkdir -p "$result_dir" "$worktree_root"
+
+if [ -e "$worktree" ]; then
+  printf 'Worktree path already exists: %s\n' "$worktree" >&2
+  exit 1
+fi
+
+git worktree add --detach "$worktree" HEAD >/dev/null
+
+prompt="$(mktemp)"
+trap 'rm -f "$prompt"' EXIT
+{
+  printf 'You are an external OSS patch worker for the Rorschach repo.\n'
+  printf 'You are running in an isolated git worktree, not the main worktree.\n'
+  printf 'Make only the bounded change described in the task. Do not touch secrets or unrelated files.\n'
+  printf 'Run lightweight verification when practical. Return a concise markdown report with changed files, verification, confidence, caveats, and escalation recommendation.\n\n'
+  printf 'Task brief follows:\n\n'
+  sed -n '1,260p' "$task"
+} > "$prompt"
+
+pass-cli run --env-file .codex/agents/opencode-go.env -- \
+  opencode run --pure --dangerously-skip-permissions --dir "$worktree" --model "$model" --title "oss-patch:$task_id" < "$prompt" > "$report"
+perl -0pi -e 's/\e\[[0-9;]*[A-Za-z]//g' "$report"
+
+git -C "$worktree" add -N . >/dev/null
+git -C "$worktree" diff --binary > "$patch"
+
+printf '%s\n%s\n' "$report" "$patch"

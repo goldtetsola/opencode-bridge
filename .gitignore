@@ -1,0 +1,9 @@
+# Credentials (never commit your key!)
+.codex/agents/opencode-go.env
+
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+__pycache__/
+*.pyc
+.DS_Store
