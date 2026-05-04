@@ -1,7 +1,7 @@
 # Merge this into your existing .codex/config.toml or Codex user config.
 
-[model_providers.opencodex_go_proxy]
-name = "OpenCode Go Responses Proxy"
+[model_providers.opencode_bridge]
+name = "OpenCode Bridge"
 base_url = "http://127.0.0.1:4000/v1"
 env_key = "LITELLM_MASTER_KEY"
 wire_api = "responses"
@@ -12,7 +12,7 @@ stream_idle_timeout_ms = 300000
 # Optional: slim profile for OSS native subagents.
 # Disables MCP/web/apps to avoid sending unsupported tool types.
 [profiles.oss_native]
-model_provider = "opencodex_go_proxy"
+model_provider = "opencode_bridge"
 web_search = "disabled"
 
 [profiles.oss_native.features]

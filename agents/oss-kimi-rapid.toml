@@ -1,7 +1,7 @@
 name = "oss_kimi_rapid"
 description = "Fast OSS Codex worker for repo navigation, code-structure analysis, docs, tests, and low-risk drafts via Kimi K2.6 through the OpenCode Go proxy."
 
-model_provider = "opencodex_go_proxy"
+model_provider = "opencode_bridge"
 model = "ocg-kimi-k2.6"
 model_reasoning_effort = "high"
 sandbox_mode = "workspace-write"

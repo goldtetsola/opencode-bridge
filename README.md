@@ -1,4 +1,4 @@
-# OpenCode Codex Bridge
+# OpenCode Bridge
 
 Use [OpenCode Go](https://opencode.ai/docs/go/) OSS models (DeepSeek V4 Pro, Kimi K2.6, DeepSeek V4 Flash) as **native [Codex](https://developers.openai.com/codex) subagents** — with full tool-loop support, multi-turn conversation, and reasoning preservation.
 
@@ -11,7 +11,7 @@ Codex speaks the OpenAI Responses API. OpenCode Go exposes Chat Completions. Thi
 Copy this entire prompt into Codex and it will clone, configure, and start everything automatically:
 
 ```
-Clone https://github.com/goldtetsola/opencode-codex-bridge into a `bridge/` directory at the root of this project.
+Clone https://github.com/goldtetsola/opencode-bridge into a `bridge/` directory at the root of this project.
 
 Then:
 1. Copy bridge/opencode-go.env.example to bridge/opencode-go.env.
@@ -20,7 +20,7 @@ Then:
 4. Merge bridge/config.toml.example into .codex/config.toml (keep existing settings, just add the new provider and profile blocks)
 5. Start the proxy: `cd bridge && ./bin/start-proxy` (background it with `&`)
 6. Verify: `curl http://127.0.0.1:4000/health -H "Authorization: Bearer sk-local-codex-bridge"`
-7. Test with: `codex exec --sandbox read-only -c model_provider=opencodex_go_proxy -m ocg-deepseek-v4-pro 'Say: hello'`
+7. Test with: `codex exec --sandbox read-only -c model_provider=opencode_bridge -m ocg-deepseek-v4-pro 'Say: hello'`
 ```
 
 ### Manual setup
@@ -75,7 +75,7 @@ curl http://127.0.0.1:4000/health -H "Authorization: Bearer sk-local-codex-bridg
 Copy the provider config into your project's `.codex/config.toml`:
 
 ```toml
-[model_providers.opencodex_go_proxy]
+[model_providers.opencode_bridge]
 name = "OpenCode Go Responses Proxy"
 base_url = "http://127.0.0.1:4000/v1"
 env_key = "LITELLM_MASTER_KEY"
@@ -105,7 +105,7 @@ Copy the agent TOML files into your project's `.codex/agents/` directory:
 
 ```bash
 codex exec --sandbox read-only \
-  -c model_provider=opencodex_go_proxy \
+  -c model_provider=opencode_bridge \
   -m ocg-deepseek-v4-pro \
   'Say: hello'
 ```
@@ -188,7 +188,7 @@ You can create agents for any model OpenCode Go supports. The only requirements 
 name = "oss_my_worker"
 description = "Description of what this agent does."
 
-model_provider = "opencodex_go_proxy"   # always this — routes through the bridge
+model_provider = "opencode_bridge"   # always this — routes through the bridge
 model = "ocg-<model-id>"               # e.g. ocg-qwen3.6-plus
 model_reasoning_effort = "high"        # high / medium / low
 sandbox_mode = "workspace-write"       # or "read-only"
@@ -300,7 +300,7 @@ self-test passed
 → OpenCode Go rate limiting. Reduce concurrency (use 1-2 OSS subagents at a time), or switch to a different model via the fallback map.
 
 **Codex says "unknown provider for model"**
-→ Verify the proxy is running (`curl http://127.0.0.1:4000/health`). Check that your `.codex/config.toml` has the `opencodex_go_proxy` provider block. Ensure `LITELLM_MASTER_KEY` is set.
+→ Verify the proxy is running (`curl http://127.0.0.1:4000/health`). Check that your `.codex/config.toml` has the `opencode_bridge` provider block. Ensure `LITELLM_MASTER_KEY` is set.
 
 ## License
 

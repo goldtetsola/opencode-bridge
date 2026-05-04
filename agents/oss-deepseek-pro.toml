@@ -1,7 +1,7 @@
 name = "oss_deepseek_pro"
 description = "OSS Codex worker for bounded implementation, debugging, and repo analysis via DeepSeek V4 Pro through OpenCode Go proxy."
 
-model_provider = "opencodex_go_proxy"
+model_provider = "opencode_bridge"
 model = "ocg-deepseek-v4-pro"
 model_reasoning_effort = "high"
 sandbox_mode = "workspace-write"
