@@ -19,7 +19,14 @@ export PROXY_STATE_DB="${PROXY_STATE_DB:-/tmp/opencode_responses_proxy_state.sql
 export FORCE_SINGLE_TOOL_INSTRUCTIONS="${FORCE_SINGLE_TOOL_INSTRUCTIONS:-0}"
 export FALLBACK_MODEL_MAP_JSON="${FALLBACK_MODEL_MAP_JSON:-{\"deepseek-v4-pro\":[\"kimi-k2.6\",\"deepseek-v4-flash\"],\"kimi-k2.6\":[\"deepseek-v4-pro\"],\"deepseek-v4-flash\":[\"kimi-k2.6\"]}}"
 
-echo "Starting OpenCode Go Responses proxy on port ${PROXY_PORT}..." >&2
+# Already running? Skip.
+if curl -s --max-time 2 "http://127.0.0.1:${PROXY_PORT}/health" \
+     -H "Authorization: Bearer ${LITELLM_MASTER_KEY}" > /dev/null 2>&1; then
+    echo "Bridge already running on :${PROXY_PORT}" >&2
+    exit 0
+fi
+
+echo "Starting OpenCode Bridge on port ${PROXY_PORT}..." >&2
 
 if [ -f "$ENV_FILE" ] && grep -q '^OPENCODE_GO_API_KEY=' "$ENV_FILE" 2>/dev/null; then
     echo "Using credentials from opencode-go.env" >&2
