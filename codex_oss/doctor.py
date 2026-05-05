@@ -318,8 +318,8 @@ def _check_bridge(url: str, report: DoctorReport):
             f"OSS inference failed: {e}",
             "Check OPENCODE_GO_API_KEY is set")
 
-    # State DB persistence
-    state_db = os.getenv("PROXY_STATE_DB", "")
+    # State DB persistence — read from health endpoint
+    state_db = health.get("state_db", "")
     if state_db and "/tmp/" in state_db:
         report.add("bridge.state_db", "WARN",
             f"State DB in /tmp ({state_db}) — may be cleaned",

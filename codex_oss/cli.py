@@ -98,6 +98,12 @@ def _start_bridge(port: int, mode: str):
     env = os.environ.copy()
     env["PROXY_PORT"] = str(port)
 
+    # Use project-local state/log paths when running from a project directory
+    project_root = env.get("CODEX_OSS_PROJECT", os.getcwd())
+    state_dir = os.path.join(project_root, ".codex-oss", "state")
+    os.makedirs(state_dir, exist_ok=True)
+    env["PROXY_STATE_DB"] = env.get("PROXY_STATE_DB", os.path.join(state_dir, "proxy.sqlite3"))
+
     gpt_strategies = {
         "production": "error",
         "compat-test": "oss",
