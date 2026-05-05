@@ -8,3 +8,6 @@ __pycache__/
 *.pyc
 .DS_Store
 CONTEXT.md
+CONTEXT.md
+orchestration/
+test-project/

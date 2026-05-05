@@ -3,11 +3,17 @@
 [model_providers.opencode_bridge]
 name = "OpenCode Bridge"
 base_url = "http://127.0.0.1:4000/v1"
-env_key = "LITELLM_MASTER_KEY"
 wire_api = "responses"
 request_max_retries = 2
 stream_max_retries = 2
 stream_idle_timeout_ms = 300000
+
+# The bridge is a localhost service with a shared secret, not a real credential.
+# auth.command tells Codex how to get the key for every session and subagent.
+[model_providers.opencode_bridge.auth]
+command = "echo"
+args = ["sk-local-codex-bridge"]
+timeout_ms = 1000
 
 # Optional: slim profile for OSS native subagents.
 # Disables MCP/web/apps to avoid sending unsupported tool types.
