@@ -21,151 +21,36 @@ For direct `codex exec` testing without subagents, use v6 compatibility mode: st
 
 ## Quick start
 
-### Zero-config: just tell Codex
-
-Copy this entire prompt into Codex and it will clone, configure, and start everything automatically:
-
-```
-Clone https://github.com/goldtetsola/opencode-bridge into a `bridge/` directory at the root of this project.
-
-Then:
-1. Copy bridge/opencode-go.env.example to bridge/opencode-go.env.
-2. Ask me for my OpenCode Go API key, write it into bridge/opencode-go.env as OPENCODE_GO_API_KEY=sk-...
-3. Copy bridge/agents/*.toml into .codex/agents/
-4. Copy bridge/orchestration/agents/*.toml into .codex/agents/ (overwrite if prompted — these are the improved versions)
-5. Copy bridge/orchestration/AGENTS.md to AGENTS.md (or merge into your existing one)
-6. Merge bridge/config.toml.example into .codex/config.toml (keep existing settings, just add the new provider and profile blocks)
-7. Start the proxy: `cd bridge && ./bin/start-proxy` (background it with `&`)
-8. Verify: `curl http://127.0.0.1:4000/health -H "Authorization: Bearer sk-local-codex-bridge"`
-9. Test with: `codex exec --sandbox read-only -c model_provider=opencode_bridge -m ocg-deepseek-v4-pro 'Say: hello'`
-```
-
-### Manual setup
-
-### 1. Prerequisites
-
-- [OpenCode Go](https://opencode.ai) with API key
-- [Codex CLI](https://developers.openai.com/codex/cli) or Codex Desktop
-- Python 3.13+ (stdlib only, no pip packages needed)
-- (Optional) [Proton Pass](https://proton.me/pass) CLI for vault-based credential management
-
-### 2. Set your OpenCode Go key
-
-Copy the example env file and add your key:
-
 ```bash
-cp opencode-go.env.example opencode-go.env
+# 1. Clone the bridge
+git clone https://github.com/goldtetsola/opencode-bridge.git ~/bridge
+
+# 2. Set your OpenCode Go key
+echo 'OPENCODE_GO_API_KEY=sk-...' > ~/bridge/.codex-oss/env/opencode-go.env
+
+# 3. cd into your Codex project and install
+cd ~/your-codex-project
+python3 ~/bridge/bin/codex-oss install
+
+# 4. Start the bridge
+OPENCODE_GO_API_KEY=sk-... python3 ~/bridge/bin/codex-oss start --mode production
+
+# 5. Verify everything
+python3 ~/bridge/bin/codex-oss doctor
+# Expected: 22 passed, 0 warnings, 0 failed
 ```
 
-Edit `opencode-go.env`:
+That's it. `codex-oss install` generates all config — `.codex/config.toml`, agent TOMLs, `AGENTS.md` routing rules, and recursive-codex-exec blocking. `codex-oss doctor` checks 22 invariants and tells you exactly what to fix.
 
-```env
-OPENCODE_GO_API_KEY=sk-...
-```
+## What `codex-oss` does
 
-Three credential methods are supported (pick one):
-
-1. **Plain key in the env file** (recommended) — just paste your key
-2. **Proton Pass vault reference** — if you use `pass-cli`, write a `pass://` reference and use `pass-cli inject`
-3. **Shell environment** — export `OPENCODE_GO_API_KEY` before starting the proxy
-
-### 3. Start the proxy
-
-```bash
-bin/start-proxy
-```
-
-This launches a local HTTP server on port 4000. You'll see:
-
-```
-Responses->Chat proxy listening on http://127.0.0.1:4000/v1
-```
-
-Verify it with:
-
-```bash
-curl http://127.0.0.1:4000/health -H "Authorization: Bearer sk-local-codex-bridge"
-```
-
-### 4. Configure Codex
-
-Copy the provider config into your project's `.codex/config.toml`:
-
-```toml
-[model_providers.opencode_bridge]
-name = "OpenCode Bridge"
-base_url = "http://127.0.0.1:4000/v1"
-env_key = "LITELLM_MASTER_KEY"
-wire_api = "responses"
-request_max_retries = 2
-stream_max_retries = 2
-stream_idle_timeout_ms = 300000
-```
-
-Or merge `config.toml.example` from this repo into your existing config.
-
-Set the proxy key in your environment:
-
-```bash
-export LITELLM_MASTER_KEY="sk-local-codex-bridge"
-```
-
-### 5. Install agent TOMLs
-
-Copy the agent TOML files into your project's `.codex/agents/` directory:
-
-```bash
-cp orchestration/agents/*.toml .codex/agents/
-```
-
-| Agent TOML | Model | Reasoning | Sandbox | Use case |
-|---|---|---|---|---|
-| `oss-deepseek-pro.toml` | deepseek-v4-pro | high | workspace-write | Bounded implementation, debugging, analysis |
-| `oss-kimi-rapid.toml` | kimi-k2.6 | medium | read-only | Repo navigation, scouting, review |
-| `oss-flash-support.toml` | deepseek-v4-flash | medium | read-only | Docs, summaries, changelog, mechanical |
-
-The `orchestration/agents/` versions are the recommended ones — they include explicit "USE ME WHEN / DO NOT USE FOR" routing descriptions, standardized output formats (confidence markers, caveats), and safety boundaries that prevent OSS agents from touching auth/recovery/schema code.
-
-The `agents/` directory has minimal versions if you prefer simpler descriptions.
-
-### 6. Set up orchestration (recommended)
-
-Copy the orchestration files into your project root:
-
-```bash
-cp orchestration/AGENTS.md AGENTS.md
-cp orchestration/ROUTING.md docs/ROUTING.md  # keep as reference
-```
-
-The `AGENTS.md` tells Codex's orchestrator (GPT-5.5) when to delegate tasks to OSS agents and when to keep them on GPT. It includes:
-
-- **Identity boundary**: "You are an orchestrator, not an implementer"
-- **Safety checks**: Never route auth/recovery/schema to OSS
-- **Task classification**: Exploration → Kimi, Implementation → DeepSeek, Docs → Flash
-- **Handoff template**: Required context for every OSS delegation
-- **Fork mode**: OSS agents must use `fork_turns: "none"` (full-history forks conflict with model overrides)
-
-See `orchestration/ROUTING.md` for the full decision flowchart, capability matrix, handoff examples, and troubleshooting guide.
-
-### 7. Test it
-
-**Direct test** (model via bridge, no orchestrator):
-
-```bash
-codex exec --sandbox read-only \
-  -c model_provider=opencode_bridge \
-  -m ocg-deepseek-v4-pro \
-  'Say: hello'
-```
-
-**Orchestration test** (GPT-5.5 routes to the right agent based on AGENTS.md):
-
-```bash
-codex exec --sandbox read-only \
-  'Map all exported functions in src/utils.js and list their call sites.'
-```
-
-The orchestrator should identify this as an exploration task and delegate to `oss_kimi_rapid`.
+| Command | What it does |
+|---|---|
+| `install` | Generates provider config, 3 agent TOMLs, AGENTS.md delegation contract, recursive-codex blocking rules, runtime directories, and gitignore entries. |
+| `doctor` | Checks 22 invariants: config correctness, agent configuration, AGENTS.md compliance, recursive-codex exec blocking, bridge health, GPT leakage, OSS inference, state DB persistence. PASS/WARN/FAIL with fix instructions. Supports `--json` for automation. |
+| `start` | Launches the bridge with mode selection (`production`/`compat-test`/`openai`). Refuses to start in production mode without a valid key. Sets project-local state paths. |
+| `stop` | Graceful shutdown via PID file or port. |
+| `status` | Queries the bridge health endpoint — shows version, mode, model health, and concurrency config. |
 
 ## Architecture
 
@@ -229,6 +114,12 @@ The bridge handles:
 | `GPT_MODEL_STRATEGY` | `error` | How to handle GPT-model requests: `error` (reject immediately), `oss` (alias to OSS model for testing), `openai` (passthrough to OpenAI API — requires `OPENAI_API_KEY`) |
 | `GPT_MODEL_OSS_FALLBACK` | `deepseek-v4-pro` | OSS model to use when `GPT_MODEL_STRATEGY=oss` |
 | `OPENAI_API_KEY` | (not set) | Required only for `GPT_MODEL_STRATEGY=openai` |
+| `MAX_GLOBAL_UPSTREAM_CONCURRENCY` | `2` | Cap concurrent upstream requests globally |
+| `MODEL_CONCURRENCY_JSON` | deepseek/kimi 1, flash 2 | Per-model concurrency caps |
+| `CIRCUIT_BREAKER_ERRORS` | `2` | Errors before marking a model degraded |
+| `CIRCUIT_BREAKER_COOLDOWN` | `300` | Seconds before auto-recovering a degraded model |
+| `OSS_MAX_TOOL_TURNS` | `6` | Max tool turns before OSS agent is stopped |
+| `ALLOW_MISSING_OPENCODE_KEY` | `0` | Set to `1` to bypass fatal key check |
 | `EXPOSE_EMPTY_REASONING_ITEM` | `1` | Include empty reasoning item in output for Codex compatibility |
 | `STRIP_TOOLS` | `0` | Set to `1` to strip ALL tools (force text-only responses) |
 
@@ -435,29 +326,24 @@ self-test passed
 
 ## Troubleshooting
 
-**"Error from provider: unknown variant `developer`"**
-→ The bridge maps `developer` → `system` automatically. If you're on an older version, update.
+**First step for any issue:** run `codex-oss doctor`. It checks 22 invariants and tells you exactly what to fix.
 
-**"We're currently experiencing high demand"**
-→ OpenCode Go rate limiting. Reduce concurrency (use 1 OSS agent at a time), switch models via the fallback map, or check your subscription tier.
+Common issues the doctor catches:
 
-**"Full-history forked agents inherit the parent agent type, model, and reasoning effort"**
-→ Codex is trying to fork with full history for an OSS agent. The orchestrator must use `fork_turns: "none"` when spawning OSS agents that override model/provider. See `orchestration/ROUTING.md` for the handoff template.
+| Problem | Doctor check | What it means |
+|---|---|---|
+| GPT requests timing out | `bridge.gpt_rejection` FAIL | Bridge set as session-wide provider. Remove `model_provider = "opencode_bridge"` from config. |
+| OSS agents can't spawn | `agents.*.provider` FAIL | Agent TOML missing `model_provider = "opencode_bridge"`. Run `codex-oss install --force`. |
+| Bridge won't start | Fatal at launch | `OPENCODE_GO_API_KEY` not set in production mode. Set key or `ALLOW_MISSING_OPENCODE_KEY=1`. |
+| State lost after reboot | `bridge.state_db` WARN | State DB in `/tmp`. `codex-oss start` now uses `.codex-oss/state/` by default. |
+| Recursive codex exec | `rules.recursive_block` WARN | No blocking rule installed. Run `codex-oss install`. |
+| Full-history fork error | `agreements.fork_turns` WARN | AGENTS.md doesn't specify `fork_turns: none`. Run `codex-oss install`. |
 
-**401 Unauthorized on subagent spawn**
-→ Codex session auth issue. Try: `codex logout && codex login`. Test from a persistent Codex Desktop session rather than `codex exec`. Consider `cli_auth_credentials_store = "file"` in `~/.codex/config.toml`.
+For advanced debugging, use the JSON output:
 
-**Codex says "unknown provider for model"**
-→ Verify the proxy is running (`curl http://127.0.0.1:4000/health -H "Authorization: Bearer sk-local-codex-bridge"`). Check that `.codex/config.toml` has the `opencode_bridge` provider block. Ensure `LITELLM_MASTER_KEY` is set.
-
-**"Codex sent a GPT-family model to the OpenCode Go bridge"**
-→ You configured `model_provider=opencode_bridge` as your session-wide provider. Codex is routing GPT-5.5 orchestrator requests through the bridge. Solution: remove `model_provider = "opencode_bridge"` from your top-level `.codex/config.toml`. Only use it in agent TOMLs. For direct testing, restart the bridge with `GPT_MODEL_STRATEGY=oss`.
-
-**Timeouts on tool operations (reads/writes) but simple text works**
-→ Same as above. GPT-5.5 orchestrator requests are going through the bridge. Simple text works because no orchestration is needed. Tool ops fail because the orchestrator can't think. Fix: keep GPT-5.5 native.
-
-**"Messages with role 'tool' must be a response to a preceding message with 'tool_calls'"**
-→ The bridge's conversation repair is working. Orphan function_call_output items can't be matched to stored conversations. Restart the proxy and retry from a fresh conversation.
+```bash
+codex-oss doctor --json
+```
 
 ## License
 
