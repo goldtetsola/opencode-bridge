@@ -1,6 +1,6 @@
 # OpenCode Bridge
 
-Use [OpenCode Go](https://opencode.ai/docs/go/) OSS models (DeepSeek V4 Pro, Kimi K2.6, DeepSeek V4 Flash) as **native [Codex](https://developers.openai.com/codex) subagents** — with full tool-loop support, multi-turn conversation, and reasoning preservation.
+Use [OpenCode Go](https://opencode.ai/docs/go/) OSS models (DeepSeek V4 Pro, Kimi K2.6, DeepSeek V4 Flash) as **native [Codex](https://developers.openai.com/codex) subagents** — with full tool-loop support, multi-turn conversation, reasoning preservation, and orchestration routing.
 
 Codex speaks the OpenAI Responses API. OpenCode Go exposes Chat Completions. This bridge sits in the middle, translating between them so Codex can spawn DeepSeek and Kimi workers the same way it spawns GPT workers.
 
@@ -17,10 +17,12 @@ Then:
 1. Copy bridge/opencode-go.env.example to bridge/opencode-go.env.
 2. Ask me for my OpenCode Go API key, write it into bridge/opencode-go.env as OPENCODE_GO_API_KEY=sk-...
 3. Copy bridge/agents/*.toml into .codex/agents/
-4. Merge bridge/config.toml.example into .codex/config.toml (keep existing settings, just add the new provider and profile blocks)
-5. Start the proxy: `cd bridge && ./bin/start-proxy` (background it with `&`)
-6. Verify: `curl http://127.0.0.1:4000/health -H "Authorization: Bearer sk-local-codex-bridge"`
-7. Test with: `codex exec --sandbox read-only -c model_provider=opencode_bridge -m ocg-deepseek-v4-pro 'Say: hello'`
+4. Copy bridge/orchestration/agents/*.toml into .codex/agents/ (overwrite if prompted — these are the improved versions)
+5. Copy bridge/orchestration/AGENTS.md to AGENTS.md (or merge into your existing one)
+6. Merge bridge/config.toml.example into .codex/config.toml (keep existing settings, just add the new provider and profile blocks)
+7. Start the proxy: `cd bridge && ./bin/start-proxy` (background it with `&`)
+8. Verify: `curl http://127.0.0.1:4000/health -H "Authorization: Bearer sk-local-codex-bridge"`
+9. Test with: `codex exec --sandbox read-only -c model_provider=opencode_bridge -m ocg-deepseek-v4-pro 'Say: hello'`
 ```
 
 ### Manual setup
@@ -49,7 +51,7 @@ OPENCODE_GO_API_KEY=sk-...
 Three credential methods are supported (pick one):
 
 1. **Plain key in the env file** (recommended) — just paste your key
-2. **Proton Pass vault reference** — if you use `pass-cli`, use `pass://vault/item/OPENCODE_GO_API_KEY`
+2. **Proton Pass vault reference** — if you use `pass-cli`, write a `pass://` reference and use `pass-cli inject`
 3. **Shell environment** — export `OPENCODE_GO_API_KEY` before starting the proxy
 
 ### 3. Start the proxy
@@ -76,7 +78,7 @@ Copy the provider config into your project's `.codex/config.toml`:
 
 ```toml
 [model_providers.opencode_bridge]
-name = "OpenCode Go Responses Proxy"
+name = "OpenCode Bridge"
 base_url = "http://127.0.0.1:4000/v1"
 env_key = "LITELLM_MASTER_KEY"
 wire_api = "responses"
@@ -93,15 +95,46 @@ Set the proxy key in your environment:
 export LITELLM_MASTER_KEY="sk-local-codex-bridge"
 ```
 
-### 5. Copy the agent TOMLs
+### 5. Install agent TOMLs
 
 Copy the agent TOML files into your project's `.codex/agents/` directory:
 
-- `agents/oss-deepseek-pro.toml` — DeepSeek V4 Pro
-- `agents/oss-kimi-rapid.toml` — Kimi K2.6
-- `agents/oss-flash-support.toml` — DeepSeek V4 Flash
+```bash
+cp orchestration/agents/*.toml .codex/agents/
+```
 
-### 6. Test it
+| Agent TOML | Model | Reasoning | Sandbox | Use case |
+|---|---|---|---|---|
+| `oss-deepseek-pro.toml` | deepseek-v4-pro | high | workspace-write | Bounded implementation, debugging, analysis |
+| `oss-kimi-rapid.toml` | kimi-k2.6 | medium | read-only | Repo navigation, scouting, review |
+| `oss-flash-support.toml` | deepseek-v4-flash | medium | read-only | Docs, summaries, changelog, mechanical |
+
+The `orchestration/agents/` versions are the recommended ones — they include explicit "USE ME WHEN / DO NOT USE FOR" routing descriptions, standardized output formats (confidence markers, caveats), and safety boundaries that prevent OSS agents from touching auth/recovery/schema code.
+
+The `agents/` directory has minimal versions if you prefer simpler descriptions.
+
+### 6. Set up orchestration (recommended)
+
+Copy the orchestration files into your project root:
+
+```bash
+cp orchestration/AGENTS.md AGENTS.md
+cp orchestration/ROUTING.md docs/ROUTING.md  # keep as reference
+```
+
+The `AGENTS.md` tells Codex's orchestrator (GPT-5.5) when to delegate tasks to OSS agents and when to keep them on GPT. It includes:
+
+- **Identity boundary**: "You are an orchestrator, not an implementer"
+- **Safety checks**: Never route auth/recovery/schema to OSS
+- **Task classification**: Exploration → Kimi, Implementation → DeepSeek, Docs → Flash
+- **Handoff template**: Required context for every OSS delegation
+- **Fork mode**: OSS agents must use `fork_turns: "none"` (full-history forks conflict with model overrides)
+
+See `orchestration/ROUTING.md` for the full decision flowchart, capability matrix, handoff examples, and troubleshooting guide.
+
+### 7. Test it
+
+**Direct test** (model via bridge, no orchestrator):
 
 ```bash
 codex exec --sandbox read-only \
@@ -110,14 +143,23 @@ codex exec --sandbox read-only \
   'Say: hello'
 ```
 
+**Orchestration test** (GPT-5.5 routes to the right agent based on AGENTS.md):
+
+```bash
+codex exec --sandbox read-only \
+  'Map all exported functions in src/utils.js and list their call sites.'
+```
+
+The orchestrator should identify this as an exploration task and delegate to `oss_kimi_rapid`.
+
 ## Architecture
 
 ```
 Codex Desktop / CLI
     │
-    │  Responses API (SSE streaming)
+    │  Responses API (SSE streaming, heartbeat keepalive)
     ▼
-bridge.py   ← this repo
+bridge.py   ← this repo (v3: immediate SSE + heartbeat)
     │
     │  Chat Completions API
     ▼
@@ -130,7 +172,7 @@ DeepSeek V4 Pro / Kimi K2.6 / DeepSeek V4 Flash
 The bridge handles:
 
 - **Protocol translation**: Responses API ↔ Chat Completions (request format, tool definitions, output items)
-- **SSE streaming**: Proper OpenAI Responses SSE event sequence (response.created, output_item.added, content_part.added, output_text.delta, output_item.done, response.completed)
+- **SSE streaming with heartbeat**: Sends `response.created` immediately, then heartbeat comments during upstream processing. Prevents Codex timeouts on complex queries with long reasoning.
 - **Tool type filtering**: Strips hosted tools (image_generation, web_search, code_interpreter), MCP namespaces, and app/connector tools that OSS providers reject
 - **Tool format conversion**: Responses flat format → Chat Completions nested `function` wrapper, with name sanitization for strict providers
 - **Reasoning preservation**: DeepSeek V4 Pro requires `reasoning_content` to be replayed across multi-turn tool calls. The proxy stores and injects it correctly
@@ -145,7 +187,7 @@ The bridge handles:
 |---|---|---|
 | `OPENCODE_GO_API_KEY` | (required) | Your OpenCode Go API key |
 | `PROXY_API_KEY` | `LITELLM_MASTER_KEY` value | Key Codex sends to authenticate with the proxy |
-| `LITELLM_MASTER_KEY` | `sk-local-codex-bridge` | Auth key (shared name for Codex config compatibility) |
+| `LITELLM_MASTER_KEY` | `sk-local-codex-bridge` | Auth key (shared name for Codex config compatibility). Leave empty for no auth on localhost. |
 | `PROXY_PORT` | `4000` | Port the proxy listens on |
 | `PROXY_STATE_DB` | `/tmp/opencode_responses_proxy_state.sqlite3` | SQLite file for conversation state |
 | `FORCE_SINGLE_TOOL_INSTRUCTIONS` | `0` | Set to `1` to inject a guard discouraging parallel tool calls |
@@ -155,6 +197,7 @@ The bridge handles:
 | `MODEL_MAP_JSON` | (built-in) | Override model name mapping |
 | `PROXY_LOG_PATH` | (stderr) | Path for structured JSON log output |
 | `SSE_CHUNK_SIZE` | `256` | Characters per SSE text delta chunk |
+| `SSE_UPSTREAM_HEARTBEAT_SECONDS` | `5` | Seconds between heartbeat comments while waiting for upstream |
 | `EXPOSE_EMPTY_REASONING_ITEM` | `1` | Include empty reasoning item in output for Codex compatibility |
 | `STRIP_TOOLS` | `0` | Set to `1` to strip ALL tools (force text-only responses) |
 
@@ -163,7 +206,7 @@ The bridge handles:
 | Codex model ID | Upstream model | Best for |
 |---|---|---|
 | `ocg-deepseek-v4-pro` | deepseek-v4-pro | Bounded implementation, debugging, reasoning-heavy analysis |
-| `ocg-kimi-k2.6` | kimi-k2.6 | Fast repo navigation, code-structure, review, drafts |
+| `ocg-kimi-k2.6` | kimi-k2.6 | Fast repo navigation, scouting, review |
 | `ocg-deepseek-v4-flash` | deepseek-v4-flash | Docs, summaries, mechanical low-risk tasks |
 | `ocg-kimi-k2.5` | kimi-k2.5 | (untested) |
 | `ocg-qwen3.6-plus` | qwen3.6-plus | (untested) |
@@ -174,68 +217,78 @@ Also accepts OpenCode-style `opencode-go/<model>` model IDs.
 
 ## Model-task matrix
 
-What model to use for what kind of work, based on real usage:
-
 | Model | Best for | Real example | Rate limit |
 |---|---|---|---|
-| DeepSeek V4 Flash | Docs, summaries, mechanical edits, test inventories | "Write a changelog entry for the last 3 commits" | 31K req/5hr — effectively unlimited |
-| DeepSeek V4 Pro | Bounded implementation, debugging, feature work | "Add a test for canonicalizeGroundingValue following existing patterns" | 3.4K req/5hr |
-| Kimi K2.6 | Repo exploration, code review, drafts, fast navigation | "Find every place that calls getJobLifecycle and summarize the call patterns" | 1.1K req/5hr |
+| DeepSeek V4 Flash | Docs, summaries, mechanical edits, test inventories | "Write a changelog entry for the last 3 commits" | 31K req/5hr |
+| DeepSeek V4 Pro | Bounded implementation, debugging, feature work | "Add a test for the validateToken function following existing patterns" | 3.4K req/5hr |
+| Kimi K2.6 | Repo exploration, scouting, code review, fast navigation | "Find every place that calls formatName and summarize the call patterns" | 1.1K req/5hr |
 | GPT-5.4 | Implementation where blast radius matters, cross-module changes | "Refactor the publish-bundle hydration to use the new artifact reader" | Usage-based |
 | GPT-5.5 | Architecture, final review, critical paths | "Review this recovery path change for safety" | Usage-based |
 
-## Orchestration pattern
+## Orchestration
 
-Here's how the models fit together in a Codex session:
+### How routing works
+
+Codex's orchestrator (GPT-5.5) reads `AGENTS.md` and agent `description` fields from `.codex/agents/` to decide which worker handles each task:
 
 ```
-┌─────────────────────────────────────┐
-│         GPT-5.5 (orchestrator)      │
-│    Architecture, final review,       │
-│    recovery/auth/schema decisions    │
-└──────────┬──────────┬───────────────┘
-           │          │
-    ┌──────▼───┐  ┌──▼──────────────┐
-    │ GPT-5.4  │  │ OSS via bridge  │
-    │ Bounded  │  │ (OpenCode Go)   │
-    │ impl │    │ │                 │
-    │ review   │  │ ┌─────────────┐ │
-    └──────────┘  │ │ DeepSeek    │ │
-                  │ │ V4 Pro      │ │
-                  │ │ impl, debug │ │
-                  │ └─────────────┘ │
-                  │ ┌─────────────┐ │
-                  │ │ Kimi K2.6   │ │
-                  │ │ explore,    │ │
-                  │ │ review      │ │
-                  │ └─────────────┘ │
-                  │ ┌─────────────┐ │
-                  │ │ DS V4 Flash │ │
-                  │ │ docs,       │ │
-                  │ │ summaries   │ │
-                  │ └─────────────┘ │
-                  └─────────────────┘
-
-GPT-5.5: orchestrator + final review (GPT credits)
-GPT-5.4: bounded implementation (GPT credits)
-OSS models: everything else ($10/month flat)
+You: "Find all callers of formatName"
+         │
+         ▼
+   GPT-5.5 reads AGENTS.md routing rules
+         │
+         │  Safety check: auth? No
+         │  Task type: exploration → Kimi
+         │
+         ▼
+   GPT-5.5 spawns oss_kimi_rapid (fork_turns: "none")
+         │  Handoff: task scope, allowed paths, output format
+         ▼
+   Kimi returns file paths + line numbers + confidence
+         │
+         ▼
+   GPT-5.5 synthesizes result. Done.
 ```
 
-Three pre-built agent files are provided in `agents/`: copy them into your project's `.codex/agents/`.
+### Safety boundaries
+
+OSS agents have explicit "DO NOT USE FOR" descriptions and developer instructions that prevent them from touching critical paths. If the orchestrator routes an auth/schema/recovery task to an OSS agent, the agent should refuse.
+
+Critical paths that must stay on GPT-5.5/5.4:
+- Authentication, authorization, session management
+- Recovery paths, error recovery, state repair
+- Schema authority, database migrations
+- CI gates, build pipelines, deployment
+- Cross-module invariants (>2 modules affected)
+- Any path where failure = data loss or security breach
+
+### Fork mode
+
+OSS subagents must be spawned with `fork_turns: "none"`. Full-history forks inherit the parent GPT-5.5 model and reasoning effort, which conflicts with the model/provider overrides OSS agents need. This is a known Codex limitation ([issue #20077](https://github.com/openai/codex/issues/20077)).
+
+The AGENTS.md handoff template includes this requirement. See `orchestration/ROUTING.md` for details.
+
+### Orchestration files
+
+| File | Purpose |
+|---|---|
+| `orchestration/AGENTS.md` | Routing rules for GPT-5.5. Merge into your project's AGENTS.md. |
+| `orchestration/ROUTING.md` | Reference: decision flowchart, capability matrix, handoff examples, troubleshooting. |
+| `orchestration/agents/*.toml` | Recommended agent TOMLs with explicit routing descriptions and safety boundaries. |
 
 ## Agent TOMLs
 
-Three pre-built agent files are provided in `agents/`: copy them into your project's `.codex/agents/`.
+Three pre-built agent files are provided in `orchestration/agents/` (recommended) and `agents/` (minimal):
 
 | Agent TOML | Model | Reasoning | Sandbox | Use case |
 |---|---|---|---|---|
-| `oss-deepseek-pro.toml` | deepseek-v4-pro | high | workspace-write | Implementation, debugging, analysis |
-| `oss-kimi-rapid.toml` | kimi-k2.6 | high | workspace-write | Fast navigation, review, drafts |
-| `oss-flash-support.toml` | deepseek-v4-flash | medium | read-only | Docs, summaries, mechanical |
+| `oss-deepseek-pro.toml` | deepseek-v4-pro | high | workspace-write | Bounded impl, debugging, analysis |
+| `oss-kimi-rapid.toml` | kimi-k2.6 | medium | read-only | Repo navigation, scouting, review |
+| `oss-flash-support.toml` | deepseek-v4-flash | medium | read-only | Docs, summaries, changelog, mechanical |
 
 ### Creating your own agent
 
-You can create agents for any model OpenCode Go supports. The only requirements are:
+You can create agents for any model OpenCode Go supports:
 
 1. **Pick a model ID**. Run `curl https://opencode.ai/zen/go/v1/models -H "Authorization: Bearer $OPENCODE_GO_API_KEY"` to see the full catalog. Use the model name with an `ocg-` prefix (e.g. `qwen3.6-plus` → `ocg-qwen3.6-plus`).
 
@@ -243,16 +296,16 @@ You can create agents for any model OpenCode Go supports. The only requirements 
 
 ```toml
 name = "oss_my_worker"
-description = "Description of what this agent does."
+description = "What this agent does. USE ME WHEN: <criteria>. DO NOT USE FOR: <boundaries>."
 
-model_provider = "opencode_bridge"   # always this — routes through the bridge
-model = "ocg-<model-id>"               # e.g. ocg-qwen3.6-plus
-model_reasoning_effort = "high"        # high / medium / low
-sandbox_mode = "workspace-write"       # or "read-only"
+model_provider = "opencode_bridge"       # always this
+model = "ocg-<model-id>"                 # e.g. ocg-qwen3.6-plus
+model_reasoning_effort = "high"          # high / medium / low
+sandbox_mode = "workspace-write"         # or "read-only"
 
 developer_instructions = """
-Your custom instructions here.
-Rules, scope, output format, escalation criteria.
+Your instructions. Rules, scope, output format, escalation criteria.
+Include: confidence marker (HIGH/MEDIUM/LOW), files inspected, caveats.
 """
 ```
 
@@ -260,34 +313,37 @@ Rules, scope, output format, escalation criteria.
 
 | Effort | When to use | Example models |
 |---|---|---|
-| `high` | Implementation, debugging, analysis | deepseek-v4-pro, kimi-k2.6 |
-| `medium` | Docs, summaries, mechanical tasks | deepseek-v4-flash |
+| `high` | Implementation, debugging, analysis | deepseek-v4-pro |
+| `medium` | Navigation, docs, summaries, mechanical | kimi-k2.6, deepseek-v4-flash |
 | `low` | Trivial text generation | Any fast model |
 
 4. **Choose the right sandbox mode**:
 
 | Mode | Permissions | Best for |
 |---|---|---|
-| `workspace-write` | Can read and edit project files | Implementation, debugging, refactoring |
-| `read-only` | Can read files and run safe commands | Exploration, review, docs, analysis |
+| `workspace-write` | Read and edit project files | Implementation, debugging, refactoring |
+| `read-only` | Read files, run safe commands | Exploration, review, docs, analysis |
 
-5. **Write developer instructions that include**:
-   - What the agent should and should not do
-   - Escalation rules (when to defer to GPT)
-   - Output format (confidence marker, files inspected, verification, caveats)
+5. **Write good descriptions**. The `description` field is Codex's routing signal. Include both "use me when" AND "do NOT use for" criteria. Example:
 
-6. **Use it**: Codex will pick up any `.toml` file in `.codex/agents/`. Spawn it with `codex exec` or let the orchestrator route to it naturally.
+```
+"Bounded implementation worker. USE ME WHEN: single file change, tests exist, requirements clear. DO NOT USE FOR: auth, schema, recovery, cross-module changes."
+```
+
+6. **Register in AGENTS.md**. Add your agent to the routing rules so the orchestrator knows when to delegate to it.
+
+7. **Use `fork_turns: "none"`**. OSS agents use different models/providers than GPT-5.5, so they must not inherit the parent session via full-history fork.
 
 ### Tested models
 
 | Agent | Model | Reasoning | Sandbox | Status |
 |---|---|---|---|---|
 | `oss-deepseek-pro.toml` | deepseek-v4-pro | high | workspace-write | Working |
-| `oss-kimi-rapid.toml` | kimi-k2.6 | high | workspace-write | Working |
+| `oss-kimi-rapid.toml` | kimi-k2.6 | medium | read-only | Working |
 | `oss-flash-support.toml` | deepseek-v4-flash | medium | read-only | Working |
-| `oss-qwen3.6-plus` (custom) | qwen3.6-plus | high | workspace-write | Untested |
-| `oss-glm-5.1` (custom) | glm-5.1 | high | workspace-write | Untested |
-| `oss-minimax-m2.7` (custom) | minimax-m2.7 | high | workspace-write | Untested |
+| `oss-qwen3.6-plus` (custom) | qwen3.6-plus | — | — | Untested |
+| `oss-glm-5.1` (custom) | glm-5.1 | — | — | Untested |
+| `oss-minimax-m2.7` (custom) | minimax-m2.7 | — | — | Untested |
 
 Untested models may need adjustments — some providers are stricter about tool schemas (shape failures) or message format requirements (relational failures). The bridge strips unsupported tool types and maps `developer` → `system`, but provider-specific quirks may still surface. If you test an untested model, open an issue with your findings.
 
@@ -304,7 +360,7 @@ The `bin/` directory includes four wrapper scripts for running OSS models as ext
 
 Use these when the proxy is down, rate-limited, or you need an isolated worktree for write tasks.
 
-## Model routing guidance
+## Model routing lanes
 
 ```
 Lane A — GPT-5.5
@@ -318,7 +374,7 @@ Lane C — GPT-5.4-mini
 
 Lane D — OSS native subagents (through this bridge)
   oss-deepseek-pro: bounded implementation, debugging, analysis
-  oss-kimi-rapid: fast navigation, review, drafts
+  oss-kimi-rapid: repo navigation, scouting, review
   oss-flash-support: docs, summaries, mechanical
 
 Lane E — OSS external workers (fallback)
@@ -327,11 +383,12 @@ Lane E — OSS external workers (fallback)
 
 ## Limitations
 
-- **Not production-grade**: This is a local development tool. It uses a single-threaded Python HTTP server (though concurrent via ThreadingHTTPServer), in-memory state, and no authentication beyond a shared key.
+- **Not production-grade**: This is a local development tool. It uses a single-threaded Python HTTP server (though concurrent via ThreadingHTTPServer) and no authentication beyond a shared key (configurable; disable entirely for localhost).
 - **Single machine only**: Bind to localhost. Do not expose publicly.
 - **DeepSeek thinking mode costs tokens**: DeepSeek V4 Pro's reasoning_content is preserved internally but counts against your OpenCode Go usage. Expect ~300-400K tokens for multi-turn coding tasks.
-- **No streaming from upstream**: The proxy requests `stream: false` from OpenCode Go and fakes SSE deltas after receiving the complete response. True token-by-token streaming from the upstream would reduce perceived latency.
-- **Tool type restrictions**: Hosted tools (web search, code interpreter, image generation), MCP namespaces, and app/connector tools are stripped. Only function-style tools reach the model. Use the slim OSS profile to avoid sending them in the first place.
+- **No true upstream streaming**: The proxy requests `stream: false` from OpenCode Go and fakes SSE deltas after receiving the complete response. True token-by-token streaming would reduce latency. The v3 heartbeat prevents Codex timeouts during long upstream responses.
+- **Tool compatibility**: OSS models through Codex get Codex's tool environment but may not know about Codex-specific tool policies (e.g., `rtk` prefixes). Some tool calls may fail until the model learns the environment.
+- **Subagent spawning**: OSS agents must use `fork_turns: "none"` (full-history forks conflict with model/provider overrides). The orchestrator needs to include explicit task context in handoffs since the child doesn't inherit parent conversation history.
 
 ## Self-test
 
@@ -348,16 +405,31 @@ self-test passed
 ## Troubleshooting
 
 **"Error from provider: unknown variant `developer`"**
-→ Update the proxy. The latest version maps `developer` → `system` for providers that reject it.
-
-**"Messages with role 'tool' must be a response to a preceding message with 'tool_calls'"**
-→ This is the bridge's conversation repair at work. It means the proxy received orphan function_call_output items it couldn't match to a stored conversation. Restart the proxy and retry from a fresh conversation.
+→ The bridge maps `developer` → `system` automatically. If you're on an older version, update.
 
 **"We're currently experiencing high demand"**
-→ OpenCode Go rate limiting. Reduce concurrency (use 1-2 OSS subagents at a time), or switch to a different model via the fallback map.
+→ OpenCode Go rate limiting. Reduce concurrency (use 1 OSS agent at a time), switch models via the fallback map, or check your subscription tier.
+
+**"Full-history forked agents inherit the parent agent type, model, and reasoning effort"**
+→ Codex is trying to fork with full history for an OSS agent. The orchestrator must use `fork_turns: "none"` when spawning OSS agents that override model/provider. See `orchestration/ROUTING.md` for the handoff template.
+
+**401 Unauthorized on subagent spawn**
+→ Codex session auth issue. Try: `codex logout && codex login`. Test from a persistent Codex Desktop session rather than `codex exec`. Consider `cli_auth_credentials_store = "file"` in `~/.codex/config.toml`.
 
 **Codex says "unknown provider for model"**
-→ Verify the proxy is running (`curl http://127.0.0.1:4000/health`). Check that your `.codex/config.toml` has the `opencode_bridge` provider block. Ensure `LITELLM_MASTER_KEY` is set.
+→ Verify the proxy is running (`curl http://127.0.0.1:4000/health`). Check that `.codex/config.toml` has the `opencode_bridge` provider block. When using direct model access, include `-c model_provider=opencode_bridge`.
+
+**"Operation not permitted" when spawning subagents**
+→ You may be trying recursive `codex exec` from inside a Codex session. Use native `SpawnAgent` with `fork_turns: "none"`, or run manual `codex exec` from a separate terminal.
+
+**Bridge returns `OPENCODE_GO_API_KEY is not set`**
+→ The bridge process doesn't have the key. Either: set it in `opencode-go.env`, export it before starting the bridge, or use `pass-cli` to inject it.
+
+**DeepSeek/Kimi times out on complex queries**
+→ The bridge sends SSE heartbeat keepalives while upstream processes. If using v2, upgrade to v3. If timeouts persist, increase `UPSTREAM_TIMEOUT_SECONDS` and check `SSE_UPSTREAM_HEARTBEAT_SECONDS`.
+
+**"Messages with role 'tool' must be a response to a preceding message with 'tool_calls'"**
+→ The bridge's conversation repair is working. Orphan function_call_output items can't be matched to stored conversations. Restart the proxy and retry from a fresh conversation.
 
 ## License
 

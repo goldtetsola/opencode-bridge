@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-responses_chat_proxy_v2.py
+responses_chat_proxy_v3.py
 
 A small, dependency-free OpenAI Responses API -> OpenAI-compatible Chat Completions
 bridge, designed for Codex custom model providers that need to call OpenCode Go OSS
@@ -98,6 +98,16 @@ DROP_TOOL_TYPES = {
 
 VALID_FUNCTION_NAME = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
+SINGLE_TOOL_GUARD_TEXT = (
+    "For this coding-agent session, call at most one tool per assistant response. "
+    "After receiving a tool result, continue with either a final answer or one next tool call. "
+    "Do not make parallel tool calls."
+)
+
+
+def is_single_tool_guard(msg: JSON) -> bool:
+    return msg.get("role") == "system" and as_text(msg.get("content", "")) == SINGLE_TOOL_GUARD_TEXT
+
 
 def now() -> int:
     return int(time.time())
@@ -153,10 +163,13 @@ def normalize_message_for_chat(msg: JSON) -> Optional[JSON]:
     if role not in ("system", "developer", "user", "assistant", "tool"):
         return None
 
+    # Many OpenAI-compatible Chat Completions providers do not support the
+    # newer Responses/Chat "developer" role. Treat it as a system message
+    # rather than forwarding an unsupported role upstream.
+    if role == "developer":
+        role = "system"
+
     out: JSON = {"role": role}
-    # Map developer role to system for providers that don't support it (DeepSeek, Kimi, etc.)
-    if out["role"] == "developer":
-        out["role"] = "system"
     if role == "tool":
         tool_call_id = msg.get("tool_call_id")
         if not tool_call_id:
@@ -678,7 +691,7 @@ class ProxyApp:
         headers = {
             "Authorization": f"Bearer {self.upstream_key}",
             "Content-Type": "application/json",
-            "User-Agent": "codex-opencode-go-responses-proxy/2.0",
+            "User-Agent": "codex-opencode-go-responses-proxy/3.0",
             "Accept": "application/json",
         }
 
@@ -721,7 +734,7 @@ class ProxyApp:
             return 500, b'{"error":{"message":"OPENCODE_GO_API_KEY is not set"}}', "application/json"
         headers = {
             "Authorization": f"Bearer {self.upstream_key}",
-            "User-Agent": "codex-opencode-go-responses-proxy/2.0",
+            "User-Agent": "codex-opencode-go-responses-proxy/3.0",
             "Accept": "application/json",
         }
         req = urllib.request.Request(self.upstream_models_url, headers=headers, method="GET")
@@ -778,15 +791,8 @@ class ProxyApp:
 
         # Add a system guard to discourage parallel tool calls. This is safer than relying
         # on tool_choice/parallel_tool_calls, which some DeepSeek endpoints reject.
-        if self.force_single_tool and converted_tools:
-            guard = {
-                "role": "system",
-                "content": (
-                    "For this coding-agent session, call at most one tool per assistant response. "
-                    "After receiving a tool result, continue with either a final answer or one next tool call. "
-                    "Do not make parallel tool calls."
-                ),
-            }
+        if self.force_single_tool and converted_tools and not any(is_single_tool_guard(m) for m in base_messages):
+            guard = {"role": "system", "content": SINGLE_TOOL_GUARD_TEXT}
             # Place after original system/developer messages but before user content when possible.
             insert_at = 0
             while insert_at < len(base_messages) and base_messages[insert_at].get("role") in ("system", "developer"):
@@ -818,6 +824,36 @@ class ProxyApp:
         # Responses-only params. Do not forward tool_choice/parallel_tool_calls/store/include.
         return payload, base_messages, model_alias, model_upstream, reverse_name_map
 
+    def build_response_shell(
+        self,
+        body: JSON,
+        model_alias: str,
+        response_id: Optional[str] = None,
+        created_at: Optional[int] = None,
+        status: str = "in_progress",
+        output: Optional[List[JSON]] = None,
+        error: Optional[JSON] = None,
+    ) -> JSON:
+        return {
+            "id": response_id or new_id("resp"),
+            "object": "response",
+            "created_at": created_at or now(),
+            "status": status,
+            "error": error,
+            "incomplete_details": None,
+            "instructions": body.get("instructions"),
+            "model": model_alias,
+            "output": output or [],
+            "parallel_tool_calls": False,
+            "previous_response_id": body.get("previous_response_id"),
+            "store": False,
+            "temperature": body.get("temperature"),
+            "top_p": body.get("top_p"),
+            "truncation": body.get("truncation", "disabled"),
+            "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+            "metadata": body.get("metadata") or {},
+        }
+
     def build_response_object(
         self,
         body: JSON,
@@ -826,6 +862,8 @@ class ProxyApp:
         model_alias: str,
         model_upstream: str,
         reverse_name_map: Dict[str, str],
+        response_id: Optional[str] = None,
+        created_at: Optional[int] = None,
     ) -> JSON:
         choice = (chat_resp.get("choices") or [{}])[0]
         upstream_msg = choice.get("message") or {}
@@ -863,7 +901,8 @@ class ProxyApp:
         if tool_calls_out:
             assistant_msg["tool_calls"] = [x["replay"] for x in tool_calls_out]
 
-        response_id = new_id("resp")
+        response_id = response_id or new_id("resp")
+        created_at = created_at or now()
         all_messages = repair_chat_history(base_messages, None) + [assistant_msg]
         pending_ids = [x["codex"]["call_id"] for x in tool_calls_out]
 
@@ -874,7 +913,7 @@ class ProxyApp:
                 model_upstream=model_upstream,
                 messages=all_messages,
                 pending_call_ids=pending_ids,
-                created_at=now(),
+                created_at=created_at,
             )
         )
 
@@ -912,7 +951,7 @@ class ProxyApp:
         resp_obj: JSON = {
             "id": response_id,
             "object": "response",
-            "created_at": now(),
+            "created_at": created_at,
             "status": "completed",
             "error": None,
             "incomplete_details": None,
@@ -939,7 +978,7 @@ APP = ProxyApp()
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "ResponsesChatProxy/2.0"
+    server_version = "ResponsesChatProxy/3.0"
 
     def _send_json(self, status: int, obj: Any) -> None:
         data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
@@ -1002,33 +1041,12 @@ class Handler(BaseHTTPRequestHandler):
                 tools=len(payload.get("tools", [])),
                 stream=bool(body.get("stream")),
             )
-            try:
-                chat_resp = APP.call_upstream_chat(payload)
-                model_used = model_upstream
-            except UpstreamError as first_err:
-                fallbacks = APP.fallback_model_map.get(model_upstream) or APP.fallback_model_map.get(model_alias) or []
-                chat_resp = None
-                model_used = model_upstream
-                if first_err.status in (408, 409, 429, 500, 502, 503, 504):
-                    for fb in fallbacks:
-                        fb_payload = dict(payload)
-                        fb_payload["model"] = map_model(str(fb), APP.model_map)
-                        try:
-                            APP.log("fallback_attempt", from_model=model_upstream, to_model=fb_payload["model"], status=first_err.status)
-                            chat_resp = APP.call_upstream_chat(fb_payload)
-                            model_used = fb_payload["model"]
-                            break
-                        except UpstreamError as fb_err:
-                            APP.log("fallback_failed", model=fb_payload["model"], status=fb_err.status, body=fb_err.body[:300])
-                            first_err = fb_err
-                if chat_resp is None:
-                    raise first_err
-
-            resp_obj = APP.build_response_object(body, chat_resp, base_messages, model_alias, model_used, reverse_name_map)
 
             if body.get("stream"):
-                self._send_sse(resp_obj)
+                self._send_sse_with_upstream(body, payload, base_messages, model_alias, model_upstream, reverse_name_map)
             else:
+                chat_resp, model_used = self._call_upstream_with_fallback(payload, model_alias, model_upstream)
+                resp_obj = APP.build_response_object(body, chat_resp, base_messages, model_alias, model_used, reverse_name_map)
                 self._send_json(200, resp_obj)
 
             # Opportunistic cleanup after successful requests.
@@ -1051,6 +1069,114 @@ class Handler(BaseHTTPRequestHandler):
             APP.log("proxy_crash", error=str(e), trace=traceback.format_exc())
             self._send_error_obj(500, f"Proxy internal error: {e}", "internal_error")
 
+    def _call_upstream_with_fallback(self, payload: JSON, model_alias: str, model_upstream: str) -> Tuple[JSON, str]:
+        try:
+            return APP.call_upstream_chat(payload), model_upstream
+        except UpstreamError as first_err:
+            fallbacks = APP.fallback_model_map.get(model_upstream) or APP.fallback_model_map.get(model_alias) or []
+            if first_err.status in (408, 409, 429, 500, 502, 503, 504):
+                for fb in fallbacks:
+                    fb_payload = dict(payload)
+                    fb_payload["model"] = map_model(str(fb), APP.model_map)
+                    try:
+                        APP.log("fallback_attempt", from_model=model_upstream, to_model=fb_payload["model"], status=first_err.status)
+                        return APP.call_upstream_chat(fb_payload), fb_payload["model"]
+                    except UpstreamError as fb_err:
+                        APP.log("fallback_failed", model=fb_payload["model"], status=fb_err.status, body=fb_err.body[:300])
+                        first_err = fb_err
+            raise first_err
+
+    def _send_sse_headers(self) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+
+    def _write_sse_comment(self, text: str = "keepalive") -> None:
+        self.wfile.write(f": {text} {now()}\n\n".encode("utf-8"))
+        self.wfile.flush()
+
+    def _send_sse_with_upstream(
+        self,
+        body: JSON,
+        payload: JSON,
+        base_messages: List[JSON],
+        model_alias: str,
+        model_upstream: str,
+        reverse_name_map: Dict[str, str],
+    ) -> None:
+        response_id = new_id("resp")
+        created_at = now()
+        shell = APP.build_response_shell(body, model_alias, response_id=response_id, created_at=created_at, status="in_progress")
+
+        self._send_sse_headers()
+        self._write_sse("response.created", {"type": "response.created", "response": shell})
+
+        result_q: "queue.Queue[Tuple[str, Any]]" = queue.Queue(maxsize=1)
+
+        def worker() -> None:
+            try:
+                chat_resp, model_used = self._call_upstream_with_fallback(payload, model_alias, model_upstream)
+                resp_obj = APP.build_response_object(
+                    body,
+                    chat_resp,
+                    base_messages,
+                    model_alias,
+                    model_used,
+                    reverse_name_map,
+                    response_id=response_id,
+                    created_at=created_at,
+                )
+                result_q.put(("ok", resp_obj))
+            except Exception as e:  # send over SSE after headers are already committed
+                result_q.put(("error", e))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+        heartbeat_s = float(os.getenv("SSE_UPSTREAM_HEARTBEAT_SECONDS", "5"))
+        while True:
+            try:
+                kind, value = result_q.get(timeout=heartbeat_s)
+                break
+            except queue.Empty:
+                try:
+                    self._write_sse_comment("upstream_wait")
+                except Exception:
+                    return
+
+        if kind == "ok":
+            self._emit_sse_items_and_completed(value)
+            return
+
+        err = value
+        if isinstance(err, UpstreamError):
+            message = err.body[:1000]
+            typ = "upstream_error"
+            APP.log("upstream_error", status=err.status, body=err.body[:500])
+        elif isinstance(err, HistoryRepairError):
+            message = str(err)
+            typ = "history_repair_error"
+            APP.log("history_repair_error", error=message)
+        else:
+            message = f"Proxy internal error: {err}"
+            typ = "internal_error"
+            APP.log("proxy_crash", error=str(err), trace="".join(traceback.format_exception(type(err), err, err.__traceback__)))
+
+        failed = APP.build_response_shell(
+            body,
+            model_alias,
+            response_id=response_id,
+            created_at=created_at,
+            status="failed",
+            error={"message": message, "type": typ, "code": typ},
+        )
+        self._write_sse("response.failed", {"type": "response.failed", "response": failed})
+        self.wfile.write(b"data: [DONE]\n\n")
+        self.wfile.flush()
+        self.close_connection = True
+
     def _write_sse(self, event: str, data: Any) -> None:
         payload = json.dumps(data, ensure_ascii=False)
         self.wfile.write(f"event: {event}\n".encode("utf-8"))
@@ -1058,14 +1184,11 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.flush()
 
     def _send_sse(self, resp_obj: JSON) -> None:
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "keep-alive")
-        self.end_headers()
-
+        self._send_sse_headers()
         self._write_sse("response.created", {"type": "response.created", "response": {**resp_obj, "output": []}})
+        self._emit_sse_items_and_completed(resp_obj)
 
+    def _emit_sse_items_and_completed(self, resp_obj: JSON) -> None:
         for idx, item in enumerate(resp_obj.get("output", [])):
             self._write_sse(
                 "response.output_item.added",
@@ -1151,6 +1274,7 @@ class Handler(BaseHTTPRequestHandler):
         self._write_sse("response.completed", {"type": "response.completed", "response": resp_obj})
         self.wfile.write(b"data: [DONE]\n\n")
         self.wfile.flush()
+        self.close_connection = True
 
 
 def run_self_test() -> None:

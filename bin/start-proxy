@@ -18,6 +18,8 @@ export PROXY_PORT="${PROXY_PORT:-4000}"
 export PROXY_STATE_DB="${PROXY_STATE_DB:-/tmp/opencode_responses_proxy_state.sqlite3}"
 export FORCE_SINGLE_TOOL_INSTRUCTIONS="${FORCE_SINGLE_TOOL_INSTRUCTIONS:-0}"
 export FALLBACK_MODEL_MAP_JSON="${FALLBACK_MODEL_MAP_JSON:-{\"deepseek-v4-pro\":[\"kimi-k2.6\",\"deepseek-v4-flash\"],\"kimi-k2.6\":[\"deepseek-v4-pro\"],\"deepseek-v4-flash\":[\"kimi-k2.6\"]}}"
+export SSE_UPSTREAM_HEARTBEAT_SECONDS="${SSE_UPSTREAM_HEARTBEAT_SECONDS:-5}"
+export UPSTREAM_TIMEOUT_SECONDS="${UPSTREAM_TIMEOUT_SECONDS:-240}"
 
 # Already running? Skip.
 if curl -s --max-time 2 "http://127.0.0.1:${PROXY_PORT}/health" \
