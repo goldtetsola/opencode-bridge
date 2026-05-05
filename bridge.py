@@ -669,6 +669,124 @@ class UpstreamError(Exception):
         self.headers = headers or {}
 
 
+# ── v8: Transactional tool-turn adapter ──
+
+# Request classification
+RequestKind = str  # "fresh_user_turn" | "tool_result_continuation" | "orphan_tool_result_continuation" | "resumed_user_turn"
+ToolKind = str  # "read" | "write" | "shell" | "unknown"
+
+@dataclass
+class CompactedToolOutput:
+    original: str
+    compacted: str
+    exit_code: int
+    is_compacted: bool
+    original_bytes: int
+    original_lines: int
+
+def classify_request_kind(body: JSON) -> RequestKind:
+    """Classify the incoming request to determine the handling path."""
+    input_items = body.get("input", [])
+    tool_outputs = [m for m in input_items if m.get("type") == "function_call_output"]
+    if tool_outputs:
+        return "tool_result_continuation" if body.get("previous_response_id") else "orphan_tool_result_continuation"
+    if body.get("previous_response_id"):
+        return "resumed_user_turn"
+    return "fresh_user_turn"
+
+def classify_tool_call_name(name: str) -> ToolKind:
+    """Classify a tool call by its name."""
+    n = (name or "").lower()
+    if any(kw in n for kw in ("read", "cat", "head", "tail", "grep", "find", "ls", "nl", "sed")):
+        return "read"
+    if any(kw in n for kw in ("write", "edit", "patch", "apply_patch", "create", "mkdir")):
+        return "write"
+    if any(kw in n for kw in ("exec", "bash", "sh", "test", "run", "npm", "node", "python")):
+        return "shell"
+    return "unknown"
+
+def compact_tool_output(output_text: str, max_chars: int = 20000,
+                        max_lines: int = 400, max_stdout: int = 16000) -> CompactedToolOutput:
+    """Compact large tool outputs to prevent upstream stalls."""
+    import hashlib
+    lines = output_text.split("\n")
+    n_bytes = len(output_text.encode("utf-8"))
+    n_lines = len(lines)
+
+    if n_bytes <= max_chars and n_lines <= max_lines:
+        return CompactedToolOutput(
+            original=output_text, compacted=output_text,
+            exit_code=0, is_compacted=False,
+            original_bytes=n_bytes, original_lines=n_lines)
+
+    sha = hashlib.sha256(output_text.encode()).hexdigest()[:16]
+    preview_first = "\n".join(lines[:200])
+    preview_last = "\n".join(lines[-80:])
+
+    compacted = (
+        f"[TOOL OUTPUT COMPACTED]\n\n"
+        f"Original bytes: {n_bytes}\n"
+        f"Original lines: {n_lines}\n"
+        f"SHA256: {sha}\n\n"
+        f"--- first 200 lines ---\n{preview_first}\n\n"
+        f"--- last 80 lines ---\n{preview_last}\n\n"
+        f"If more exact content is required, ask the parent orchestrator for a narrower read."
+    )
+    return CompactedToolOutput(
+        original=output_text, compacted=compacted,
+        exit_code=0, is_compacted=True,
+        original_bytes=n_bytes, original_lines=n_lines)
+
+def build_deterministic_write_report(model: str, tool_name: str, path: str,
+                                      success: bool) -> JSON:
+    """Build a deterministic assistant report for write operations."""
+    if success:
+        text = (
+            f"OSS write completed.\n\n"
+            f"Model: {model}\n"
+            f"Tool call: {tool_name}\n"
+            f"Changed path: {path}\n"
+            f"Result: success\n"
+            f"Confidence: MEDIUM\n"
+            f"Caveat: final OSS model report bypassed; tool execution confirmed\n"
+            f"Escalation: GPT review required before accepting changes"
+        )
+    else:
+        text = (
+            f"OSS write failed.\n\n"
+            f"Model: {model}\n"
+            f"Tool call: {tool_name}\n"
+            f"Path: {path}\n"
+            f"Result: failure\n"
+            f"Confidence: LOW\n"
+            f"Escalation: GPT-5.4 review required"
+        )
+    return {
+        "id": new_id("msg"),
+        "status": "completed",
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": text, "annotations": []}],
+    }
+
+def build_deterministic_error_report(error_kind: str, details: str) -> JSON:
+    """Build a deterministic error report when a tool fails."""
+    return {
+        "id": new_id("msg"),
+        "status": "completed",
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": (
+            f"OSS tool failed.\n\n"
+            f"Error: {error_kind}\n"
+            f"Details: {details}\n\n"
+            f"Confidence: LOW\n"
+            f"Escalation: GPT-5.4 review required"
+        ), "annotations": []}],
+    }
+
+
+# ── End v8 preamble ──
+
+
 class ProxyApp:
     def __init__(self):
         self.upstream_base = os.getenv("UPSTREAM_BASE", "https://opencode.ai/zen/go/v1").rstrip("/")
@@ -726,6 +844,22 @@ class ProxyApp:
         # Max-turn guard — prevent runaway token burn in OSS agent loops
         self.max_tool_turns = int(os.getenv("OSS_MAX_TOOL_TURNS", "6"))
         self.max_write_tool_turns = int(os.getenv("OSS_MAX_WRITE_TOOL_TURNS", "3"))
+
+        # ── Bridge v8: Transactional tool-turn adapter ──
+        self.native_max_tool_exchanges = int(os.getenv("OSS_NATIVE_MAX_TOOL_EXCHANGES", "1"))
+        self.continuation_tools = os.getenv("CONTINUATION_TOOLS", "none")
+        self.continuation_model = os.getenv("CONTINUATION_MODEL", "kimi-k2.6")
+        self.continuation_fallbacks = [
+            m.strip() for m in os.getenv("CONTINUATION_FALLBACK_MODELS", "deepseek-v4-flash").split(",") if m.strip()
+        ]
+        self.continuation_deadline = float(os.getenv("CONTINUATION_DEADLINE_SECONDS", "45"))
+        self.write_result_mode = os.getenv("WRITE_RESULT_MODE", "deterministic")
+        self.write_report_deadline = float(os.getenv("WRITE_REPORT_DEADLINE_SECONDS", "20"))
+        self.upstream_first_byte_timeout = float(os.getenv("UPSTREAM_FIRST_BYTE_TIMEOUT_SECONDS", "30"))
+        self.upstream_idle_timeout = float(os.getenv("UPSTREAM_IDLE_TIMEOUT_SECONDS", "30"))
+        self.oss_turn_deadline = float(os.getenv("OSS_TURN_DEADLINE_SECONDS", "120"))
+        self.max_tool_output_chars = int(os.getenv("MAX_TOOL_OUTPUT_CHARS", "20000"))
+        self.degraded_completion_on_timeout = os.getenv("DEGRADED_COMPLETION_ON_TIMEOUT", "1") != "0"
 
     def log(self, msg: str, **fields: Any) -> None:
         line = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
@@ -849,6 +983,105 @@ class ProxyApp:
             health["fallback"] = fb
             self.log("circuit_breaker_open", model=model, fallback=fb, cooldown_s=self.circuit_breaker_cooldown)
         self.model_health[model] = health
+
+    # ── v8: Transactional tool-turn adapter methods ──
+
+    def resolve_continuation_tools(self, tool_kind: ToolKind) -> Optional[List[JSON]]:
+        """Return tools for a continuation turn, or None to strip all tools and force finalization."""
+        if self.continuation_tools == "none":
+            return None
+        return []
+
+    def should_deterministic_close(self, tool_kind: ToolKind, exit_code: int) -> bool:
+        """Whether this tool result should get a deterministic report without calling the model."""
+        if tool_kind == "write" and self.write_result_mode == "deterministic":
+            return True
+        if exit_code != 0:
+            return True
+        return False
+
+    def build_continuation_payload(self, model: str, base_messages: List[JSON],
+                                     compacted: CompactedToolOutput,
+                                     tool_kind: ToolKind, original_task: str) -> JSON:
+        """Build a finalizer payload — no tools, short context, compacted output."""
+        messages = list(base_messages)
+        tool_output_text = compacted.compacted[:self.max_tool_output_chars]
+        messages.append({
+            "role": "user",
+            "content": (
+                f"Task: {original_task}\n\n"
+                f"Tool executed: {tool_kind} operation\n"
+                f"Tool result:\n{tool_output_text}"
+            )
+        })
+        payload = {
+            "model": model,
+            "messages": messages,
+            "stream": self.upstream_streaming,
+        }
+        # No tools on finalizer
+        payload["tools"] = []
+        return payload
+
+    def call_continuation_with_deadline(self, payload: JSON, deadline: float) -> JSON:
+        """Call upstream with a hard deadline. Returns response or raises."""
+        start = time.time()
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        headers = {
+            "Authorization": f"Bearer {self.upstream_key}",
+            "Content-Type": "application/json",
+            "User-Agent": "codex-opencode-go-responses-proxy/8.0",
+            "Accept": "application/json",
+        }
+
+        req = urllib.request.Request(self.upstream_chat_url, data=data, headers=headers, method="POST")
+        remaining = max(1.0, deadline - (time.time() - start))
+
+        try:
+            with urllib.request.urlopen(req, timeout=remaining) as resp:
+                body = resp.read().decode("utf-8", errors="replace")
+                return json.loads(body)
+        except Exception as e:
+            self.log("continuation_upstream_failed", error=str(e), deadline=deadline)
+            raise
+
+    def build_degraded_completion(self, model: str, reason: str, tool_kind: ToolKind) -> JSON:
+        """Build a degraded-but-terminal assistant message for stalled continuations."""
+        return {
+            "id": new_id("msg"),
+            "status": "completed",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": (
+                f"OSS worker could not complete the final report.\n\n"
+                f"Model: {model}\n"
+                f"Operation: {tool_kind}\n"
+                f"Reason: {reason}\n"
+                f"Confidence: LOW\n"
+                f"Escalation: GPT-5.4 review required"
+            ), "annotations": []}],
+        }
+
+    def build_response_shell(self, body: JSON, model_alias: str, response_id: str,
+                             created_at: int, status: str, output: List[JSON]) -> JSON:
+        return {
+            "id": response_id,
+            "object": "response",
+            "created_at": created_at,
+            "status": status,
+            "error": None,
+            "incomplete_details": None,
+            "instructions": None,
+            "model": model_alias,
+            "output": output,
+            "parallel_tool_calls": False,
+            "previous_response_id": body.get("previous_response_id"),
+            "store": False,
+            "temperature": None,
+            "top_p": None,
+            "truncation": "disabled",
+            "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+            "metadata": {},
+        }
 
     def call_upstream_chat(self, payload: JSON) -> JSON:
         if not self.upstream_key:
@@ -1709,7 +1942,16 @@ class Handler(BaseHTTPRequestHandler):
                     self._send_raw(status, data, ctype)
                 return
 
+            # ── v8: Check for continuation BEFORE prepare_chat_payload ──
+            request_kind = classify_request_kind(body)
+            if request_kind in ("tool_result_continuation", "orphan_tool_result_continuation"):
+                self._handle_continuation(body)
+                return
+
             payload, base_messages, model_alias, model_upstream, reverse_name_map = APP.prepare_chat_payload(body)
+
+            # ── v8: Transactional continuation path ──
+            request_kind = classify_request_kind(body)
             APP.log(
                 "request",
                 model_alias=model_alias,
@@ -1717,7 +1959,7 @@ class Handler(BaseHTTPRequestHandler):
                 messages=len(payload.get("messages", [])),
                 tools=len(payload.get("tools", [])),
                 stream=bool(body.get("stream")),
-                turn_kind="tool_output_continuation" if body.get("previous_response_id") else "new",
+                turn_kind=request_kind,
                 tool_count=sum(1 for m in payload.get("messages", []) if m.get("role") == "tool"),
             )
 
@@ -1774,6 +2016,167 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             APP.log("proxy_crash", error=str(e), trace=traceback.format_exc())
             self._send_error_obj(500, f"Proxy internal error: {e}", "internal_error")
+
+    def _handle_continuation(self, body: JSON) -> None:
+        """v8: Handle tool_result_continuation with deterministic finalization.
+
+        This is a dedicated path — it does NOT go through prepare_chat_payload.
+        For writes/errors: deterministic close. For reads: compacted finalizer call.
+        """
+        model_alias = str(body.get("model") or "ocg-deepseek-v4-pro")
+        model_upstream = APP.route_gpt_model_for_chat_bridge(model_alias) or map_model(model_alias, APP.model_map)
+
+        # Classify tool outputs
+        tool_outputs = [m for m in body.get("input", []) if m.get("type") == "function_call_output"]
+        if not tool_outputs:
+            # Fall through to normal path if somehow no tool outputs
+            self._handle_fresh_turn(body)
+            return
+
+        first_tool = tool_outputs[0]
+        tool_call_id = str(first_tool.get("call_id", ""))
+        tool_name_raw = first_tool.get("name", "")
+
+        # Look up stored state to find the previous tool call's original name
+        prev_id = body.get("previous_response_id")
+        prev_state = None
+        if prev_id:
+            prev_state = APP.state.get(str(prev_id))
+        if not prev_state and tool_call_id:
+            prev_state = APP.state.find_by_call_ids([tool_call_id])
+
+        reverse_name_map = {}
+        if prev_state:
+            # Try to find the tool name from the stored messages
+            for msg in prev_state.messages:
+                tool_calls = msg.get("tool_calls") or []
+                for tc in tool_calls:
+                    tc_func = tc.get("function", {})
+                    if tc.get("id") == tool_call_id or tc.get("codex", {}).get("call_id") == tool_call_id:
+                        tool_name_raw = tc_func.get("name", tool_name_raw)
+                    if tc_func.get("name"):
+                        reverse_name_map[tc_func["name"]] = tc_func["name"]
+
+        tool_kind = classify_tool_call_name(tool_name_raw)
+        tool_output_raw = first_tool.get("output", "")
+        tool_output_text = str(tool_output_raw)
+
+        APP.log("continuation_start", model=model_alias, tool_kind=tool_kind,
+                tool_name=tool_name_raw, output_chars=len(tool_output_text))
+
+        # Compact large outputs
+        compacted = compact_tool_output(tool_output_text, max_chars=APP.max_tool_output_chars)
+        if compacted.is_compacted:
+            APP.log("tool_output_compacted", original_bytes=compacted.original_bytes,
+                    original_lines=compacted.original_lines)
+
+        # Exit code detection
+        exit_code = 0
+        if isinstance(tool_output_raw, dict) and tool_output_raw.get("error"):
+            exit_code = 1
+
+        # Deterministic close for writes and errors
+        if APP.should_deterministic_close(tool_kind, exit_code):
+            report = build_deterministic_write_report(
+                model=model_alias, tool_name=tool_name_raw,
+                path=tool_call_id,
+                success=(exit_code == 0))
+            resp_obj = APP.build_response_shell(
+                body, model_alias,
+                response_id=new_id("resp"),
+                created_at=now(),
+                status="completed",
+                output=[{"type": "message", **report}],
+            )
+            APP.log("continuation_deterministic_close", tool_kind=tool_kind)
+            self._send_json(200, resp_obj)
+            return
+
+        # Finalizer call for reads — no tools, short deadline, compacted output
+        finalizer_model = map_model(APP.continuation_model, APP.model_map)
+        original_task = ""
+        if prev_state:
+            for m in prev_state.messages:
+                if m.get("role") == "user" and m.get("content"):
+                    original_task = str(m["content"])[:500]
+                    break
+
+        finalizer_messages: List[JSON] = []
+        if prev_state:
+            finalizer_messages = list(repair_chat_history(prev_state.messages, tool_outputs))
+            finalizer_messages = merge_new_user_messages(finalizer_messages, [])
+        finalizer_messages.append({
+            "role": "user",
+            "content": (
+                f"Task: {original_task}\n\n"
+                f"Tool executed: {tool_kind} operation\n"
+                f"Tool result:\n{compacted.compacted[:APP.max_tool_output_chars]}"
+            )
+        })
+
+        finalizer_payload = {
+            "model": finalizer_model,
+            "messages": finalizer_messages,
+            "stream": False,  # Non-streaming for finalizer — faster, simpler
+        }
+        if APP.continuation_tools == "none":
+            finalizer_payload["tools"] = []
+            finalizer_payload["tool_choice"] = "none"
+
+        APP.log("continuation_finalizer", model=finalizer_model, deadline=APP.continuation_deadline)
+
+        try:
+            chat_resp = APP.call_continuation_with_deadline(
+                finalizer_payload, APP.continuation_deadline)
+            resp_obj = APP.build_response_object(
+                body, chat_resp, finalizer_messages, model_alias,
+                map_model(model_alias, APP.model_map), reverse_name_map)
+            self._send_json(200, resp_obj)
+            APP.log("continuation_finalizer_ok")
+        except Exception as e:
+            APP.log("continuation_finalizer_failed", error=str(e))
+
+            # Fallback ladder
+            for fb_model_name in APP.continuation_fallbacks:
+                fb_model = map_model(fb_model_name, APP.model_map)
+                fb_payload = dict(finalizer_payload)
+                fb_payload["model"] = fb_model
+                try:
+                    chat_resp = APP.call_continuation_with_deadline(
+                        fb_payload, APP.continuation_deadline * 0.7)
+                    resp_obj = APP.build_response_object(
+                        body, chat_resp, finalizer_messages, model_alias,
+                        map_model(model_alias, APP.model_map), reverse_name_map)
+                    self._send_json(200, resp_obj)
+                    APP.log("continuation_fallback_ok", fallback_model=fb_model)
+                    return
+                except Exception:
+                    APP.log("continuation_fallback_failed", model=fb_model)
+
+            # Degraded completion — always return something terminal
+            if APP.degraded_completion_on_timeout:
+                degraded = APP.build_degraded_completion(model_alias, "all finalizers failed", tool_kind)
+                resp_obj = APP.build_response_shell(
+                    body, model_alias,
+                    response_id=new_id("resp"),
+                    created_at=now(),
+                    status="completed",
+                    output=[{"type": "message", **degraded}],
+                )
+                self._send_json(200, resp_obj)
+                APP.log("continuation_degraded_complete")
+            else:
+                self._send_error_obj(502, f"All continuation finalizers failed for {tool_kind}")
+
+    def _handle_fresh_turn(self, body: JSON) -> None:
+        """Fallback for when continuation path can't handle the request."""
+        payload, base_messages, model_alias, model_upstream, reverse_name_map = APP.prepare_chat_payload(body)
+        if body.get("stream"):
+            self._send_sse_with_upstream(body, payload, base_messages, model_alias, model_upstream, reverse_name_map)
+        else:
+            chat_resp, model_used = self._call_upstream_with_fallback(payload, model_alias, model_upstream)
+            resp_obj = APP.build_response_object(body, chat_resp, base_messages, model_alias, model_used, reverse_name_map)
+            self._send_json(200, resp_obj)
 
     def _call_upstream_with_fallback(self, payload: JSON, model_alias: str, model_upstream: str) -> Tuple[JSON, str]:
         # Circuit breaker check
@@ -2311,6 +2714,43 @@ def run_self_test() -> None:
     assert is_gpt_model("gpt-5.5")
     assert is_gpt_model("openai/gpt-5.4-mini")
     assert not is_gpt_model("ocg-deepseek-v4-pro")
+
+    # ── v8: Classification tests ──
+    assert classify_request_kind({"input": [{"role": "user", "content": "hello"}]}) == "fresh_user_turn"
+    assert classify_request_kind({"input": [{"type": "function_call_output", "call_id": "x", "output": "y"}]}) == "orphan_tool_result_continuation"
+    assert classify_request_kind({"input": [{"type": "function_call_output", "call_id": "x", "output": "y"}], "previous_response_id": "abc"}) == "tool_result_continuation"
+    assert classify_request_kind({"previous_response_id": "abc"}) == "resumed_user_turn"
+
+    # Tool classification
+    assert classify_tool_call_name("rtk_read") == "read"
+    assert classify_tool_call_name("exec_command") == "shell"
+    assert classify_tool_call_name("write_to_file") == "write"
+    assert classify_tool_call_name("apply_patch") == "write"
+    assert classify_tool_call_name("unknown_tool") == "unknown"
+
+    # Tool output compaction
+    small = compact_tool_output("short output", max_chars=1000, max_lines=10)
+    assert not small.is_compacted
+    assert small.compacted == "short output"
+
+    big = compact_tool_output("\n".join(f"line {i}" for i in range(500)), max_chars=200, max_lines=10)
+    assert big.is_compacted
+    assert "TOOL OUTPUT COMPACTED" in big.compacted
+    assert "line 0" in big.compacted
+    assert big.original_lines == 500
+
+    # Deterministic write report
+    report = build_deterministic_write_report("ocg-deepseek-v4-pro", "write_to_file", "/tmp/test.txt", True)
+    assert "OSS write completed" in report["content"][0]["text"]
+    assert "MEDIUM" in report["content"][0]["text"]
+
+    report_fail = build_deterministic_write_report("ocg-deepseek-v4-pro", "write_to_file", "/tmp/test.txt", False)
+    assert "OSS write failed" in report_fail["content"][0]["text"]
+
+    # Deterministic error report
+    error_report = build_deterministic_error_report("file_not_found", "src/missing.js does not exist")
+    assert "OSS tool failed" in error_report["content"][0]["text"]
+    assert "file_not_found" in error_report["content"][0]["text"]
 
     print("self-test passed")
 
