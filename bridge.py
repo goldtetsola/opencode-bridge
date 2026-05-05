@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-responses_chat_proxy_v6.py
+responses_chat_proxy_v8.py
 
 A small, dependency-free OpenAI Responses API -> OpenAI-compatible Chat Completions
 bridge with true upstream streaming, designed for Codex custom model providers that need to call OpenCode Go OSS
@@ -919,7 +919,7 @@ class ProxyApp:
         headers = {
             "Authorization": f"Bearer {self.openai_key}",
             "Content-Type": "application/json",
-            "User-Agent": "codex-opencode-go-responses-proxy/6.0",
+            "User-Agent": "codex-opencode-go-responses-proxy/8.0",
             "Accept": "application/json",
         }
         req = urllib.request.Request(self.openai_responses_url, data=data, headers=headers, method="POST")
@@ -941,7 +941,7 @@ class ProxyApp:
         headers = {
             "Authorization": f"Bearer {self.openai_key}",
             "Content-Type": "application/json",
-            "User-Agent": "codex-opencode-go-responses-proxy/6.0",
+            "User-Agent": "codex-opencode-go-responses-proxy/8.0",
             "Accept": "text/event-stream, application/json",
         }
         req = urllib.request.Request(self.openai_responses_url, data=data, headers=headers, method="POST")
@@ -1109,7 +1109,7 @@ class ProxyApp:
         headers = {
             "Authorization": f"Bearer {self.upstream_key}",
             "Content-Type": "application/json",
-            "User-Agent": "codex-opencode-go-responses-proxy/6.0",
+            "User-Agent": "codex-opencode-go-responses-proxy/8.0",
             "Accept": "application/json",
         }
 
@@ -1170,7 +1170,7 @@ class ProxyApp:
         headers = {
             "Authorization": f"Bearer {self.upstream_key}",
             "Content-Type": "application/json",
-            "User-Agent": "codex-opencode-go-responses-proxy/6.0",
+            "User-Agent": "codex-opencode-go-responses-proxy/8.0",
             "Accept": "text/event-stream, application/json",
         }
 
@@ -1230,7 +1230,7 @@ class ProxyApp:
             return 500, b'{"error":{"message":"OPENCODE_GO_API_KEY is not set"}}', "application/json"
         headers = {
             "Authorization": f"Bearer {self.upstream_key}",
-            "User-Agent": "codex-opencode-go-responses-proxy/6.0",
+            "User-Agent": "codex-opencode-go-responses-proxy/8.0",
             "Accept": "application/json",
         }
         req = urllib.request.Request(self.upstream_models_url, headers=headers, method="GET")
@@ -1857,7 +1857,7 @@ class ChatStreamAssembler:
         return resp_obj
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "ResponsesChatProxy/5.0"
+    server_version = "ResponsesChatProxy/8.0"
 
     def _send_json(self, status: int, obj: Any) -> None:
         data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
@@ -1898,7 +1898,7 @@ class Handler(BaseHTTPRequestHandler):
             status_info = {
                 "ok": True,
                 "service": "responses-chat-proxy",
-                "bridge_version": "7.0",
+                "bridge_version": "8.0",
                 "time": now(),
                 "gpt_model_strategy": APP.gpt_model_strategy,
                 "upstream_stream": getattr(APP, "upstream_streaming", True),
