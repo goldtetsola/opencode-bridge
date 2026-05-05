@@ -120,6 +120,15 @@ The bridge handles:
 | `CIRCUIT_BREAKER_COOLDOWN` | `300` | Seconds before auto-recovering a degraded model |
 | `OSS_MAX_TOOL_TURNS` | `6` | Max tool turns before OSS agent is stopped |
 | `ALLOW_MISSING_OPENCODE_KEY` | `0` | Set to `1` to bypass fatal key check |
+| `OSS_NATIVE_MAX_TOOL_EXCHANGES` | `1` | Max tool calls per OSS subagent turn |
+| `CONTINUATION_TOOLS` | `none` | Tools for continuation turns (v8: `none` = no tools, force finalization) |
+| `CONTINUATION_MODEL` | `kimi-k2.6` | Model for read-result finalizer |
+| `CONTINUATION_DEADLINE_SECONDS` | `45` | Deadline for finalizer model calls |
+| `WRITE_RESULT_MODE` | `deterministic` | Write results: `deterministic` = no model call |
+| `MAX_TOOL_OUTPUT_CHARS` | `20000` | Compact tool outputs larger than this |
+| `UPSTREAM_FIRST_BYTE_TIMEOUT_SECONDS` | `30` | Timeout for first byte from upstream |
+| `UPSTREAM_IDLE_TIMEOUT_SECONDS` | `30` | Timeout for upstream idle during processing |
+| `DEGRADED_COMPLETION_ON_TIMEOUT` | `1` | Return degraded report on timeout (v8: always returns terminal response) |
 | `EXPOSE_EMPTY_REASONING_ITEM` | `1` | Include empty reasoning item in output for Codex compatibility |
 | `STRIP_TOOLS` | `0` | Set to `1` to strip ALL tools (force text-only responses) |
 
@@ -136,6 +145,30 @@ The bridge handles:
 | `ocg-minimax-m2.7` | minimax-m2.7 | (untested) |
 
 Also accepts OpenCode-style `opencode-go/<model>` model IDs.
+
+## Bridge v8: Transactional tool-turn adapter
+
+OSS agents are bounded tool transactions, not autonomous multi-turn agents. When an OSS subagent executes a tool (read, write, shell), the continuation is handled deterministically:
+
+- **Writes**: No model call needed after a successful write. The bridge generates the report directly ("OSS write completed. File: X. Result: success. GPT review required").
+- **Reads**: A no-tool finalizer call with a short deadline. The model can only summarize — it can't call more tools or hang in reasoning.
+- **Stalled finalizer**: Falls back through Kimi → Flash → deterministic degraded report. **Every request always returns a terminal response. No hang possible.**
+
+This fixes the two common failure modes: resumed turn hangs and post-write report hangs.
+
+### v8 environment variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `OSS_NATIVE_MAX_TOOL_EXCHANGES` | `1` | Max tool calls per OSS subagent turn |
+| `CONTINUATION_TOOLS` | `none` | Tools for continuation turns (`none` = no tools) |
+| `CONTINUATION_MODEL` | `kimi-k2.6` | Model for read finalizer |
+| `CONTINUATION_FALLBACK_MODELS` | `deepseek-v4-flash` | Fallback finalizer models |
+| `CONTINUATION_DEADLINE_SECONDS` | `45` | Deadline for finalizer calls |
+| `WRITE_RESULT_MODE` | `deterministic` | Write handling: `deterministic` = no model call |
+| `MAX_TOOL_OUTPUT_CHARS` | `20000` | Compact outputs larger than this |
+| `UPSTREAM_FIRST_BYTE_TIMEOUT_SECONDS` | `30` | Timeout for first upstream byte |
+| `DEGRADED_COMPLETION_ON_TIMEOUT` | `1` | Return degraded report on timeout |
 
 ## Model-task matrix
 
