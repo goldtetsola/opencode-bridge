@@ -1,0 +1,14 @@
+#!/usr/bin/env python3
+"""codex-oss entry point. Run from the repo root or a project directory."""
+
+import os
+import sys
+
+# Add repo root to path so codex_oss imports work
+repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, repo_root)
+
+from codex_oss.cli import main
+
+if __name__ == "__main__":
+    main()

@@ -1575,7 +1575,17 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if self.path.rstrip("/") in ("/health", "/v1/health"):
-            self._send_json(200, {"ok": True, "service": "responses-chat-proxy", "time": now()})
+            status_info = {
+                "ok": True,
+                "service": "responses-chat-proxy",
+                "bridge_version": "6.0",
+                "time": now(),
+                "gpt_model_strategy": APP.gpt_model_strategy,
+                "upstream_stream": getattr(APP, "upstream_stream", True),
+                "has_opencode_key": bool(APP.upstream_key),
+                "state_db": APP.state.db_path if hasattr(APP.state, "db_path") else os.getenv("PROXY_STATE_DB", "unknown"),
+            }
+            self._send_json(200, status_info)
             return
 
         self._send_error_obj(404, f"Unknown path: {self.path}", "not_found")
