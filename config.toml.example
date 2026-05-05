@@ -1,19 +1,20 @@
 # Merge this into your existing .codex/config.toml or Codex user config.
 
+# ⚠️ CRITICAL: Do NOT set model_provider = "opencode_bridge" as your session-wide
+# provider. Codex will route GPT-5.5 orchestrator requests through the bridge,
+# which cannot serve GPT models (OpenCode Go rejects them).
+# 
+# Correct: GPT-5.5 native (openai provider as parent session).
+#          OSS agents use model_provider = "opencode_bridge" in their TOMLs only.
+
 [model_providers.opencode_bridge]
 name = "OpenCode Bridge"
 base_url = "http://127.0.0.1:4000/v1"
+env_key = "LITELLM_MASTER_KEY"
 wire_api = "responses"
 request_max_retries = 2
 stream_max_retries = 2
 stream_idle_timeout_ms = 300000
-
-# The bridge is a localhost service with a shared secret, not a real credential.
-# auth.command tells Codex how to get the key for every session and subagent.
-[model_providers.opencode_bridge.auth]
-command = "echo"
-args = ["sk-local-codex-bridge"]
-timeout_ms = 1000
 
 # Optional: slim profile for OSS native subagents.
 # Disables MCP/web/apps to avoid sending unsupported tool types.

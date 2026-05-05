@@ -1,5 +1,18 @@
 # OSS Model Routing — Reference & Troubleshooting
 
+## Architecture
+
+```
+Parent session:  GPT-5.5 (native openai provider)  ← orchestrator
+                                                      reads AGENTS.md, spawns subagents
+OSS subagents:   opencode_bridge provider            ← only used in agent TOMLs
+                   → bridge.py (v6)
+                   → OpenCode Go
+                   → DeepSeek V4 Pro / Kimi K2.6 / Flash
+```
+
+**Bridge is a subagent-only provider.** Do NOT set `model_provider = "opencode_bridge"` as your session-wide provider. Codex will route GPT-5.5 orchestrator requests through the bridge, which cannot serve GPT models. The bridge v6 detects and rejects GPT requests immediately (`GPT_MODEL_STRATEGY=error`).
+
 ## How routing works
 
 Codex's orchestrator (GPT-5.5) matches tasks to agents by reading `.codex/agents/*.toml` and applying the rules in `AGENTS.md`. OSS agents use `fork_turns: "none"` to avoid inheriting the parent GPT-5.5 model, which conflicts with custom provider overrides.

@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-responses_chat_proxy_v3.py
+responses_chat_proxy_v6.py
 
 A small, dependency-free OpenAI Responses API -> OpenAI-compatible Chat Completions
-bridge, designed for Codex custom model providers that need to call OpenCode Go OSS
-models such as deepseek-v4-pro and kimi-k2.6.
+bridge with true upstream streaming, designed for Codex custom model providers that need to call OpenCode Go OSS
+models such as deepseek-v4-pro and kimi-k2.6. v6 also handles accidental GPT model aliases so
+the bridge does not silently forward gpt-5.x requests to OpenCode Go.
 
 What this proxy does:
 - Accepts POST /v1/responses from Codex.
@@ -14,8 +15,11 @@ What this proxy does:
 - Tracks response state and repairs orphan function_call_output turns.
 - Preserves provider reasoning_content in stored assistant messages.
 - Preserves valid completed assistant->tool exchanges instead of truncating context.
-- Emits normal JSON or SSE-like Responses events back to Codex.
+- Emits normal JSON or live Responses SSE events back to Codex.
+- Streams upstream Chat Completions SSE live and converts deltas into Responses SSE.
+- Assembles streamed tool calls/content/reasoning into stored assistant state.
 - Forwards GET /v1/models to the upstream provider.
+- Optionally passes GPT-family model requests through to OpenAI Responses API or aliases them to an OSS model.
 
 Intended upstream:
   https://opencode.ai/zen/go/v1/chat/completions
@@ -27,6 +31,12 @@ Recommended env:
   PROXY_API_KEY or LITELLM_MASTER_KEY   # key Codex sends to this local proxy
   PROXY_PORT=4000
   PROXY_STATE_DB=/tmp/opencode_responses_proxy_state.sqlite3
+
+Optional GPT-family model handling:
+  GPT_MODEL_STRATEGY=error|oss|openai   # default: error
+  GPT_MODEL_OSS_FALLBACK=deepseek-v4-pro
+  OPENAI_API_KEY                        # required only for GPT_MODEL_STRATEGY=openai
+  OPENAI_BASE_URL=https://api.openai.com/v1
 
 Codex config example:
   [model_providers.litellm_opencode_go]
@@ -394,6 +404,11 @@ class HistoryRepairError(Exception):
     pass
 
 
+class ClientDisconnected(Exception):
+    """Raised when Codex closes the SSE connection before we finish writing."""
+    pass
+
+
 def tool_call_ids(assistant_msg: JSON) -> List[str]:
     ids: List[str] = []
     for tc in assistant_msg.get("tool_calls") or []:
@@ -633,6 +648,19 @@ def is_deepseek(model: str) -> bool:
     return "deepseek" in model.lower()
 
 
+def is_gpt_model(model: str) -> bool:
+    m = (model or "").lower().strip()
+    if m.startswith("openai/"):
+        m = m.split("/", 1)[1]
+    return m.startswith("gpt-") or m.startswith("gpt_")
+
+
+class UnsupportedBridgeModel(Exception):
+    def __init__(self, model: str, message: Optional[str] = None):
+        self.model = model
+        super().__init__(message or f"Model {model!r} is not served by the OpenCode Go bridge")
+
+
 class UpstreamError(Exception):
     def __init__(self, status: int, body: str, headers: Optional[Dict[str, str]] = None):
         super().__init__(f"upstream error {status}: {body[:1000]}")
@@ -648,7 +676,12 @@ class ProxyApp:
         self.upstream_models_url = f"{self.upstream_base}/models"
         self.upstream_key = os.getenv("OPENCODE_GO_API_KEY", "")
         self.proxy_key = os.getenv("PROXY_API_KEY") or os.getenv("LITELLM_MASTER_KEY") or ""
-        self.timeout = float(os.getenv("UPSTREAM_TIMEOUT_SECONDS", "240"))
+        self.gpt_model_strategy = os.getenv("GPT_MODEL_STRATEGY", "error").strip().lower()
+        self.gpt_oss_fallback = os.getenv("GPT_MODEL_OSS_FALLBACK", "deepseek-v4-pro").strip()
+        self.openai_key = os.getenv("OPENAI_API_KEY", "")
+        self.openai_base = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
+        self.openai_responses_url = f"{self.openai_base}/responses"
+        self.timeout = float(os.getenv("UPSTREAM_TIMEOUT_SECONDS", "900"))
         self.max_retries = int(os.getenv("UPSTREAM_RETRIES", "2"))
         self.state = StateStore(
             os.getenv("PROXY_STATE_DB", "/tmp/opencode_responses_proxy_state.sqlite3"),
@@ -666,6 +699,7 @@ class ProxyApp:
         # Useful for provider capacity errors. It will not bypass a hard account-wide
         # OpenCode Go quota, but it can route around model-specific congestion.
         self.fallback_model_map = json.loads(os.getenv("FALLBACK_MODEL_MAP_JSON", "{}") or "{}")
+        self.upstream_streaming = os.getenv("UPSTREAM_STREAM", "1") != "0"
 
     def log(self, msg: str, **fields: Any) -> None:
         line = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
@@ -683,6 +717,82 @@ class ProxyApp:
             return False
         return auth_header.split(" ", 1)[1].strip() == self.proxy_key
 
+    def route_gpt_model_for_chat_bridge(self, model_alias: str) -> Optional[str]:
+        """Return an OSS upstream model for a GPT alias, or raise/error according to strategy.
+
+        This solves the Codex gotcha where setting `model_provider=opencode_bridge`
+        as the session-wide provider can cause Codex to send gpt-5.x helper/orchestrator
+        requests to the same bridge. OpenCode Go cannot serve those models directly.
+        """
+        if not is_gpt_model(model_alias):
+            return None
+
+        # Explicit MODEL_MAP_JSON wins. This lets callers define precise aliases such as:
+        #   {"gpt-5.5":"deepseek-v4-pro","gpt-5.4-mini":"deepseek-v4-flash"}
+        if model_alias in self.model_map:
+            return map_model(model_alias, self.model_map)
+
+        if self.gpt_model_strategy in ("oss", "alias", "alias_to_oss", "opencode"):
+            fallback = map_model(self.gpt_oss_fallback, self.model_map)
+            self.log("gpt_alias_routed_to_oss", model_alias=model_alias, upstream=fallback)
+            return fallback
+
+        if self.gpt_model_strategy in ("openai", "passthrough", "pass_through"):
+            # Handled before Chat payload preparation. If it reaches here, fail loudly.
+            raise UnsupportedBridgeModel(model_alias, f"GPT model {model_alias!r} must be handled by OpenAI passthrough, not OpenCode chat conversion")
+
+        raise UnsupportedBridgeModel(
+            model_alias,
+            "Codex sent a GPT-family model to the OpenCode Go bridge. "
+            "Do not set model_provider=opencode_bridge as the parent session provider, "
+            "or set GPT_MODEL_STRATEGY=oss for compatibility testing, "
+            "or set GPT_MODEL_STRATEGY=openai with OPENAI_API_KEY for passthrough."
+        )
+
+    def should_passthrough_openai(self, model_alias: str) -> bool:
+        return is_gpt_model(model_alias) and self.gpt_model_strategy in ("openai", "passthrough", "pass_through")
+
+    def call_openai_responses(self, body: JSON) -> Tuple[int, bytes, str]:
+        if not self.openai_key:
+            raise UpstreamError(500, "OPENAI_API_KEY is not set but GPT_MODEL_STRATEGY=openai was requested")
+        data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        headers = {
+            "Authorization": f"Bearer {self.openai_key}",
+            "Content-Type": "application/json",
+            "User-Agent": "codex-opencode-go-responses-proxy/6.0",
+            "Accept": "application/json",
+        }
+        req = urllib.request.Request(self.openai_responses_url, data=data, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                return resp.status, resp.read(), resp.headers.get_content_type()
+        except urllib.error.HTTPError as e:
+            body_bytes = e.read()
+            raise UpstreamError(e.code, body_bytes.decode("utf-8", errors="replace"), {k: v for k, v in e.headers.items()})
+        except urllib.error.URLError as e:
+            raise UpstreamError(502, f"OpenAI passthrough network error: {e}")
+
+    def openai_responses_stream(self, body: JSON):
+        if not self.openai_key:
+            raise UpstreamError(500, "OPENAI_API_KEY is not set but GPT_MODEL_STRATEGY=openai was requested")
+        stream_body = dict(body)
+        stream_body["stream"] = True
+        data = json.dumps(stream_body, ensure_ascii=False).encode("utf-8")
+        headers = {
+            "Authorization": f"Bearer {self.openai_key}",
+            "Content-Type": "application/json",
+            "User-Agent": "codex-opencode-go-responses-proxy/6.0",
+            "Accept": "text/event-stream, application/json",
+        }
+        req = urllib.request.Request(self.openai_responses_url, data=data, headers=headers, method="POST")
+        try:
+            return urllib.request.urlopen(req, timeout=self.timeout)
+        except urllib.error.HTTPError as e:
+            body_bytes = e.read()
+            raise UpstreamError(e.code, body_bytes.decode("utf-8", errors="replace"), {k: v for k, v in e.headers.items()})
+        except urllib.error.URLError as e:
+            raise UpstreamError(502, f"OpenAI passthrough network error: {e}")
+
     def call_upstream_chat(self, payload: JSON) -> JSON:
         if not self.upstream_key:
             raise UpstreamError(500, "OPENCODE_GO_API_KEY is not set")
@@ -691,7 +801,7 @@ class ProxyApp:
         headers = {
             "Authorization": f"Bearer {self.upstream_key}",
             "Content-Type": "application/json",
-            "User-Agent": "codex-opencode-go-responses-proxy/3.0",
+            "User-Agent": "codex-opencode-go-responses-proxy/6.0",
             "Accept": "application/json",
         }
 
@@ -729,12 +839,85 @@ class ProxyApp:
         assert last_err is not None
         raise last_err
 
+    def iter_upstream_chat_stream(self, payload: JSON):
+        """
+        Yield parsed upstream Chat Completions streaming chunks.
+
+        Yields tuples:
+          ("chunk", parsed_json)
+          ("complete", parsed_json) when upstream returns normal JSON despite stream=True
+          ("done", None) when [DONE] is seen or the SSE body ends cleanly
+        """
+        if not self.upstream_key:
+            raise UpstreamError(500, "OPENCODE_GO_API_KEY is not set")
+
+        stream_payload = dict(payload)
+        stream_payload["stream"] = True
+        data = json.dumps(stream_payload, ensure_ascii=False).encode("utf-8")
+        headers = {
+            "Authorization": f"Bearer {self.upstream_key}",
+            "Content-Type": "application/json",
+            "User-Agent": "codex-opencode-go-responses-proxy/6.0",
+            "Accept": "text/event-stream, application/json",
+        }
+
+        req = urllib.request.Request(self.upstream_chat_url, data=data, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                ctype = (resp.headers.get("Content-Type") or "").lower()
+                if "application/json" in ctype and "event-stream" not in ctype:
+                    body = resp.read().decode("utf-8", errors="replace")
+                    yield ("complete", json.loads(body))
+                    return
+
+                data_lines: List[str] = []
+
+                def flush_event() -> Optional[str]:
+                    nonlocal data_lines
+                    if not data_lines:
+                        return None
+                    value = "\n".join(data_lines).strip()
+                    data_lines = []
+                    return value
+
+                for raw_line in resp:
+                    line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
+                    if line == "":
+                        value = flush_event()
+                        if value is None:
+                            continue
+                        if value == "[DONE]":
+                            yield ("done", None)
+                            return
+                        try:
+                            yield ("chunk", json.loads(value))
+                        except json.JSONDecodeError:
+                            self.log("upstream_stream_bad_json", data=value[:500])
+                        continue
+                    if line.startswith("data:"):
+                        data_lines.append(line[5:].lstrip())
+                    # Ignore event:/id:/comment lines from upstream.
+
+                value = flush_event()
+                if value and value != "[DONE]":
+                    try:
+                        yield ("chunk", json.loads(value))
+                    except json.JSONDecodeError:
+                        self.log("upstream_stream_bad_json", data=value[:500])
+                yield ("done", None)
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="replace")
+            hdrs = {k: v for k, v in e.headers.items()}
+            raise UpstreamError(e.code, body, hdrs)
+        except urllib.error.URLError as e:
+            raise UpstreamError(502, f"network error: {e}")
+
     def forward_models(self) -> Tuple[int, bytes, str]:
         if not self.upstream_key:
             return 500, b'{"error":{"message":"OPENCODE_GO_API_KEY is not set"}}', "application/json"
         headers = {
             "Authorization": f"Bearer {self.upstream_key}",
-            "User-Agent": "codex-opencode-go-responses-proxy/3.0",
+            "User-Agent": "codex-opencode-go-responses-proxy/6.0",
             "Accept": "application/json",
         }
         req = urllib.request.Request(self.upstream_models_url, headers=headers, method="GET")
@@ -746,7 +929,8 @@ class ProxyApp:
 
     def prepare_chat_payload(self, body: JSON) -> Tuple[JSON, List[JSON], str, str, Dict[str, str]]:
         model_alias = str(body.get("model") or "ocg-deepseek-v4-pro")
-        model_upstream = map_model(model_alias, self.model_map)
+        gpt_routed = self.route_gpt_model_for_chat_bridge(model_alias)
+        model_upstream = gpt_routed if gpt_routed else map_model(model_alias, self.model_map)
 
         new_messages, current_tool_outputs = extract_request_messages_and_tool_outputs(body)
         prev_id = body.get("previous_response_id")
@@ -767,8 +951,10 @@ class ProxyApp:
             # Repair and continue from the completed assistant->tool exchange.
             base_messages = repair_chat_history(prev_state.messages, current_tool_outputs)
             base_messages = merge_new_user_messages(base_messages, new_messages)
-            # Preserve the previous upstream model if Codex omits model consistency.
-            model_upstream = map_model(model_alias or prev_state.model_alias, self.model_map)
+            # Preserve the previous upstream model if Codex omits model consistency;
+            # keep GPT alias routing consistent when using compatibility mode.
+            routed_prev = self.route_gpt_model_for_chat_bridge(model_alias or prev_state.model_alias)
+            model_upstream = routed_prev if routed_prev else map_model(model_alias or prev_state.model_alias, self.model_map)
 
         elif prev_id:
             prev_state = self.state.get(str(prev_id))
@@ -977,8 +1163,388 @@ class ProxyApp:
 APP = ProxyApp()
 
 
+
+@dataclass
+class ToolStreamState:
+    index: int
+    item_id: str
+    call_id: str
+    raw_name_parts: List[str]
+    args_parts: List[str]
+    output_index: int = -1
+    added: bool = False
+    done: bool = False
+
+    @property
+    def raw_name(self) -> str:
+        return "".join(self.raw_name_parts).strip()
+
+    @property
+    def arguments(self) -> str:
+        return "".join(self.args_parts)
+
+
+class ChatStreamAssembler:
+    """Convert live Chat Completions SSE chunks into Responses SSE events."""
+
+    def __init__(
+        self,
+        handler: "Handler",
+        body: JSON,
+        base_messages: List[JSON],
+        model_alias: str,
+        model_upstream: str,
+        reverse_name_map: Dict[str, str],
+        response_id: str,
+        created_at: int,
+    ):
+        self.handler = handler
+        self.body = body
+        self.base_messages = base_messages
+        self.model_alias = model_alias
+        self.model_upstream = model_upstream
+        self.reverse_name_map = reverse_name_map
+        self.response_id = response_id
+        self.created_at = created_at
+        self.output_order: List[Tuple[str, Any]] = []
+        self.next_output_index = 0
+
+        self.text_started = False
+        self.text_done = False
+        self.text_item_id = new_id("msg")
+        self.text_parts: List[str] = []
+
+        self.reasoning_parts: List[str] = []
+        self.thinking_blocks: List[Any] = []
+        self.tool_states: Dict[int, ToolStreamState] = {}
+        self.usage: JSON = {}
+        self.last_progress = time.time()
+
+    def _write_sse(self, event: str, data: Any) -> None:
+        self.handler._write_sse(event, data)
+        self.last_progress = time.time()
+
+    def maybe_progress(self, note: str = "upstream_stream") -> None:
+        interval = float(os.getenv("SSE_VISIBLE_PROGRESS_SECONDS", "8"))
+        if time.time() - self.last_progress >= interval:
+            self.handler._write_in_progress(self.response_id, self.model_alias, self.created_at, self.body, note)
+            self.last_progress = time.time()
+
+    def _assign_output_index(self, kind: str, key: Any) -> int:
+        idx = self.next_output_index
+        self.next_output_index += 1
+        self.output_order.append((kind, key))
+        return idx
+
+    def ensure_text_item(self) -> int:
+        if self.text_started:
+            # Find existing output index.
+            for i, (kind, key) in enumerate(self.output_order):
+                if kind == "message" and key == "text":
+                    return i
+        idx = self._assign_output_index("message", "text")
+        self.text_started = True
+        item = {
+            "type": "message",
+            "id": self.text_item_id,
+            "status": "in_progress",
+            "role": "assistant",
+            "content": [],
+        }
+        self._write_sse("response.output_item.added", {"type": "response.output_item.added", "output_index": idx, "item": item})
+        self._write_sse(
+            "response.content_part.added",
+            {
+                "type": "response.content_part.added",
+                "output_index": idx,
+                "content_index": 0,
+                "part": {"type": "output_text", "text": "", "annotations": []},
+                "item_id": self.text_item_id,
+            },
+        )
+        return idx
+
+    def on_content_delta(self, text: str) -> None:
+        if not text:
+            return
+        idx = self.ensure_text_item()
+        chunk_size = int(os.getenv("SSE_CHUNK_SIZE", "256"))
+        for start in range(0, len(text), chunk_size):
+            delta = text[start : start + chunk_size]
+            self.text_parts.append(delta)
+            self._write_sse(
+                "response.output_text.delta",
+                {
+                    "type": "response.output_text.delta",
+                    "output_index": idx,
+                    "content_index": 0,
+                    "delta": delta,
+                    "item_id": self.text_item_id,
+                },
+            )
+
+    def on_reasoning_delta(self, text: str) -> None:
+        if text:
+            self.reasoning_parts.append(text)
+        # Do not expose raw reasoning text. Emit occasional progress so Codex does not
+        # treat a long hidden-thinking phase as a dead stream.
+        self.maybe_progress("hidden_reasoning")
+
+    def _get_tool_state(self, index: int) -> ToolStreamState:
+        if index not in self.tool_states:
+            self.tool_states[index] = ToolStreamState(
+                index=index,
+                item_id=new_id("fc"),
+                call_id=new_id("call"),
+                raw_name_parts=[],
+                args_parts=[],
+            )
+        return self.tool_states[index]
+
+    def _ensure_tool_added(self, st: ToolStreamState, force: bool = False) -> None:
+        if st.added:
+            return
+        if not st.raw_name and not force:
+            return
+        raw_name = st.raw_name or "tool"
+        name = restore_tool_name(raw_name, self.reverse_name_map)
+        st.output_index = self._assign_output_index("function_call", st.index)
+        item = {
+            "type": "function_call",
+            "id": st.item_id,
+            "call_id": st.call_id,
+            "name": name,
+            "arguments": "",
+            "status": "in_progress",
+        }
+        self._write_sse(
+            "response.output_item.added",
+            {"type": "response.output_item.added", "output_index": st.output_index, "item": item},
+        )
+        st.added = True
+
+    def _emit_args_delta(self, st: ToolStreamState, delta: str) -> None:
+        if not delta:
+            return
+        self._ensure_tool_added(st, force=bool(st.raw_name))
+        if not st.added:
+            # Buffer until name arrives.
+            return
+        arg_chunk_size = int(os.getenv("SSE_FUNCTION_ARGS_CHUNK_SIZE", "512"))
+        for start in range(0, len(delta), arg_chunk_size):
+            part = delta[start : start + arg_chunk_size]
+            self._write_sse(
+                "response.function_call_arguments.delta",
+                {
+                    "type": "response.function_call_arguments.delta",
+                    "output_index": st.output_index,
+                    "item_id": st.item_id,
+                    "delta": part,
+                },
+            )
+
+    def on_tool_call_delta(self, tc: JSON) -> None:
+        try:
+            idx = int(tc.get("index", 0))
+        except Exception:
+            idx = 0
+        st = self._get_tool_state(idx)
+        if tc.get("id") and st.call_id.startswith("call_"):
+            # Prefer upstream tool_call id if we have not already exposed a generated id.
+            if not st.added:
+                st.call_id = str(tc["id"])
+        fn = tc.get("function") or {}
+        name_part = fn.get("name") or tc.get("name")
+        if name_part:
+            st.raw_name_parts.append(str(name_part))
+            self._ensure_tool_added(st, force=False)
+            # If arguments arrived before the name, flush them now as one delta stream.
+            if st.added and st.arguments:
+                already_emitted_key = "_already_emitted_chars"
+                emitted = getattr(st, already_emitted_key, 0)
+                remaining = st.arguments[emitted:]
+                if remaining:
+                    self._emit_args_delta(st, remaining)
+                    setattr(st, already_emitted_key, len(st.arguments))
+
+        args_delta = fn.get("arguments", tc.get("arguments"))
+        if args_delta is not None:
+            args_text = args_delta if isinstance(args_delta, str) else json_dumps(args_delta)
+            before = len(st.arguments)
+            st.args_parts.append(args_text)
+            if st.added:
+                self._emit_args_delta(st, args_text)
+                setattr(st, "_already_emitted_chars", len(st.arguments))
+            else:
+                # Preserve for later flush when the name arrives. Nothing has been
+                # emitted yet, so keep the emitted counter at zero.
+                if not hasattr(st, "_already_emitted_chars"):
+                    setattr(st, "_already_emitted_chars", 0)
+
+    def on_chunk(self, chunk: JSON) -> None:
+        if chunk.get("usage"):
+            self.usage = chunk["usage"]
+        for choice in chunk.get("choices") or []:
+            delta = choice.get("delta") or {}
+            if not isinstance(delta, dict):
+                continue
+            # Provider-specific hidden reasoning fields.
+            for key in ("reasoning_content", "reasoning", "thinking"):
+                if delta.get(key):
+                    self.on_reasoning_delta(as_text(delta.get(key)))
+            if delta.get("thinking_blocks"):
+                self.thinking_blocks.append(delta.get("thinking_blocks"))
+                self.maybe_progress("hidden_thinking_blocks")
+            if delta.get("content") is not None:
+                self.on_content_delta(as_text(delta.get("content")))
+            for tc in delta.get("tool_calls") or []:
+                if isinstance(tc, dict):
+                    self.on_tool_call_delta(tc)
+            if choice.get("finish_reason"):
+                self.maybe_progress(f"finish:{choice.get('finish_reason')}")
+
+    def _final_message_item(self) -> Optional[JSON]:
+        if not self.text_started:
+            return None
+        text = "".join(self.text_parts)
+        return {
+            "type": "message",
+            "id": self.text_item_id,
+            "status": "completed",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": text, "annotations": []}],
+        }
+
+    def _final_function_item(self, st: ToolStreamState) -> JSON:
+        raw_name = st.raw_name or "tool"
+        name = restore_tool_name(raw_name, self.reverse_name_map)
+        return {
+            "type": "function_call",
+            "id": st.item_id,
+            "call_id": st.call_id,
+            "name": name,
+            "arguments": st.arguments,
+            "status": "completed",
+        }
+
+    def finalize(self) -> JSON:
+        # Force-add and finish any tool calls that only became complete at stream end.
+        for idx in sorted(self.tool_states):
+            st = self.tool_states[idx]
+            self._ensure_tool_added(st, force=True)
+            if not st.done:
+                args = st.arguments
+                emitted = getattr(st, "_already_emitted_chars", 0)
+                if emitted < len(args):
+                    self._emit_args_delta(st, args[emitted:])
+                    setattr(st, "_already_emitted_chars", len(args))
+                self._write_sse(
+                    "response.function_call_arguments.done",
+                    {
+                        "type": "response.function_call_arguments.done",
+                        "output_index": st.output_index,
+                        "item_id": st.item_id,
+                        "arguments": args,
+                    },
+                )
+                self._write_sse(
+                    "response.output_item.done",
+                    {"type": "response.output_item.done", "output_index": st.output_index, "item": self._final_function_item(st)},
+                )
+                st.done = True
+
+        if self.text_started and not self.text_done:
+            text = "".join(self.text_parts)
+            idx = next(i for i, (kind, key) in enumerate(self.output_order) if kind == "message" and key == "text")
+            self._write_sse(
+                "response.output_text.done",
+                {
+                    "type": "response.output_text.done",
+                    "output_index": idx,
+                    "content_index": 0,
+                    "text": text,
+                    "item_id": self.text_item_id,
+                },
+            )
+            part = {"type": "output_text", "text": text, "annotations": []}
+            self._write_sse(
+                "response.content_part.done",
+                {
+                    "type": "response.content_part.done",
+                    "output_index": idx,
+                    "content_index": 0,
+                    "part": part,
+                    "item_id": self.text_item_id,
+                },
+            )
+            self._write_sse(
+                "response.output_item.done",
+                {"type": "response.output_item.done", "output_index": idx, "item": self._final_message_item()},
+            )
+            self.text_done = True
+
+        output_by_index: Dict[int, JSON] = {}
+        for idx, (kind, key) in enumerate(self.output_order):
+            if kind == "message":
+                item = self._final_message_item()
+                if item:
+                    output_by_index[idx] = item
+            elif kind == "function_call":
+                st = self.tool_states[int(key)]
+                output_by_index[idx] = self._final_function_item(st)
+        output = [output_by_index[i] for i in sorted(output_by_index)]
+
+        content = "".join(self.text_parts)
+        reasoning_content = "".join(self.reasoning_parts)
+        assistant_msg: JSON = {"role": "assistant", "content": content or ""}
+        if reasoning_content:
+            assistant_msg["reasoning_content"] = reasoning_content
+        if self.thinking_blocks:
+            assistant_msg["thinking_blocks"] = self.thinking_blocks
+
+        replay_tool_calls: List[JSON] = []
+        for idx in sorted(self.tool_states):
+            st = self.tool_states[idx]
+            replay_tool_calls.append(
+                {
+                    "id": st.call_id,
+                    "type": "function",
+                    "function": {"name": st.raw_name or "tool", "arguments": st.arguments},
+                }
+            )
+        if replay_tool_calls:
+            assistant_msg["tool_calls"] = replay_tool_calls
+
+        all_messages = repair_chat_history(self.base_messages, None) + [assistant_msg]
+        APP.state.put(
+            StoredResponse(
+                response_id=self.response_id,
+                model_alias=self.model_alias,
+                model_upstream=self.model_upstream,
+                messages=all_messages,
+                pending_call_ids=[tc["id"] for tc in replay_tool_calls],
+                created_at=self.created_at,
+            )
+        )
+
+        usage = self.usage or {}
+        resp_obj = APP.build_response_shell(
+            self.body,
+            self.model_alias,
+            response_id=self.response_id,
+            created_at=self.created_at,
+            status="completed",
+            output=output,
+        )
+        resp_obj["usage"] = {
+            "input_tokens": usage.get("prompt_tokens", usage.get("input_tokens", 0)),
+            "output_tokens": usage.get("completion_tokens", usage.get("output_tokens", 0)),
+            "total_tokens": usage.get("total_tokens", 0),
+        }
+        return resp_obj
+
 class Handler(BaseHTTPRequestHandler):
-    server_version = "ResponsesChatProxy/3.0"
+    server_version = "ResponsesChatProxy/5.0"
 
     def _send_json(self, status: int, obj: Any) -> None:
         data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
@@ -1032,6 +1598,16 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         try:
+            raw_model_alias = str(body.get("model") or "")
+            if APP.should_passthrough_openai(raw_model_alias):
+                APP.log("openai_passthrough", model_alias=raw_model_alias, stream=bool(body.get("stream")))
+                if body.get("stream"):
+                    self._forward_openai_sse(body)
+                else:
+                    status, data, ctype = APP.call_openai_responses(body)
+                    self._send_raw(status, data, ctype)
+                return
+
             payload, base_messages, model_alias, model_upstream, reverse_name_map = APP.prepare_chat_payload(body)
             APP.log(
                 "request",
@@ -1053,6 +1629,9 @@ class Handler(BaseHTTPRequestHandler):
             if time.time() % 10 < 1:
                 APP.state.cleanup()
 
+        except UnsupportedBridgeModel as e:
+            APP.log("unsupported_bridge_model", model=e.model, error=str(e))
+            self._send_error_obj(400, str(e), "unsupported_bridge_model")
         except HistoryRepairError as e:
             APP.log("history_repair_error", error=str(e))
             self._send_error_obj(400, str(e))
@@ -1090,13 +1669,79 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "keep-alive")
+        # This is a finite SSE response. Default to closing the TCP connection after
+        # [DONE] so each Codex tool turn starts with a fresh connection instead of
+        # relying on HTTP keep-alive reuse across many write-operation turns.
+        self.send_header("Connection", os.getenv("SSE_CONNECTION", "close"))
         self.send_header("X-Accel-Buffering", "no")
         self.end_headers()
 
-    def _write_sse_comment(self, text: str = "keepalive") -> None:
-        self.wfile.write(f": {text} {now()}\n\n".encode("utf-8"))
+    def _send_raw(self, status: int, data: bytes, content_type: str = "application/json") -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", content_type or "application/json")
+        self.send_header("Connection", os.getenv("SSE_CONNECTION", "close"))
+        self.end_headers()
+        self.wfile.write(data)
         self.wfile.flush()
+        self.close_connection = True
+
+    def _forward_openai_sse(self, body: JSON) -> None:
+        try:
+            upstream = APP.openai_responses_stream(body)
+        except UpstreamError as e:
+            APP.log("openai_passthrough_error", status=e.status, body=e.body[:500])
+            status = e.status if 400 <= e.status < 600 else 502
+            try:
+                parsed = json.loads(e.body)
+            except Exception:
+                parsed = {"error": {"message": e.body, "type": "openai_passthrough_error"}}
+            self._send_json(status, parsed)
+            return
+
+        self.send_response(upstream.status)
+        self.send_header("Content-Type", upstream.headers.get("Content-Type") or "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", os.getenv("SSE_CONNECTION", "close"))
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+        try:
+            with upstream:
+                while True:
+                    chunk = upstream.read(8192)
+                    if not chunk:
+                        break
+                    self._safe_write(chunk)
+        except ClientDisconnected:
+            APP.log("client_disconnected", phase="openai_passthrough")
+        finally:
+            self.close_connection = True
+
+    def _safe_write(self, data: bytes) -> None:
+        try:
+            self.wfile.write(data)
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError) as e:
+            raise ClientDisconnected(str(e)) from e
+
+    def _write_sse_comment(self, text: str = "keepalive") -> None:
+        self._safe_write(f": {text} {now()}\n\n".encode("utf-8"))
+
+    def _write_in_progress(self, response_id: str, model_alias: str, created_at: int, body: JSON, note: str = "upstream_wait") -> None:
+        # Codex appears to reset its stream timer more reliably on real SSE events
+        # than on comment-only heartbeats. Emit a legal progress event with the same
+        # response id while the upstream Chat Completions request is still running.
+        shell = APP.build_response_shell(
+            body,
+            model_alias,
+            response_id=response_id,
+            created_at=created_at,
+            status="in_progress",
+            output=[],
+        )
+        meta = dict(shell.get("metadata") or {})
+        meta["proxy_note"] = note
+        shell["metadata"] = meta
+        self._write_sse("response.in_progress", {"type": "response.in_progress", "response": shell})
 
     def _send_sse_with_upstream(
         self,
@@ -1114,6 +1759,159 @@ class Handler(BaseHTTPRequestHandler):
         self._send_sse_headers()
         self._write_sse("response.created", {"type": "response.created", "response": shell})
 
+        # If upstream streaming is disabled, fall back to the v4 fake-stream path.
+        if not APP.upstream_streaming:
+            return self._send_sse_with_upstream_buffered(body, payload, base_messages, model_alias, model_upstream, reverse_name_map, response_id, created_at)
+
+        event_q: "queue.Queue[Tuple[str, Any, Optional[str]]]" = queue.Queue(maxsize=int(os.getenv("STREAM_QUEUE_MAXSIZE", "256")))
+        stop_event = threading.Event()
+
+        def worker() -> None:
+            attempts: List[Tuple[str, JSON]] = [(model_upstream, dict(payload))]
+            for fb in APP.fallback_model_map.get(model_upstream, []) + APP.fallback_model_map.get(model_alias, []):
+                fb_model = map_model(str(fb), APP.model_map)
+                if fb_model != model_upstream:
+                    fb_payload = dict(payload)
+                    fb_payload["model"] = fb_model
+                    attempts.append((fb_model, fb_payload))
+
+            last_err: Optional[UpstreamError] = None
+            for attempt_idx, (attempt_model, attempt_payload) in enumerate(attempts):
+                yielded_any = False
+                try:
+                    APP.log("upstream_stream_start", model=attempt_model, response_id=response_id, attempt=attempt_idx + 1)
+                    for kind, value in APP.iter_upstream_chat_stream(attempt_payload):
+                        if stop_event.is_set():
+                            return
+                        if kind == "chunk":
+                            yielded_any = True
+                            event_q.put(("chunk", value, attempt_model))
+                        elif kind == "complete":
+                            event_q.put(("complete", value, attempt_model))
+                            return
+                        elif kind == "done":
+                            event_q.put(("done", None, attempt_model))
+                            return
+                    event_q.put(("done", None, attempt_model))
+                    return
+                except UpstreamError as e:
+                    last_err = e
+                    transient = e.status in (408, 409, 429, 500, 502, 503, 504)
+                    if yielded_any or not transient or attempt_idx >= len(attempts) - 1:
+                        event_q.put(("error", e, attempt_model))
+                        return
+                    APP.log("stream_fallback_attempt", from_model=attempt_model, status=e.status, body=e.body[:300])
+                    continue
+                except Exception as e:
+                    event_q.put(("error", e, attempt_model))
+                    return
+            if last_err:
+                event_q.put(("error", last_err, model_upstream))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+        assembler = ChatStreamAssembler(
+            self,
+            body,
+            base_messages,
+            model_alias,
+            model_upstream,
+            reverse_name_map,
+            response_id,
+            created_at,
+        )
+        heartbeat_s = float(os.getenv("SSE_UPSTREAM_HEARTBEAT_SECONDS", "5"))
+        actual_model_used = model_upstream
+
+        while True:
+            try:
+                kind, value, used_model = event_q.get(timeout=heartbeat_s)
+            except queue.Empty:
+                try:
+                    if os.getenv("SSE_HEARTBEAT_EVENT", "1") != "0":
+                        self._write_in_progress(response_id, model_alias, created_at, body, "upstream_stream_wait")
+                    if os.getenv("SSE_HEARTBEAT_COMMENT", "0") == "1":
+                        self._write_sse_comment("upstream_stream_wait")
+                except ClientDisconnected:
+                    stop_event.set()
+                    APP.log("client_disconnected", response_id=response_id, phase="upstream_stream_wait")
+                    return
+                continue
+
+            if used_model:
+                actual_model_used = used_model
+                assembler.model_upstream = used_model
+
+            try:
+                if kind == "chunk":
+                    assembler.on_chunk(value)
+                    continue
+                if kind == "complete":
+                    # Upstream ignored stream=True and returned a normal Chat Completion.
+                    resp_obj = APP.build_response_object(
+                        body,
+                        value,
+                        base_messages,
+                        model_alias,
+                        actual_model_used,
+                        reverse_name_map,
+                        response_id=response_id,
+                        created_at=created_at,
+                    )
+                    self._emit_sse_items_and_completed(resp_obj)
+                    return
+                if kind == "done":
+                    resp_obj = assembler.finalize()
+                    completed_response = resp_obj
+                    if os.getenv("SSE_COMPACT_COMPLETED_FOR_TOOL_CALLS", "0") == "1":
+                        completed_response = self._compact_completed_response(resp_obj)
+                    self._write_sse("response.completed", {"type": "response.completed", "response": completed_response})
+                    self._safe_write(b"data: [DONE]\n\n")
+                    self.close_connection = True
+                    return
+                if kind == "error":
+                    raise value
+            except ClientDisconnected:
+                stop_event.set()
+                APP.log("client_disconnected", response_id=response_id, phase=f"stream_{kind}")
+                return
+            except Exception as e:
+                # Headers are committed; surface failure as Responses SSE.
+                try:
+                    if isinstance(e, UpstreamError):
+                        message = e.body[:1000]
+                        typ = "upstream_error"
+                        APP.log("upstream_error", status=e.status, body=e.body[:500])
+                    else:
+                        message = f"Proxy internal error: {e}"
+                        typ = "internal_error"
+                        APP.log("proxy_stream_error", error=str(e), trace="".join(traceback.format_exception(type(e), e, e.__traceback__)))
+                    failed = APP.build_response_shell(
+                        body,
+                        model_alias,
+                        response_id=response_id,
+                        created_at=created_at,
+                        status="failed",
+                        error={"message": message, "type": typ, "code": typ},
+                    )
+                    self._write_sse("response.failed", {"type": "response.failed", "response": failed})
+                    self._safe_write(b"data: [DONE]\n\n")
+                except ClientDisconnected:
+                    APP.log("client_disconnected", response_id=response_id, phase="stream_error_emit")
+                self.close_connection = True
+                return
+
+    def _send_sse_with_upstream_buffered(
+        self,
+        body: JSON,
+        payload: JSON,
+        base_messages: List[JSON],
+        model_alias: str,
+        model_upstream: str,
+        reverse_name_map: Dict[str, str],
+        response_id: str,
+        created_at: int,
+    ) -> None:
         result_q: "queue.Queue[Tuple[str, Any]]" = queue.Queue(maxsize=1)
 
         def worker() -> None:
@@ -1130,11 +1928,10 @@ class Handler(BaseHTTPRequestHandler):
                     created_at=created_at,
                 )
                 result_q.put(("ok", resp_obj))
-            except Exception as e:  # send over SSE after headers are already committed
+            except Exception as e:
                 result_q.put(("error", e))
 
         threading.Thread(target=worker, daemon=True).start()
-
         heartbeat_s = float(os.getenv("SSE_UPSTREAM_HEARTBEAT_SECONDS", "5"))
         while True:
             try:
@@ -1142,46 +1939,53 @@ class Handler(BaseHTTPRequestHandler):
                 break
             except queue.Empty:
                 try:
-                    self._write_sse_comment("upstream_wait")
-                except Exception:
+                    if os.getenv("SSE_HEARTBEAT_EVENT", "1") != "0":
+                        self._write_in_progress(response_id, model_alias, created_at, body, "upstream_wait")
+                    if os.getenv("SSE_HEARTBEAT_COMMENT", "0") == "1":
+                        self._write_sse_comment("upstream_wait")
+                except ClientDisconnected:
+                    APP.log("client_disconnected", response_id=response_id, phase="upstream_wait")
                     return
 
         if kind == "ok":
-            self._emit_sse_items_and_completed(value)
+            try:
+                self._emit_sse_items_and_completed(value)
+            except ClientDisconnected:
+                APP.log("client_disconnected", response_id=response_id, phase="emit_completed")
             return
-
         err = value
-        if isinstance(err, UpstreamError):
-            message = err.body[:1000]
-            typ = "upstream_error"
-            APP.log("upstream_error", status=err.status, body=err.body[:500])
-        elif isinstance(err, HistoryRepairError):
-            message = str(err)
-            typ = "history_repair_error"
-            APP.log("history_repair_error", error=message)
-        else:
-            message = f"Proxy internal error: {err}"
-            typ = "internal_error"
-            APP.log("proxy_crash", error=str(err), trace="".join(traceback.format_exception(type(err), err, err.__traceback__)))
-
-        failed = APP.build_response_shell(
-            body,
-            model_alias,
-            response_id=response_id,
-            created_at=created_at,
-            status="failed",
-            error={"message": message, "type": typ, "code": typ},
-        )
-        self._write_sse("response.failed", {"type": "response.failed", "response": failed})
-        self.wfile.write(b"data: [DONE]\n\n")
-        self.wfile.flush()
+        try:
+            if isinstance(err, UpstreamError):
+                message = err.body[:1000]
+                typ = "upstream_error"
+                APP.log("upstream_error", status=err.status, body=err.body[:500])
+            else:
+                message = f"Proxy internal error: {err}"
+                typ = "internal_error"
+                APP.log("proxy_crash", error=str(err), trace="".join(traceback.format_exception(type(err), err, err.__traceback__)))
+            failed = APP.build_response_shell(body, model_alias, response_id=response_id, created_at=created_at, status="failed", error={"message": message, "type": typ, "code": typ})
+            self._write_sse("response.failed", {"type": "response.failed", "response": failed})
+            self._safe_write(b"data: [DONE]\n\n")
+        except ClientDisconnected:
+            APP.log("client_disconnected", response_id=response_id, phase="emit_failed")
         self.close_connection = True
 
     def _write_sse(self, event: str, data: Any) -> None:
         payload = json.dumps(data, ensure_ascii=False)
-        self.wfile.write(f"event: {event}\n".encode("utf-8"))
-        self.wfile.write(f"data: {payload}\n\n".encode("utf-8"))
-        self.wfile.flush()
+        self._safe_write(f"event: {event}\n".encode("utf-8") + f"data: {payload}\n\n".encode("utf-8"))
+
+    def _compact_completed_response(self, resp_obj: JSON) -> JSON:
+        compact = dict(resp_obj)
+        compact_output = []
+        for item in resp_obj.get("output", []):
+            if item.get("type") == "function_call":
+                tiny = dict(item)
+                tiny["arguments"] = ""
+                compact_output.append(tiny)
+            else:
+                compact_output.append(item)
+        compact["output"] = compact_output
+        return compact
 
     def _send_sse(self, resp_obj: JSON) -> None:
         self._send_sse_headers()
@@ -1190,12 +1994,26 @@ class Handler(BaseHTTPRequestHandler):
 
     def _emit_sse_items_and_completed(self, resp_obj: JSON) -> None:
         for idx, item in enumerate(resp_obj.get("output", [])):
+            item_type = item.get("type")
+            item_for_added = item
+
+            # For large write operations the function-call arguments can contain a
+            # whole patch or shell script. Sending that full JSON blob in
+            # output_item.added, delta, done, output_item.done, and response.completed
+            # creates huge SSE frames. Real Responses streams usually accumulate
+            # arguments through delta events and only finalize at done. Keep added
+            # lightweight and chunk argument deltas.
+            if item_type == "function_call":
+                item_for_added = dict(item)
+                item_for_added["arguments"] = ""
+                item_for_added["status"] = "in_progress"
+
             self._write_sse(
                 "response.output_item.added",
-                {"type": "response.output_item.added", "output_index": idx, "item": item},
+                {"type": "response.output_item.added", "output_index": idx, "item": item_for_added},
             )
 
-            if item.get("type") == "message":
+            if item_type == "message":
                 content = item.get("content") or []
                 if content:
                     part = content[0]
@@ -1210,7 +2028,6 @@ class Handler(BaseHTTPRequestHandler):
                         },
                     )
                     text = as_text(part.get("text", ""))
-                    # Chunk fake streaming so clients that expect deltas see deltas.
                     chunk_size = int(os.getenv("SSE_CHUNK_SIZE", "256"))
                     for start in range(0, len(text), chunk_size):
                         delta = text[start : start + chunk_size]
@@ -1245,17 +2062,32 @@ class Handler(BaseHTTPRequestHandler):
                         },
                     )
 
-            elif item.get("type") == "function_call":
+            elif item_type == "function_call":
                 args = item.get("arguments", "")
-                self._write_sse(
-                    "response.function_call_arguments.delta",
-                    {
-                        "type": "response.function_call_arguments.delta",
-                        "output_index": idx,
-                        "item_id": item.get("id"),
-                        "delta": args,
-                    },
+                if not isinstance(args, str):
+                    args = json_dumps(args)
+                arg_chunk_size = int(os.getenv("SSE_FUNCTION_ARGS_CHUNK_SIZE", "1024"))
+                APP.log(
+                    "emit_function_call",
+                    response_id=resp_obj.get("id"),
+                    output_index=idx,
+                    item_id=item.get("id"),
+                    call_id=item.get("call_id"),
+                    name=item.get("name"),
+                    args_chars=len(args),
+                    arg_chunk_size=arg_chunk_size,
                 )
+                for start in range(0, len(args), arg_chunk_size):
+                    delta = args[start : start + arg_chunk_size]
+                    self._write_sse(
+                        "response.function_call_arguments.delta",
+                        {
+                            "type": "response.function_call_arguments.delta",
+                            "output_index": idx,
+                            "item_id": item.get("id"),
+                            "delta": delta,
+                        },
+                    )
                 self._write_sse(
                     "response.function_call_arguments.done",
                     {
@@ -1271,9 +2103,12 @@ class Handler(BaseHTTPRequestHandler):
                 {"type": "response.output_item.done", "output_index": idx, "item": item},
             )
 
-        self._write_sse("response.completed", {"type": "response.completed", "response": resp_obj})
-        self.wfile.write(b"data: [DONE]\n\n")
-        self.wfile.flush()
+        completed_response = resp_obj
+        if os.getenv("SSE_COMPACT_COMPLETED_FOR_TOOL_CALLS", "0") == "1":
+            completed_response = self._compact_completed_response(resp_obj)
+
+        self._write_sse("response.completed", {"type": "response.completed", "response": completed_response})
+        self._safe_write(b"data: [DONE]\n\n")
         self.close_connection = True
 
 
@@ -1334,6 +2169,10 @@ def run_self_test() -> None:
         # The repair function reaches final pending_now unmatched check.
         pass
 
+    assert is_gpt_model("gpt-5.5")
+    assert is_gpt_model("openai/gpt-5.4-mini")
+    assert not is_gpt_model("ocg-deepseek-v4-pro")
+
     print("self-test passed")
 
 
@@ -1355,8 +2194,17 @@ def main() -> None:
 
     httpd = ThreadingHTTPServer((args.host, args.port), Handler)
 
+    shutdown_started = threading.Event()
+
     def shutdown(signum, frame):
-        print("shutting down", file=sys.stderr)
+        if shutdown_started.is_set():
+            return
+        shutdown_started.set()
+        try:
+            sys.stderr.write("shutting down\n")
+            sys.stderr.flush()
+        except Exception:
+            pass
         threading.Thread(target=httpd.shutdown, daemon=True).start()
 
     signal.signal(signal.SIGINT, shutdown)

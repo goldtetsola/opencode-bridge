@@ -4,6 +4,21 @@ Use [OpenCode Go](https://opencode.ai/docs/go/) OSS models (DeepSeek V4 Pro, Kim
 
 Codex speaks the OpenAI Responses API. OpenCode Go exposes Chat Completions. This bridge sits in the middle, translating between them so Codex can spawn DeepSeek and Kimi workers the same way it spawns GPT workers.
 
+## Critical: Architecture warning
+
+**Do NOT set `model_provider = "opencode_bridge"` as your top-level Codex provider.** Codex will route GPT-5.5 orchestrator requests through the bridge, which cannot serve GPT models (OpenCode Go rejects them). This causes timeouts on any operation requiring orchestration (reads, writes, multi-turn tool loops).
+
+**Correct architecture:**
+
+```
+Parent session: GPT-5.5 (native openai provider)
+OSS subagents only: opencode_bridge provider
+```
+
+The bridge is a **subagent-only provider**. Use `model_provider = "opencode_bridge"` in agent TOMLs only. Your `.codex/config.toml` should NOT set a top-level `model_provider` to `opencode_bridge`.
+
+For direct `codex exec` testing without subagents, use v6 compatibility mode: start the bridge with `GPT_MODEL_STRATEGY=oss` to alias GPT requests to OSS models. This is for bridge testing only — not the recommended production setup.
+
 ## Quick start
 
 ### Zero-config: just tell Codex
@@ -157,17 +172,27 @@ The orchestrator should identify this as an exploration task and delegate to `os
 ```
 Codex Desktop / CLI
     │
-    │  Responses API (SSE streaming, heartbeat keepalive)
-    ▼
-bridge.py   ← this repo (v3: immediate SSE + heartbeat)
+    │  Parent session: GPT-5.5 (native openai provider)
+    │  OSS subagents only: opencode_bridge provider
     │
-    │  Chat Completions API
-    ▼
-api.opencode.ai/zen/go/v1
-    │
-    ▼
-DeepSeek V4 Pro / Kimi K2.6 / DeepSeek V4 Flash
+    ├─ GPT-5.5 orchestrator (native)
+    │     │
+    │     ├─ GPT-5.4 worker (native)
+    │     └─ OSS subagent spawn
+    │           │
+    │           │  Responses API (SSE streaming, live upstream)
+    │           ▼
+    │     bridge.py   ← this repo (v6)
+    │           │
+    │           │  Chat Completions API (stream=true)
+    │           ▼
+    │     api.opencode.ai/zen/go/v1
+    │           │
+    │           ▼
+    │     DeepSeek V4 Pro / Kimi K2.6 / Flash
 ```
+
+**Bridge is a subagent-only provider.** Do NOT set `model_provider = "opencode_bridge"` as your session-wide provider. The bridge rejects GPT-5.5 requests (or aliases them to OSS in compatibility mode, which is for testing only).
 
 The bridge handles:
 
@@ -180,6 +205,8 @@ The bridge handles:
 - **Context preservation**: Repairs conversation history so earlier completed assistant→tool exchanges are preserved (not truncated), while incomplete tails are dropped
 - **Retry + fallback**: Retries transient upstream errors with exponential backoff. Falls back to alternate models on capacity errors
 - **Developer role mapping**: Maps Codex's `developer` role to `system` for providers that reject it (DeepSeek, Kimi)
+- **GPT model handling** (v6): Detects and rejects GPT-5.5/5.4 requests hitting the bridge by mistake. Configurable via `GPT_MODEL_STRATEGY` — `error` (immediate rejection, default), `oss` (alias to OSS for compatibility testing), or `openai` (API passthrough)
+- **Live upstream streaming** (v5+): Uses `stream=true` against OpenCode Go and translates Chat Completions chunks to Responses SSE deltas in real time
 
 ## Environment variables
 
@@ -198,6 +225,10 @@ The bridge handles:
 | `PROXY_LOG_PATH` | (stderr) | Path for structured JSON log output |
 | `SSE_CHUNK_SIZE` | `256` | Characters per SSE text delta chunk |
 | `SSE_UPSTREAM_HEARTBEAT_SECONDS` | `5` | Seconds between heartbeat comments while waiting for upstream |
+| `UPSTREAM_STREAM` | `1` | Use stream=true for upstream Chat Completions (v5+ live streaming) |
+| `GPT_MODEL_STRATEGY` | `error` | How to handle GPT-model requests: `error` (reject immediately), `oss` (alias to OSS model for testing), `openai` (passthrough to OpenAI API — requires `OPENAI_API_KEY`) |
+| `GPT_MODEL_OSS_FALLBACK` | `deepseek-v4-pro` | OSS model to use when `GPT_MODEL_STRATEGY=oss` |
+| `OPENAI_API_KEY` | (not set) | Required only for `GPT_MODEL_STRATEGY=openai` |
 | `EXPOSE_EMPTY_REASONING_ITEM` | `1` | Include empty reasoning item in output for Codex compatibility |
 | `STRIP_TOOLS` | `0` | Set to `1` to strip ALL tools (force text-only responses) |
 
@@ -385,9 +416,9 @@ Lane E — OSS external workers (fallback)
 
 - **Not production-grade**: This is a local development tool. It uses a single-threaded Python HTTP server (though concurrent via ThreadingHTTPServer) and no authentication beyond a shared key (configurable; disable entirely for localhost).
 - **Single machine only**: Bind to localhost. Do not expose publicly.
+- **Subagent-only provider**: The bridge is NOT a session-wide Codex provider. GPT-5.5 must remain native. Only OSS agents in `.codex/agents/` should route through the bridge.
 - **DeepSeek thinking mode costs tokens**: DeepSeek V4 Pro's reasoning_content is preserved internally but counts against your OpenCode Go usage. Expect ~300-400K tokens for multi-turn coding tasks.
-- **No true upstream streaming**: The proxy requests `stream: false` from OpenCode Go and fakes SSE deltas after receiving the complete response. True token-by-token streaming would reduce latency. The v3 heartbeat prevents Codex timeouts during long upstream responses.
-- **Tool compatibility**: OSS models through Codex get Codex's tool environment but may not know about Codex-specific tool policies (e.g., `rtk` prefixes). Some tool calls may fail until the model learns the environment.
+- **True upstream streaming** (v5+): The bridge uses `stream=true` against OpenCode Go and translates chunks live. This reduces latency compared to v3's fake SSE but depends on OpenCode Go's streaming behavior.
 - **Subagent spawning**: OSS agents must use `fork_turns: "none"` (full-history forks conflict with model/provider overrides). The orchestrator needs to include explicit task context in handoffs since the child doesn't inherit parent conversation history.
 
 ## Self-test
@@ -417,16 +448,13 @@ self-test passed
 → Codex session auth issue. Try: `codex logout && codex login`. Test from a persistent Codex Desktop session rather than `codex exec`. Consider `cli_auth_credentials_store = "file"` in `~/.codex/config.toml`.
 
 **Codex says "unknown provider for model"**
-→ Verify the proxy is running (`curl http://127.0.0.1:4000/health`). Check that `.codex/config.toml` has the `opencode_bridge` provider block. When using direct model access, include `-c model_provider=opencode_bridge`.
+→ Verify the proxy is running (`curl http://127.0.0.1:4000/health -H "Authorization: Bearer sk-local-codex-bridge"`). Check that `.codex/config.toml` has the `opencode_bridge` provider block. Ensure `LITELLM_MASTER_KEY` is set.
 
-**"Operation not permitted" when spawning subagents**
-→ You may be trying recursive `codex exec` from inside a Codex session. Use native `SpawnAgent` with `fork_turns: "none"`, or run manual `codex exec` from a separate terminal.
+**"Codex sent a GPT-family model to the OpenCode Go bridge"**
+→ You configured `model_provider=opencode_bridge` as your session-wide provider. Codex is routing GPT-5.5 orchestrator requests through the bridge. Solution: remove `model_provider = "opencode_bridge"` from your top-level `.codex/config.toml`. Only use it in agent TOMLs. For direct testing, restart the bridge with `GPT_MODEL_STRATEGY=oss`.
 
-**Bridge returns `OPENCODE_GO_API_KEY is not set`**
-→ The bridge process doesn't have the key. Either: set it in `opencode-go.env`, export it before starting the bridge, or use `pass-cli` to inject it.
-
-**DeepSeek/Kimi times out on complex queries**
-→ The bridge sends SSE heartbeat keepalives while upstream processes. If using v2, upgrade to v3. If timeouts persist, increase `UPSTREAM_TIMEOUT_SECONDS` and check `SSE_UPSTREAM_HEARTBEAT_SECONDS`.
+**Timeouts on tool operations (reads/writes) but simple text works**
+→ Same as above. GPT-5.5 orchestrator requests are going through the bridge. Simple text works because no orchestration is needed. Tool ops fail because the orchestrator can't think. Fix: keep GPT-5.5 native.
 
 **"Messages with role 'tool' must be a response to a preceding message with 'tool_calls'"**
 → The bridge's conversation repair is working. Orphan function_call_output items can't be matched to stored conversations. Restart the proxy and retry from a fresh conversation.
