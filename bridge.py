@@ -701,6 +701,32 @@ class ProxyApp:
         self.fallback_model_map = json.loads(os.getenv("FALLBACK_MODEL_MAP_JSON", "{}") or "{}")
         self.upstream_streaming = os.getenv("UPSTREAM_STREAM", "1") != "0"
 
+        # ── Bridge v7 hardening ──
+
+        # Fatal missing key in production mode
+        if self.gpt_model_strategy == "error" and not self.upstream_key:
+            if os.getenv("ALLOW_MISSING_OPENCODE_KEY", "0") != "1":
+                print("FATAL: OPENCODE_GO_API_KEY is not set and GPT_MODEL_STRATEGY=error.", file=sys.stderr)
+                print("Set OPENCODE_GO_API_KEY or start with ALLOW_MISSING_OPENCODE_KEY=1", file=sys.stderr)
+                sys.exit(1)
+
+        # Concurrency semaphores — prevent rate-limit death spirals
+        self.max_global_concurrency = int(os.getenv("MAX_GLOBAL_UPSTREAM_CONCURRENCY", "2"))
+        self.model_concurrency = json.loads(
+            os.getenv("MODEL_CONCURRENCY_JSON", '{"deepseek-v4-pro":1,"kimi-k2.6":1,"deepseek-v4-flash":2}') or "{}"
+        )
+        self.global_semaphore = threading.Semaphore(self.max_global_concurrency)
+        self.model_semaphores: Dict[str, threading.Semaphore] = {}
+
+        # Circuit breaker — mark models degraded after capacity errors
+        self.model_health: Dict[str, JSON] = {}  # model → {"status": "ok"|"degraded", "errors": int, "since": timestamp}
+        self.circuit_breaker_errors = int(os.getenv("CIRCUIT_BREAKER_ERRORS", "2"))
+        self.circuit_breaker_cooldown = int(os.getenv("CIRCUIT_BREAKER_COOLDOWN", "300"))
+
+        # Max-turn guard — prevent runaway token burn in OSS agent loops
+        self.max_tool_turns = int(os.getenv("OSS_MAX_TOOL_TURNS", "6"))
+        self.max_write_tool_turns = int(os.getenv("OSS_MAX_WRITE_TOOL_TURNS", "3"))
+
     def log(self, msg: str, **fields: Any) -> None:
         line = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
         if fields:
@@ -793,9 +819,58 @@ class ProxyApp:
         except urllib.error.URLError as e:
             raise UpstreamError(502, f"OpenAI passthrough network error: {e}")
 
+    def _acquire_model(self, model: str) -> bool:
+        sem = self.model_semaphores.get(model)
+        if sem is None:
+            sem = threading.Semaphore(self.model_concurrency.get(model, 1))
+            self.model_semaphores[model] = sem
+        return sem.acquire(blocking=False)
+
+    def _release_model(self, model: str) -> None:
+        sem = self.model_semaphores.get(model)
+        if sem:
+            sem.release()
+
+    def _check_circuit_breaker(self, model: str) -> Optional[str]:
+        health = self.model_health.get(model)
+        if health and health.get("status") == "degraded":
+            if time.time() - health["since"] < self.circuit_breaker_cooldown:
+                return health.get("fallback")
+            health["status"] = "ok"
+        return None
+
+    def _record_model_error(self, model: str) -> None:
+        health = self.model_health.get(model, {"errors": 0, "since": time.time(), "status": "ok"})
+        health["errors"] = health.get("errors", 0) + 1
+        if health["errors"] >= self.circuit_breaker_errors:
+            health["status"] = "degraded"
+            health["since"] = time.time()
+            fb = self.fallback_model_map.get(model, [None])[0] if self.fallback_model_map.get(model) else None
+            health["fallback"] = fb
+            self.log("circuit_breaker_open", model=model, fallback=fb, cooldown_s=self.circuit_breaker_cooldown)
+        self.model_health[model] = health
+
     def call_upstream_chat(self, payload: JSON) -> JSON:
         if not self.upstream_key:
             raise UpstreamError(500, "OPENCODE_GO_API_KEY is not set")
+
+        # Concurrency gate — prevent rate-limit death spirals
+        model = payload.get("model", "unknown")
+        acquired_global = self.global_semaphore.acquire(timeout=10)
+        if not acquired_global:
+            raise UpstreamError(429, f"Global concurrency limit ({self.max_global_concurrency}) reached")
+        model_acquired = False
+        try:
+            model_sem = self.model_semaphores.get(model)
+            if model_sem is None:
+                model_sem = threading.Semaphore(self.model_concurrency.get(model, 1))
+                self.model_semaphores[model] = model_sem
+            model_acquired = model_sem.acquire(timeout=30)
+            if not model_acquired:
+                raise UpstreamError(429, f"Model concurrency limit for {model} reached")
+        except UpstreamError:
+            self.global_semaphore.release()
+            raise
 
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         headers = {
@@ -806,38 +881,43 @@ class ProxyApp:
         }
 
         last_err: Optional[UpstreamError] = None
-        for attempt in range(self.max_retries + 1):
-            req = urllib.request.Request(self.upstream_chat_url, data=data, headers=headers, method="POST")
-            try:
-                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                    body = resp.read().decode("utf-8", errors="replace")
-                    return json.loads(body)
-            except urllib.error.HTTPError as e:
-                body = e.read().decode("utf-8", errors="replace")
-                hdrs = {k: v for k, v in e.headers.items()}
-                last_err = UpstreamError(e.code, body, hdrs)
+        try:
+            for attempt in range(self.max_retries + 1):
+                req = urllib.request.Request(self.upstream_chat_url, data=data, headers=headers, method="POST")
+                try:
+                    with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                        body = resp.read().decode("utf-8", errors="replace")
+                        return json.loads(body)
+                except urllib.error.HTTPError as e:
+                    body = e.read().decode("utf-8", errors="replace")
+                    hdrs = {k: v for k, v in e.headers.items()}
+                    last_err = UpstreamError(e.code, body, hdrs)
 
-                # Retry only transient errors/rate limits.
-                if e.code not in (408, 409, 429, 500, 502, 503, 504) or attempt >= self.max_retries:
-                    break
-                retry_after = hdrs.get("Retry-After")
-                if retry_after:
-                    try:
-                        sleep_s = min(float(retry_after), 60.0)
-                    except ValueError:
+                    # Retry only transient errors/rate limits.
+                    if e.code not in (408, 409, 429, 500, 502, 503, 504) or attempt >= self.max_retries:
+                        break
+                    retry_after = hdrs.get("Retry-After")
+                    if retry_after:
+                        try:
+                            sleep_s = min(float(retry_after), 60.0)
+                        except ValueError:
+                            sleep_s = min(2 ** attempt, 30.0)
+                    else:
                         sleep_s = min(2 ** attempt, 30.0)
-                else:
-                    sleep_s = min(2 ** attempt, 30.0)
-                self.log("upstream_retry", status=e.code, attempt=attempt + 1, sleep_s=sleep_s)
-                time.sleep(sleep_s)
-            except urllib.error.URLError as e:
-                last_err = UpstreamError(502, f"network error: {e}")
-                if attempt >= self.max_retries:
-                    break
-                time.sleep(min(2 ** attempt, 30.0))
+                    self.log("upstream_retry", status=e.code, attempt=attempt + 1, sleep_s=sleep_s)
+                    time.sleep(sleep_s)
+                except urllib.error.URLError as e:
+                    last_err = UpstreamError(502, f"network error: {e}")
+                    if attempt >= self.max_retries:
+                        break
+                    time.sleep(min(2 ** attempt, 30.0))
 
-        assert last_err is not None
-        raise last_err
+            assert last_err is not None
+            raise last_err
+        finally:
+            if model_acquired:
+                self.model_semaphores.get(model, threading.Semaphore(1)).release()
+            self.global_semaphore.release()
 
     def iter_upstream_chat_stream(self, payload: JSON):
         """
@@ -1575,7 +1655,28 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if self.path.rstrip("/") in ("/health", "/v1/health"):
-            self._send_json(200, {"ok": True, "service": "responses-chat-proxy", "time": now()})
+            model_health = {}
+            for model, h in APP.model_health.items():
+                model_health[model] = {
+                    "status": h.get("status", "ok"),
+                    "errors": h.get("errors", 0),
+                    "since": h.get("since", 0),
+                }
+            status_info = {
+                "ok": True,
+                "service": "responses-chat-proxy",
+                "bridge_version": "7.0",
+                "time": now(),
+                "gpt_model_strategy": APP.gpt_model_strategy,
+                "upstream_stream": getattr(APP, "upstream_streaming", True),
+                "has_opencode_key": bool(APP.upstream_key),
+                "state_db": APP.state.db_path if hasattr(APP.state, "db_path") else os.getenv("PROXY_STATE_DB", "unknown"),
+                "model_health": model_health,
+                "concurrency": {
+                    "max_global": APP.max_global_concurrency,
+                },
+            }
+            self._send_json(200, status_info)
             return
 
         self._send_error_obj(404, f"Unknown path: {self.path}", "not_found")
@@ -1616,6 +1717,8 @@ class Handler(BaseHTTPRequestHandler):
                 messages=len(payload.get("messages", [])),
                 tools=len(payload.get("tools", [])),
                 stream=bool(body.get("stream")),
+                turn_kind="tool_output_continuation" if body.get("previous_response_id") else "new",
+                tool_count=sum(1 for m in payload.get("messages", []) if m.get("role") == "tool"),
             )
 
             if body.get("stream"):
@@ -1634,7 +1737,31 @@ class Handler(BaseHTTPRequestHandler):
             self._send_error_obj(400, str(e), "unsupported_bridge_model")
         except HistoryRepairError as e:
             APP.log("history_repair_error", error=str(e))
-            self._send_error_obj(400, str(e))
+            # Return a recoverable message instead of a raw provider error.
+            # This lets GPT-5.5 gracefully restart the subagent task.
+            self._send_json(200, {
+                "id": body.get("previous_response_id") or "resp_orphan",
+                "object": "response",
+                "created_at": int(time.time()),
+                "status": "completed",
+                "model": body.get("model", "unknown"),
+                "output": [{
+                    "type": "message",
+                    "id": "msg_orphan_recovery",
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [{
+                        "type": "output_text",
+                        "text": (
+                            "The bridge lost its tool-call state for this turn, likely due to "
+                            "proxy restart or expired state. Start a fresh OSS subagent task "
+                            "with the original request. No repository changes were accepted."
+                        ),
+                        "annotations": [],
+                    }],
+                }],
+                "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+            })
         except UpstreamError as e:
             APP.log("upstream_error", status=e.status, body=e.body[:500])
             status = e.status if 400 <= e.status < 600 else 502
@@ -1649,9 +1776,21 @@ class Handler(BaseHTTPRequestHandler):
             self._send_error_obj(500, f"Proxy internal error: {e}", "internal_error")
 
     def _call_upstream_with_fallback(self, payload: JSON, model_alias: str, model_upstream: str) -> Tuple[JSON, str]:
+        # Circuit breaker check
+        fallback_from_breaker = APP._check_circuit_breaker(model_upstream)
+        if fallback_from_breaker:
+            fb_payload = dict(payload)
+            fb_payload["model"] = map_model(str(fallback_from_breaker), APP.model_map)
+            APP.log("circuit_breaker_routing", from_model=model_upstream, to_model=fb_payload["model"])
+            try:
+                return APP.call_upstream_chat(fb_payload), fb_payload["model"]
+            except UpstreamError:
+                pass  # Fall through to normal fallback
+
         try:
             return APP.call_upstream_chat(payload), model_upstream
         except UpstreamError as first_err:
+            APP._record_model_error(model_upstream)
             fallbacks = APP.fallback_model_map.get(model_upstream) or APP.fallback_model_map.get(model_alias) or []
             if first_err.status in (408, 409, 429, 500, 502, 503, 504):
                 for fb in fallbacks:
