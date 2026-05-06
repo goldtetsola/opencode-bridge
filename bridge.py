@@ -1882,6 +1882,15 @@ class ProxyApp:
 
     def prepare_chat_payload(self, body: JSON) -> Tuple[JSON, List[JSON], str, str, Dict[str, str]]:
         model_alias = str(body.get("model") or "ocg-deepseek-v4-pro")
+
+        # Detect subagent fork: GPT model with continuation context.
+        # In production mode, auto-alias to OSS so subagent spawn succeeds.
+        prev_id = body.get("previous_response_id")
+        if self.gpt_model_strategy == "error" and is_gpt_model(model_alias) and prev_id:
+            self.log("gpt_subagent_fork_auto_alias", model_alias=model_alias,
+                     fallback=self.gpt_oss_fallback)
+            model_alias = self.gpt_oss_fallback
+
         gpt_routed = self.route_gpt_model_for_chat_bridge(model_alias)
         model_upstream = gpt_routed if gpt_routed else map_model(model_alias, self.model_map)
 
