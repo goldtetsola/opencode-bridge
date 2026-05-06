@@ -43,6 +43,8 @@ def main():
     # up — foreground supervisor
     up = sub.add_parser("up", help="Start bridge with foreground supervisor (keep terminal open)")
     up.add_argument("--port", type=int, default=4000)
+    up.add_argument("--daemon", action="store_true", help="Start bridge as daemon (detach and exit after health check)")
+    up.add_argument("--foreground", action="store_true", help="Keep terminal open with live log tailing")
 
     # run — start bridge, run command, cleanup
     run = sub.add_parser("run", help="Start bridge, run command, stop bridge")
@@ -73,7 +75,7 @@ def main():
         _bridge_status()
 
     elif args.command == "up":
-        sys.exit(_supervise(args.port))
+        sys.exit(_supervise(args.port, daemon=args.daemon, foreground=args.foreground))
 
     elif args.command == "run":
         sys.exit(_run_with_bridge(args.port, args.cmd))
@@ -218,8 +220,10 @@ def _bridge_status():
 
 # ── Supervisor ──
 
-def _supervise(port: int) -> int:
-    """Foreground supervisor: start bridge, monitor health, stream logs, handle Ctrl+C."""
+def _supervise(port: int, daemon: bool = False, foreground: bool = False) -> int:
+    """Foreground supervisor: start bridge, monitor health, stream logs, handle Ctrl+C.
+    With --daemon: exit after health, bridge keeps running independently.
+    """
     import os, signal, time, threading, subprocess, urllib.request, json, hashlib
 
     package_dir = os.path.dirname(os.path.abspath(__file__))
@@ -287,7 +291,7 @@ def _supervise(port: int) -> int:
         json.dump(supervisor_info, f)
 
     # Wait for health
-    print(f"  Waiting for health...")
+    print(f"  Waiting for health...") if not daemon else None
     for i in range(30):
         try:
             req = urllib.request.Request(f"http://127.0.0.1:{port}/health")
@@ -295,6 +299,11 @@ def _supervise(port: int) -> int:
             req.add_header("Authorization", f"Bearer {key}")
             d = json.loads(urllib.request.urlopen(req, timeout=2).read())
             if d.get("ok"):
+                if daemon:
+                    print(f"  Bridge started on port {port} (PID: {proc.pid})")
+                    print(f"  Logs: .codex-oss/logs/")
+                    print(f"  Stop with: codex-oss stop")
+                    return 0
                 print(f"  Provider listening: http://127.0.0.1:{port}/v1")
                 print(f"  State DB: {d.get('state_db', 'unknown')}")
                 print()
@@ -307,45 +316,51 @@ def _supervise(port: int) -> int:
     else:
         print("  WARN: Bridge did not respond to health check within 15s")
         print("  Check .codex-oss/logs/bridge.err.log")
+        if daemon:
+            return 1
 
-    # Handle Ctrl+C gracefully
-    def _shutdown(sig=None, frame=None):
-        print("\n  Shutting down bridge...")
-        proc.terminate()
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
+    if daemon:
+        return 0  # Already returned above on success, here on timeout
+
+    if not daemon:
+        # Handle Ctrl+C gracefully
+        def _shutdown(sig=None, frame=None):
+            print("\n  Shutting down bridge...")
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+            os.remove(pid_file) if os.path.exists(pid_file) else None
+            os.remove(supervisor_file) if os.path.exists(supervisor_file) else None
+            print("  Bridge stopped.")
+            sys.exit(0)
+
+        signal.signal(signal.SIGINT, _shutdown)
+        signal.signal(signal.SIGTERM, _shutdown)
+
+        # Log tailer
+        def _tail():
+            try:
+                while proc.poll() is None:
+                    time.sleep(3)
+                    if os.path.exists(os.path.join(log_dir, "bridge.err.log")):
+                        with open(os.path.join(log_dir, "bridge.err.log")) as f:
+                            lines = f.readlines()
+                            if lines:
+                                last = lines[-1].strip()
+                                if "error" in last.lower() or "fatal" in last.lower():
+                                    print(f"  [bridge] {last[:120]}")
+            except Exception:
+                pass
+        threading.Thread(target=_tail, daemon=True).start()
+
+        # Wait for bridge process
+        proc.wait()
+        print("  Bridge process exited unexpectedly.")
         os.remove(pid_file) if os.path.exists(pid_file) else None
-        os.remove(supervisor_file) if os.path.exists(supervisor_file) else None
-        print("  Bridge stopped.")
-        sys.exit(0)
-
-    signal.signal(signal.SIGINT, _shutdown)
-    signal.signal(signal.SIGTERM, _shutdown)
-
-    # Log tailer — stream last few lines of error log
-    def _tail():
-        try:
-            while proc.poll() is None:
-                time.sleep(3)
-                # Print any new error log content
-                if os.path.exists(os.path.join(log_dir, "bridge.err.log")):
-                    with open(os.path.join(log_dir, "bridge.err.log")) as f:
-                        lines = f.readlines()
-                        if lines:
-                            last = lines[-1].strip()
-                            if "error" in last.lower() or "fatal" in last.lower():
-                                print(f"  [bridge] {last[:120]}")
-        except Exception:
-            pass
-    threading.Thread(target=_tail, daemon=True).start()
-
-    # Wait for bridge process
-    proc.wait()
-    print("  Bridge process exited unexpectedly.")
-    os.remove(pid_file) if os.path.exists(pid_file) else None
-    return 1
+        return 1
+    return 0
 
 
 def _run_with_bridge(port: int, cmd: list) -> int:
