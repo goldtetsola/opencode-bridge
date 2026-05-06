@@ -553,6 +553,7 @@ class TaskSession:
     read_paths: dict = field(default_factory=dict)
     commands_run: list = field(default_factory=list)
     required_outputs: list = field(default_factory=list)
+    verification_steps: list = field(default_factory=list)  # v12: grep/read steps
     handoff_text: str = ""
 
 
@@ -596,26 +597,83 @@ def build_task_session(body: JSON, handoff_text: str, response_id: str) -> TaskS
         max_tool_exchanges=budget if mode != "context_pack" else 0,
         required_paths=paths,
         required_commands=cmd_lines,
+        verification_steps=parse_task_envelope(handoff_text).get("verification_steps", []),
         required_outputs=fields,
         handoff_text=handoff_text,
     )
 
 
 def build_context_pack(session: TaskSession, project_root: str) -> str:
-    """Gather all required sources and return as context pack string."""
+    """Gather all required sources, command-aware: grep instead of full file where specified."""
     sections = []
+    files_fully_read = set()
+    PACK_MAX = int(os.getenv("CONTEXT_PACK_MAX_CHARS", "24000"))
+    total_chars = 0
+
+    def _append_section(text: str):
+        nonlocal total_chars
+        sections.append(text)
+        total_chars += len(text)
+
+    # Parse verification steps into commands (grep, read) and paths
+    cmd_requests: list = []  # (type, target, pattern)
+    for step in session.verification_steps + session.required_commands:
+        step_lower = step.lower().strip("- ").strip()
+        # Match "grep PATTERN in FILENAME" or "grep PATTERN FILENAME"
+        if step_lower.startswith("grep"):
+            rest = step_lower.replace("grep ", "", 1).strip()
+            if " in " in rest:
+                parts = rest.split(" in ", 1)
+                pattern = parts[0].strip()
+                target = parts[1].strip()
+            else:
+                # "grep pattern filename" — last word is file
+                parts = rest.rsplit(None, 1)
+                pattern = parts[0].strip() if len(parts) > 1 else rest
+                target = parts[1].strip() if len(parts) > 1 else ""
+            if pattern and target:
+                cmd_requests.append(("grep", target, pattern))
+
+    # Process required paths
     for path in session.required_paths:
         full = os.path.normpath(os.path.join(project_root, path))
+        # Check if any grep request targets this file (by filename match)
+        grep_pattern = None
+        for ct, target, pattern in cmd_requests:
+            target_clean = target.strip().rstrip(".").lstrip("./")
+            path_clean = path.strip().lstrip("./")
+            if target_clean in path_clean or path_clean.endswith(target_clean) or target_clean == path_clean.split("/")[-1]:
+                grep_pattern = pattern
+                break
+
+        full = os.path.normpath(os.path.join(project_root, path))
         try:
+            if grep_pattern:
+                # Run grep instead of full read
+                out = subprocess.run(
+                    ["rtk", "grep", grep_pattern, path],
+                    cwd=project_root, capture_output=True, text=True, timeout=15)
+                files_fully_read.add(path)
+                _append_section(
+                    f"=== grep {grep_pattern} in {path} ===\n"
+                    f"exit_code: {out.returncode}\n"
+                    f"matched lines:\n{out.stdout[:4000]}\n")
+                session.commands_run.append(["grep", grep_pattern, path])
+                continue
+
             raw = open(full, encoding="utf-8", errors="replace").read()
-            MAX = 8000
-            if len(raw) > MAX:
-                sections.append(f"=== {path} (TRUNCATED: {len(raw)} chars total, showing first {MAX}) ===\n"
-                                f"{raw[:MAX]}\n[... {len(raw) - MAX} more chars ...]\n")
+            files_fully_read.add(path)
+            # Cap per file and globally
+            per_file_max = min(8000, max(1000, PACK_MAX // max(len(session.required_paths), 1)))
+            if len(raw) > per_file_max or total_chars + len(raw) > PACK_MAX:
+                chunk = min(per_file_max, max(500, PACK_MAX - total_chars))
+                _append_section(
+                    f"=== {path} (TRUNCATED: {len(raw)} total, showing first {chunk}) ===\n"
+                    f"{raw[:chunk]}\n[... truncated ...]\n")
             else:
-                sections.append(f"=== {path} ({len(raw)} chars) ===\n{raw}\n")
+                _append_section(f"=== {path} ({len(raw)} chars) ===\n{raw}\n")
         except Exception as e:
-            sections.append(f"=== {path} ===\n[ERROR: {e}]\n")
+            _append_section(f"=== {path} ===\n[ERROR: {e}]\n")
 
     # Run git commands if requested
     for cmd_text in session.required_commands:
@@ -623,16 +681,15 @@ def build_context_pack(session: TaskSession, project_root: str) -> str:
         if "git" in cmd_text.lower():
             try:
                 args = [a for a in cmd_text.split() if a and not a.startswith(("-", "git", "VERIFICA"))]
-                if not args:
-                    continue
-                import subprocess
+                if not args: continue
                 out = subprocess.run(["git"] + args, cwd=project_root,
                                      capture_output=True, text=True, timeout=15)
-                sections.append(f"=== git {' '.join(args)} ===\nexit_code: {out.returncode}\n{out.stdout}\n{out.stderr}\n")
+                _append_section(f"=== git {' '.join(args)} ===\nexit_code: {out.returncode}\n{out.stdout}\n{out.stderr}\n")
                 session.commands_run.append(args)
             except Exception as e:
-                sections.append(f"=== git ({cmd_text}) ===\n[ERROR: {e}]\n")
+                _append_section(f"=== git ({cmd_text}) ===\n[ERROR: {e}]\n")
 
+    session.required_paths = list(files_fully_read)
     return "\n".join(sections)
 
 
@@ -708,7 +765,9 @@ def parse_task_envelope(handoff_text: str) -> dict:
         envelope["forbidden_actions"] = _parse_path_list(_extract_segment(merged, marker))
     if "VERIFICATION STEPS:" in upper_all or "VERIFICATION:" in upper_all:
         marker = "VERIFICATION STEPS:" if "VERIFICATION STEPS:" in merged else "VERIFICATION:"
-        envelope["verification_steps"] = _parse_path_list(_extract_segment(merged, marker))
+        raw = _extract_segment(merged, marker)
+        # Split by commas to get individual steps, but keep multi-word steps together
+        envelope["verification_steps"] = [s.strip().strip("- ") for s in raw.split(",") if s.strip()]
     if "DELIVERABLE:" in upper_all:
         raw = _extract_after(merged, "DELIVERABLE:")
         envelope["deliverable_fields"] = [raw.strip()] if raw else []
@@ -763,11 +822,17 @@ def _parse_path_list(line: str) -> list:
     after = line.split(":", 1)[1] if ":" in line else line
     parts = [p.strip().strip(",") for p in after.replace(";", ",").split(",")
             if p.strip() and not p.strip().lower().startswith(("no ", "none", "do not"))]
-    # Normalize absolute paths to relative when possible
     normalized = []
     for p in parts:
+        # Strip trailing sentence-boundary periods from filenames
+        if p.endswith(".") and not p.endswith(".."):
+            stem = p[:-1]
+            # Only strip if it looks like a sentence boundary (uppercase next word would have followed)
+            if "." in stem or any(stem.lower().endswith(ext) for ext in
+                (".md", ".py", ".js", ".ts", ".toml", ".json", ".txt", ".yml", ".yaml", ".css", ".html")):
+                p = stem
+        # Normalize absolute paths
         if p.startswith("/"):
-            # Convert absolute to relative if it's under /Users/.../project/
             cwd = os.getcwd()
             if p.startswith(cwd):
                 normalized.append(os.path.relpath(p, cwd))
