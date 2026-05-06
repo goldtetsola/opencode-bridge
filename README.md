@@ -146,17 +146,20 @@ The bridge handles:
 
 Also accepts OpenCode-style `opencode-go/<model>` model IDs.
 
-## Bridge v8: Transactional tool-turn adapter
+## Bridge v8+: OSS subagent runtime
 
-OSS agents are bounded tool transactions, not autonomous multi-turn agents. When an OSS subagent executes a tool (read, write, shell), the continuation is handled deterministically:
+OSS agents are no longer autonomous multi-turn agents — they're bounded transactions with deterministic finalization, managed autonomy, and context-pack mode for prep tasks.
 
-- **Writes**: No model call needed after a successful write. The bridge generates the report directly ("OSS write completed. File: X. Result: success. GPT review required").
-- **Reads**: A no-tool finalizer call with a short deadline. The model can only summarize — it can't call more tools or hang in reasoning.
-- **Stalled finalizer**: Falls back through Kimi → Flash → deterministic degraded report. **Every request always returns a terminal response. No hang possible.**
+- **Writes**: No model call needed after a successful write. The bridge generates the report directly.
+- **Reads**: A no-tool finalizer call with a short deadline.
+- **Managed autonomy** (v10): Scouts get per-task-class budgets (scout:6, prep_report:8). The bridge tracks turns, injects evidence ledgers, and lets the agent continue until budget exhausted or task complete.
+- **Context-pack mode** (v11): When `READ-ONLY PATHS` are explicit (prep/report tasks with known sources), the bridge gathers all files + git commands internally and sends one no-tools synthesis call. No duplicate reads, no budget waste, one model turn.
+- **Duplicate suppression** (v11): In managed autonomy, if the model re-requests an already-read file, the bridge returns `[ALREADY READ]` with remaining paths instead of re-executing.
+- **Report validation**: Startup sentences and sub-50-char outputs are rejected. Missing required fields are logged.
 
-This fixes the two common failure modes: resumed turn hangs and post-write report hangs.
+Every path guarantees a terminal response (`response.completed` or `response.failed`) before closing the SSE stream.
 
-### v8 environment variables
+### v8+ environment variables
 
 | Variable | Default | Description |
 |---|---|---|
@@ -167,7 +170,7 @@ This fixes the two common failure modes: resumed turn hangs and post-write repor
 | `CONTINUATION_DEADLINE_SECONDS` | `45` | Deadline for finalizer calls |
 | `WRITE_RESULT_MODE` | `deterministic` | Write handling: `deterministic` = no model call |
 | `MAX_TOOL_OUTPUT_CHARS` | `20000` | Compact outputs larger than this |
-| `UPSTREAM_FIRST_BYTE_TIMEOUT_SECONDS` | `30` | Timeout for first upstream byte |
+| `FORCE_SINGLE_TOOL_INSTRUCTIONS` | `1` | Enforce single-tool-per-turn (prevents parallel-call repair failures) |
 | `DEGRADED_COMPLETION_ON_TIMEOUT` | `1` | Return degraded report on timeout |
 
 ## Model-task matrix
