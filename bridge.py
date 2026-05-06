@@ -2758,6 +2758,8 @@ class Handler(BaseHTTPRequestHandler):
         """
         model_alias = str(body.get("model") or "ocg-deepseek-v4-pro")
         model_upstream = APP.route_gpt_model_for_chat_bridge(model_alias) or map_model(model_alias, APP.model_map)
+        request_start = time.time()
+        request_deadline = float(os.getenv("REQUEST_DEADLINE_SECONDS", "90"))
 
         # Classify tool outputs
         tool_outputs = [m for m in body.get("input", []) if m.get("type") == "function_call_output"]
@@ -2933,7 +2935,20 @@ class Handler(BaseHTTPRequestHandler):
                             APP.log("intent_retry_failed")
                 except Exception as e:
                     APP.log("context_pack_failed", error=str(e))
-                    # Fall through to finalizer — skip managed autonomy below
+                    # Emit deterministic partial — don't let client hang
+                    elapsed = time.time() - request_start
+                    partial_text = (
+                        f"PARTIAL\n"
+                        f"Reason: context-pack model call timed out after {elapsed:.0f}s\n"
+                        f"Files gathered: {', '.join(session.required_paths)}\n"
+                        f"Missing: model synthesis\n"
+                        f"Confidence: LOW\nCaveat: GPT review recommended"
+                    )
+                    emitter = ResponseEmitter(self, new_id("resp"), model_alias, bool(body.get("stream")))
+                    emitter.emit_text_message(partial_text)
+                    emitter.complete()
+                    APP.log("context_pack_deterministic_partial")
+                    return
 
             # Skip managed autonomy if context-pack was attempted
             if not context_pack_attempted:
