@@ -67,7 +67,7 @@ Codex Desktop / CLI
     │           │
     │           │  Responses API (SSE streaming, live upstream)
     │           ▼
-    │     bridge.py   ← this repo (v6)
+    │     bridge.py   ← this repo
     │           │
     │           │  Chat Completions API (stream=true)
     │           ▼
@@ -110,7 +110,7 @@ The bridge handles:
 | `PROXY_LOG_PATH` | (stderr) | Path for structured JSON log output |
 | `SSE_CHUNK_SIZE` | `256` | Characters per SSE text delta chunk |
 | `SSE_UPSTREAM_HEARTBEAT_SECONDS` | `5` | Seconds between heartbeat comments while waiting for upstream |
-| `UPSTREAM_STREAM` | `1` | Use stream=true for upstream Chat Completions (v5+ live streaming) |
+| `UPSTREAM_STREAM` | `1` | Use stream=true for upstream Chat Completions (live streaming) |
 | `GPT_MODEL_STRATEGY` | `error` | How to handle GPT-model requests: `error` (reject immediately), `oss` (alias to OSS model for testing), `openai` (passthrough to OpenAI API — requires `OPENAI_API_KEY`) |
 | `GPT_MODEL_OSS_FALLBACK` | `deepseek-v4-pro` | OSS model to use when `GPT_MODEL_STRATEGY=oss` |
 | `OPENAI_API_KEY` | (not set) | Required only for `GPT_MODEL_STRATEGY=openai` |
