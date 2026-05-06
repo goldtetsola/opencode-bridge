@@ -121,14 +121,14 @@ The bridge handles:
 | `OSS_MAX_TOOL_TURNS` | `6` | Max tool turns before OSS agent is stopped |
 | `ALLOW_MISSING_OPENCODE_KEY` | `0` | Set to `1` to bypass fatal key check |
 | `OSS_NATIVE_MAX_TOOL_EXCHANGES` | `1` | Max tool calls per OSS subagent turn |
-| `CONTINUATION_TOOLS` | `none` | Tools for continuation turns (v8: `none` = no tools, force finalization) |
+| `CONTINUATION_TOOLS` | `none` | Tools for continuation turns (`none` = force finalization) |
 | `CONTINUATION_MODEL` | `kimi-k2.6` | Model for read-result finalizer |
 | `CONTINUATION_DEADLINE_SECONDS` | `45` | Deadline for finalizer model calls |
 | `WRITE_RESULT_MODE` | `deterministic` | Write results: `deterministic` = no model call |
 | `MAX_TOOL_OUTPUT_CHARS` | `20000` | Compact tool outputs larger than this |
 | `UPSTREAM_FIRST_BYTE_TIMEOUT_SECONDS` | `30` | Timeout for first byte from upstream |
 | `UPSTREAM_IDLE_TIMEOUT_SECONDS` | `30` | Timeout for upstream idle during processing |
-| `DEGRADED_COMPLETION_ON_TIMEOUT` | `1` | Return degraded report on timeout (v8: always returns terminal response) |
+| `DEGRADED_COMPLETION_ON_TIMEOUT` | `1` | Return degraded report on timeout |
 | `EXPOSE_EMPTY_REASONING_ITEM` | `1` | Include empty reasoning item in output for Codex compatibility |
 | `STRIP_TOOLS` | `0` | Set to `1` to strip ALL tools (force text-only responses) |
 
@@ -146,20 +146,20 @@ The bridge handles:
 
 Also accepts OpenCode-style `opencode-go/<model>` model IDs.
 
-## Bridge v8+: OSS subagent runtime
+## Bridge: OSS subagent runtime
 
-OSS agents are no longer autonomous multi-turn agents — they're bounded transactions with deterministic finalization, managed autonomy, and context-pack mode for prep tasks.
+OSS agents are bounded transactions with deterministic finalization, managed autonomy, and context-pack mode for prep tasks.
 
 - **Writes**: No model call needed after a successful write. The bridge generates the report directly.
 - **Reads**: A no-tool finalizer call with a short deadline.
-- **Managed autonomy** (v10): Scouts get per-task-class budgets (scout:6, prep_report:8). The bridge tracks turns, injects evidence ledgers, and lets the agent continue until budget exhausted or task complete.
-- **Context-pack mode** (v11): When `READ-ONLY PATHS` are explicit (prep/report tasks with known sources), the bridge gathers all files + git commands internally and sends one no-tools synthesis call. No duplicate reads, no budget waste, one model turn.
-- **Duplicate suppression** (v11): In managed autonomy, if the model re-requests an already-read file, the bridge returns `[ALREADY READ]` with remaining paths instead of re-executing.
+- **Managed autonomy**: Scouts get per-task-class budgets (scout:6, prep_report:8). The bridge tracks turns, injects evidence ledgers, and lets the agent continue until budget exhausted or task complete.
+- **Context-pack mode**: When `READ-ONLY PATHS` are explicit (prep/report tasks with known sources), the bridge gathers all files + git commands internally and sends one no-tools synthesis call. No duplicate reads, no budget waste, one model turn.
+- **Duplicate suppression**: In managed autonomy, if the model re-requests an already-read file, the bridge returns `[ALREADY READ]` with remaining paths instead of re-executing.
 - **Report validation**: Startup sentences and sub-50-char outputs are rejected. Missing required fields are logged.
 
 Every path guarantees a terminal response (`response.completed` or `response.failed`) before closing the SSE stream.
 
-### v8+ environment variables
+### Runtime environment variables
 
 | Variable | Default | Description |
 |---|---|---|
