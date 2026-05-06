@@ -2652,7 +2652,7 @@ class ResponseEmitter:
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "ResponsesChatProxy/11.0"
+    server_version = "ResponsesChatProxy/12.0"
 
     def _send_json(self, status: int, obj: Any) -> None:
         data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
@@ -2693,7 +2693,7 @@ class Handler(BaseHTTPRequestHandler):
             status_info = {
                 "ok": True,
                 "service": "responses-chat-proxy",
-                "bridge_version": "11.0",
+                "bridge_version": "12.0",
                 "time": now(),
                 "pid": os.getpid(),
                 "argv": sys.argv,
