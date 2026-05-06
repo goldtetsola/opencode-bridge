@@ -148,16 +148,24 @@ Also accepts OpenCode-style `opencode-go/<model>` model IDs.
 
 ## Bridge: OSS subagent runtime
 
-OSS agents are bounded transactions with deterministic finalization, managed autonomy, and context-pack mode for prep tasks.
+OSS agents are bounded transactions with deterministic finalization, managed autonomy, and context-pack mode for prep tasks. The bridge auto-detects subagent forks (GPT-5.5 with continuation context) and aliases to OSS — no `fork_turns` configuration needed.
 
-- **Writes**: No model call needed after a successful write. The bridge generates the report directly.
-- **Reads**: A no-tool finalizer call with a short deadline.
-- **Managed autonomy**: Scouts get per-task-class budgets (scout:6, prep_report:8). The bridge tracks turns, injects evidence ledgers, and lets the agent continue until budget exhausted or task complete.
-- **Context-pack mode**: When `READ-ONLY PATHS` are explicit (prep/report tasks with known sources), the bridge gathers all files + git commands internally and sends one no-tools synthesis call. No duplicate reads, no budget waste, one model turn.
-- **Duplicate suppression**: In managed autonomy, if the model re-requests an already-read file, the bridge returns `[ALREADY READ]` with remaining paths instead of re-executing.
-- **Report validation**: Startup sentences and sub-50-char outputs are rejected. Missing required fields are logged.
+### Execution modes
 
-Every path guarantees a terminal response (`response.completed` or `response.failed`) before closing the SSE stream.
+The bridge selects the right mode based on the task handoff:
+
+- **`no_tool_exact`** — exact output tasks (guardrail tests, control probes). No model decisions needed.
+- **`context_pack_report`** — read tasks with explicit `READ-ONLY PATHS` + `DELIVERABLE`. Bridge gathers all files internally, sends one no-tools synthesis call. Command-aware: `grep X in Y` steps get grep output, not full files.
+- **`managed_autonomy`** — discovery tasks where the model chooses what to inspect. Budget-capped, duplicate-suppressed, evidence-ledger-injected.
+- **`bounded_write_exact`** — writes to explicit `OWNED PATHS` with exact content. Bridge writes the file directly, reads it back, returns deterministic PASS/FAIL. No model call needed.
+
+### Guarantees
+
+- **Writes**: Deterministic — bridge writes file, reads back, reports result. No model self-report dependency.
+- **Reads**: Context-pack or managed autonomy with deadline control. Grimg detected, only grep output included (not full files).
+- **Intent rejection**: "I will", "Running...", "Starting..." rejected as non-terminal. Internal retry once, then deterministic report from gathered evidence.
+- **Timeout recovery**: Request-level deadline prevents serial timeout stacking. Deterministic PARTIAL report within deadline instead of client disconnect.
+- **Terminal guarantee**: Every path emits `response.completed` or `response.failed` before closing the SSE stream.
 
 ### Runtime environment variables
 
@@ -172,6 +180,9 @@ Every path guarantees a terminal response (`response.completed` or `response.fai
 | `MAX_TOOL_OUTPUT_CHARS` | `20000` | Compact outputs larger than this |
 | `FORCE_SINGLE_TOOL_INSTRUCTIONS` | `1` | Enforce single-tool-per-turn (prevents parallel-call repair failures) |
 | `DEGRADED_COMPLETION_ON_TIMEOUT` | `1` | Return degraded report on timeout |
+| `REQUEST_DEADLINE_SECONDS` | `90` | Hard deadline for entire request |
+| `CONTEXT_PACK_MAX_CHARS` | `24000` | Max chars in context-pack source bundle |
+| `GPT_MODEL_STRATEGY` | `error` | GPT handling: `error` (reject top-level misuse, auto-alias subagent forks), `oss` (alias all), `openai` (passthrough) |
 
 ## Model-task matrix
 
