@@ -294,6 +294,81 @@ class StoredResponse:
     messages: List[JSON]
     pending_call_ids: List[str]
     created_at: int
+    tool_exchange_count: int = 0  # v10: tracks turn count for budget enforcement
+    task_max_exchanges: int = 1  # v10: per-task-class budget
+
+
+# ── v10: Task-class budgets ──
+
+TASK_CLASS_BUDGETS = {
+    "single_read": 2,
+    "scout": 6,
+    "prep_report": 8,
+    "review": 6,
+    "docs_support": 4,
+    "bounded_write": 3,
+    "bounded_test_write": 4,
+    "implementation": 5,
+    "proof_critical": 0,
+}
+
+DEFAULT_TASK_BUDGET = 1
+
+TASK_CLASS_KEYWORDS = {
+    "scout": ["scout", "explor", "navigation", "find", "map", "search", "inspect", "repo inspection"],
+    "prep_report": ["prep", "prepare", "report", "read-only repo", "memory inspection", "prep report"],
+    "review": ["review", "audit", "check", "diff"],
+    "docs_support": ["docs", "documentation", "changelog", "summary", "summarize"],
+    "bounded_write": ["write", "edit", "patch", "implement", "create", "add function"],
+    "bounded_test_write": ["test", "add test", "test scaffolding"],
+    "proof_critical": ["proof", "critical", "recovery", "finalizer", "certification", "publish"],
+    "single_read": ["read", "say", "tell"],
+}
+
+SETUP_PATH_PREFIXES = [
+    "/Users/",  # global skill paths
+    ".codex/skills/",
+]
+
+
+def _extract_budget(messages: List[JSON]) -> int:
+    """Extract task-class budget from OSS handoff text in messages."""
+    handoff = ""
+    for msg in messages:
+        if msg.get("role") in ("system", "developer", "user") and msg.get("content"):
+            handoff += " " + str(msg["content"])
+    task_class = extract_task_class(handoff)
+    return get_task_budget(task_class)
+
+
+def extract_task_class(handoff_text: str) -> str:
+    """Infer task class from OSS handoff text using keyword matching."""
+    text_lower = handoff_text.lower()
+    scores = {}
+    for cls_name, keywords in TASK_CLASS_KEYWORDS.items():
+        score = sum(1 for kw in keywords if kw in text_lower)
+        if score > 0:
+            scores[cls_name] = score
+    if scores:
+        return max(scores, key=scores.get)
+    return "scout"
+
+
+def get_task_budget(task_class: str) -> int:
+    return TASK_CLASS_BUDGETS.get(task_class, DEFAULT_TASK_BUDGET)
+
+
+def task_class_allows_writes(task_class: str) -> bool:
+    return task_class in ("bounded_write", "bounded_test_write", "implementation")
+
+
+def is_setup_read(path: str) -> bool:
+    """Check if a file read is setup/context, not task work."""
+    p = path.strip().strip("'\"").strip()
+    for prefix in SETUP_PATH_PREFIXES:
+        if p.startswith(prefix) and ("skill" in p.lower() or "SKILL" in p):
+            return True
+    return False
 
 
 class StateStore:
@@ -328,6 +403,16 @@ class StateStore:
             """
         )
         self.db.commit()
+        # v10: add columns if missing (safe on existing DBs)
+        try:
+            self.db.execute("ALTER TABLE responses ADD COLUMN tool_exchange_count INTEGER DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            self.db.execute("ALTER TABLE responses ADD COLUMN task_max_exchanges INTEGER DEFAULT 1")
+        except sqlite3.OperationalError:
+            pass
+        self.db.commit()
 
     def cleanup(self) -> None:
         cutoff = now() - self.ttl_seconds
@@ -350,8 +435,8 @@ class StateStore:
             self.db.execute(
                 """
                 INSERT OR REPLACE INTO responses
-                (response_id, model_alias, model_upstream, messages_json, pending_call_ids_json, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                (response_id, model_alias, model_upstream, messages_json, pending_call_ids_json, created_at, tool_exchange_count, task_max_exchanges)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     state.response_id,
@@ -360,6 +445,8 @@ class StateStore:
                     json_dumps(state.messages),
                     json_dumps(state.pending_call_ids),
                     state.created_at,
+                    state.tool_exchange_count,
+                    state.task_max_exchanges,
                 ),
             )
             for call_id in state.pending_call_ids:
@@ -372,7 +459,8 @@ class StateStore:
     def get(self, response_id: str) -> Optional[StoredResponse]:
         with self.lock:
             row = self.db.execute(
-                "SELECT response_id, model_alias, model_upstream, messages_json, pending_call_ids_json, created_at FROM responses WHERE response_id = ?",
+                "SELECT response_id, model_alias, model_upstream, messages_json, pending_call_ids_json, created_at, "
+                "COALESCE(tool_exchange_count, 0), COALESCE(task_max_exchanges, 1) FROM responses WHERE response_id = ?",
                 (response_id,),
             ).fetchone()
         if not row:
@@ -384,6 +472,8 @@ class StateStore:
             messages=json.loads(row[3]),
             pending_call_ids=json.loads(row[4]),
             created_at=int(row[5]),
+            tool_exchange_count=row[6] if len(row) > 6 else 0,
+            task_max_exchanges=row[7] if len(row) > 7 else 1,
         )
 
     def find_by_call_ids(self, call_ids: Iterable[str]) -> Optional[StoredResponse]:
@@ -1413,6 +1503,7 @@ class ProxyApp:
                 messages=all_messages,
                 pending_call_ids=pending_ids,
                 created_at=created_at,
+                task_max_exchanges=_extract_budget(base_messages),
             )
         )
 
@@ -1837,6 +1928,7 @@ class ChatStreamAssembler:
                 messages=all_messages,
                 pending_call_ids=[tc["id"] for tc in replay_tool_calls],
                 created_at=self.created_at,
+                task_max_exchanges=_extract_budget(self.base_messages),
             )
         )
 
@@ -2219,8 +2311,22 @@ class Handler(BaseHTTPRequestHandler):
         tool_output_raw = first_tool.get("output", "")
         tool_output_text = str(tool_output_raw)
 
-        APP.log("continuation_start", model=model_alias, tool_kind=tool_kind,
-                tool_name=tool_name_raw, output_chars=len(tool_output_text))
+        # Count turn and determine budget
+        if prev_state:
+            turn = prev_state.tool_exchange_count + 1
+            max_exchanges = prev_state.task_max_exchanges or 1
+        else:
+            turn = 1
+            max_exchanges = 1
+
+        APP.log("continuation_turn", turn=turn, max_exchanges=max_exchanges,
+                tool_kind=tool_kind, tool_name=tool_name_raw,
+                output_chars=len(tool_output_text))
+
+        # Setup reads (skill files) don't count against budget
+        if turn == 1 and is_setup_read(tool_name_raw or tool_call_id):
+            turn = 0  # don't count this
+            APP.log("continuation_setup_read", tool=tool_name_raw)
 
         # Compact large outputs
         compacted = compact_tool_output(tool_output_text, max_chars=APP.max_tool_output_chars)
@@ -2233,16 +2339,33 @@ class Handler(BaseHTTPRequestHandler):
         if isinstance(tool_output_raw, dict) and tool_output_raw.get("error"):
             exit_code = 1
 
-        # Deterministic close for writes and errors
-        if APP.should_deterministic_close(tool_kind, exit_code):
+        # Deterministic close for writes and errors (even under budget)
+        # Writers always close deterministically after first write
+        if exit_code != 0 or tool_kind == "write":
             report = build_deterministic_write_report(
                 model=model_alias, tool_name=tool_name_raw,
                 path=tool_call_id,
-                success=(exit_code == 0))
+                success=(exit_code == 0)) if exit_code != 0 or tool_kind == "write" else \
+                build_deterministic_error_report(tool_kind, compacted.compacted[:200])
             APP.log("continuation_deterministic_close", tool_kind=tool_kind)
             emitter = ResponseEmitter(self, new_id("resp"), model_alias, bool(body.get("stream")))
             emitter.emit_text_message(report["content"][0]["text"])
             emitter.complete()
+            return
+
+        # Continue with tools if budget remains (v10: managed autonomy)
+        if turn < max_exchanges and prev_state:
+            APP.log("continuation_continue", turn=turn, max_exchanges=max_exchanges)
+            # Fall through to normal agent path with tools.
+            # The fresh_turn path creates a new StoredResponse — update its counter after.
+            self._handle_fresh_turn(body)
+            # Update state with incremented turn count
+            if prev_id:
+                refreshed = APP.state.get(str(prev_id))
+                if refreshed:
+                    refreshed.tool_exchange_count = turn
+                    refreshed.task_max_exchanges = max_exchanges
+                    APP.state.put(refreshed)
             return
 
         # Finalizer call for reads — no tools, short deadline, compacted output
