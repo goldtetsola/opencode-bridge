@@ -296,6 +296,8 @@ class StoredResponse:
     created_at: int
     tool_exchange_count: int = 0  # v10: tracks turn count for budget enforcement
     task_max_exchanges: int = 1  # v10: per-task-class budget
+    read_ledger_json: str = ""  # v10: comma-sep read paths
+    command_ledger_json: str = ""  # v10: pipe-sep commands
 
 
 # ── v10: Task-class budgets ──
@@ -360,6 +362,171 @@ def get_task_budget(task_class: str) -> int:
 
 def task_class_allows_writes(task_class: str) -> bool:
     return task_class in ("bounded_write", "bounded_test_write", "implementation")
+
+
+# ── v10: OSS subagent runtime ──
+
+@dataclass
+class ReadLedger:
+    paths: str = ""  # comma-separated paths read, stored in SQLite
+    commands: str = ""  # commands executed
+
+    def add_read(self, path: str) -> None:
+        if path not in self.paths.split(","):
+            self.paths = (self.paths + "," + path).strip(",")
+
+    def add_command(self, cmd: str) -> None:
+        if cmd not in self.commands.split("|"):
+            self.commands = (self.commands + "|" + cmd).strip("|")
+
+    def already_read(self, path: str) -> bool:
+        return path in self.paths.split(",")
+
+    def summary(self) -> str:
+        parts = []
+        p = [x for x in self.paths.split(",") if x]
+        c = [x for x in self.commands.split("|") if x]
+        if p: parts.append("Already inspected: " + ", ".join(p))
+        if c: parts.append("Commands run: " + ", ".join(c))
+        return "\n".join(parts)
+
+
+def extract_allowed_paths(handoff_text: str) -> list:
+    """Extract explicit read paths from READ-ONLY PATHS or OWNED PATHS lines."""
+    paths = []
+    for line in handoff_text.split("\n"):
+        line = line.strip()
+        if "READ-ONLY PATHS:" in line.upper() or "OWNED PATHS:" in line.upper() or "ALLOWED PATHS:" in line.upper():
+            # Extract everything after the colon
+            after = line.split(":", 1)[1] if ":" in line else ""
+            parts = [p.strip().strip(",") for p in after.replace(";", ",").split(",")]
+            paths.extend([p for p in parts if p and not p.lower().startswith(("no ", "none", "do not"))])
+    return paths
+
+
+def extract_required_deliverables(handoff_text: str) -> list:
+    """Extract required output fields from DELIVERABLE lines."""
+    fields = []
+    capturing = False
+    for line in handoff_text.split("\n"):
+        line = line.strip()
+        if "DELIVERABLE:" in line.upper():
+            capturing = True
+            after = line.split(":", 1)[1] if ":" in line else ""
+            if after.strip():
+                fields.append(after.strip())
+            continue
+        if capturing and line and not line.startswith(("#", "//", "- ")):
+            # Stop at the next section marker
+            if any(line.upper().startswith(kw) for kw in ("COMPLETION", "ESCALAT", "OWNED", "READ-ONLY", "DO NOT", "VERIFICA", "PREREQ", "RELEVANT", "RULES", "RETURN")):
+                capturing = False
+                continue
+            fields.append(line.strip().lstrip("- ").strip())
+    return fields
+
+
+def normalize_tool_args(args, tool_name: str) -> tuple:
+    """Extract normalized path and command from tool call arguments."""
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except Exception:
+            return (args, str(args)) if tool_name in ("rtk_read", "read") else (None, str(args))
+
+    if not isinstance(args, dict):
+        return (None, str(args))
+
+    if tool_name in ("rtk_read", "read", "cat"):
+        for key in ("path", "file_path", "filepath", "file", "filename", "target"):
+            val = args.get(key)
+            if isinstance(val, str) and val.strip():
+                return (val.strip(), val.strip())
+        # Check nested
+        for nested_key in ("args", "input", "request"):
+            nested = args.get(nested_key)
+            if isinstance(nested, dict):
+                p, _ = normalize_tool_args(nested, tool_name)
+                if p:
+                    return (p, str(nested))
+
+    if tool_name in ("exec_command", "rtk_git", "git", "rtk_exec"):
+        for key in ("command", "args", "cmd", "arguments"):
+            val = args.get(key)
+            if val:
+                return (None, str(val) if isinstance(val, str) else json.dumps(val))
+
+    return (None, json.dumps(args))
+
+
+def inject_evidence_ledger(messages: list, ledger: ReadLedger, required_paths: list,
+                            required_fields: list, budget_remaining: int) -> list:
+    """Inject progress context into the continuation payload."""
+    remaining = [p for p in required_paths if not ledger.already_read(p)]
+    summary = ledger.summary()
+    lines = ["[EVIDENCE LEDGER]"]
+
+    if summary:
+        lines.append(summary)
+    if remaining:
+        lines.append(f"Still required: {', '.join(remaining)}")
+    if required_fields:
+        lines.append(f"Report must include: {', '.join(required_fields)}")
+    lines.append(f"Tool budget remaining: {budget_remaining}")
+    lines.append("Do not reread complete files unless the prior result was incomplete.")
+
+    evidence_text = "\n".join(lines)
+
+    # Insert after the last system message or at the beginning
+    out = list(messages)
+    insert_at = len(out)
+    for i in range(len(out) - 1, -1, -1):
+        if out[i].get("role") in ("system", "developer"):
+            insert_at = i + 1
+            break
+
+    out.insert(insert_at, {"role": "system", "content": evidence_text})
+    return out
+
+
+def _extract_read_paths_from_history(messages: list) -> set:
+    """Extract file paths already read from conversation history."""
+    paths = set()
+    for msg in messages:
+        tool_calls = msg.get("tool_calls", [])
+        for tc in tool_calls:
+            func = tc.get("function", {})
+            name = func.get("name", "")
+            if name in ("rtk_read", "read", "cat"):
+                args = func.get("arguments", "{}")
+                path, _ = normalize_tool_args(args, name)
+                if path:
+                    paths.add(path)
+        # Also check codex-format tool calls
+        codex_tc = msg.get("codex")
+        if codex_tc and isinstance(codex_tc, dict):
+            codex_name = codex_tc.get("name", "")
+            if codex_name in ("rtk_read", "read", "cat"):
+                path, _ = normalize_tool_args(codex_tc.get("arguments", "{}"), codex_name)
+                if path:
+                    paths.add(path)
+    return paths
+
+
+def _extract_handoff_text(messages: list) -> str:
+    """Extract the OSS handoff text from system/developer messages."""
+    text = ""
+    for msg in messages:
+        if msg.get("role") in ("system", "developer", "user") and msg.get("content"):
+            text += " " + str(msg["content"])
+    return text
+
+
+def _has_evidence_ledger(body: JSON) -> bool:
+    """Check if the body already has an evidence ledger injected."""
+    for item in body.get("input", []):
+        if isinstance(item, dict) and "EVIDENCE LEDGER" in str(item.get("content", "")):
+            return True
+    return False
 
 
 def is_setup_read(path: str) -> bool:
@@ -2356,8 +2523,26 @@ class Handler(BaseHTTPRequestHandler):
         # Continue with tools if budget remains (v10: managed autonomy)
         if turn < max_exchanges and prev_state:
             APP.log("continuation_continue", turn=turn, max_exchanges=max_exchanges)
-            # Fall through to normal agent path with tools.
-            # The fresh_turn path creates a new StoredResponse — update its counter after.
+
+            # Build evidence ledger from conversation history
+            read_paths = _extract_read_paths_from_history(prev_state.messages)
+            handoff_text = _extract_handoff_text(prev_state.messages)
+            required_paths = extract_allowed_paths(handoff_text)
+            remaining = [p for p in required_paths if p not in read_paths]
+
+            if remaining and not _has_evidence_ledger(body):
+                APP.log("evidence_ledger", read_count=len(read_paths), remaining=len(remaining))
+                # Inject evidence ledger as a system message in the input
+                ledger_text = "EVIDENCE LEDGER\n"
+                if read_paths:
+                    ledger_text += f"Already read: {', '.join(sorted(read_paths))}\n"
+                ledger_text += f"Still required: {', '.join(remaining)}\n"
+                ledger_text += f"Tool budget remaining: {max_exchanges - turn}\n"
+                ledger_text += "Do not reread completed files. Continue with the next unread source."
+                input_items = list(body.get("input", []))
+                input_items.insert(0, {"role": "system", "content": ledger_text})
+                body["input"] = input_items
+
             self._handle_fresh_turn(body)
             # Update state with incremented turn count
             if prev_id:
