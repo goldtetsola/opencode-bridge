@@ -2167,6 +2167,7 @@ class ProxyApp:
 
 
 APP = ProxyApp()
+START_TIME = time.time()
 
 
 
@@ -2752,7 +2753,13 @@ class Handler(BaseHTTPRequestHandler):
                 "bridge_version": "12.0",
                 "time": now(),
                 "pid": os.getpid(),
+                "ppid": os.getppid(),
+                "uptime_seconds": int(time.time() - START_TIME) if 'START_TIME' in dir() else 0,
                 "argv": sys.argv,
+                "supervisor": {
+                    "mode": os.getenv("CODEX_OSS_SUPERVISOR_MODE", "unknown"),
+                    "durable": os.getenv("CODEX_OSS_SUPERVISOR_MODE", "") != "",
+                },
                 "gpt_model_strategy": APP.gpt_model_strategy,
                 "upstream_stream": getattr(APP, "upstream_streaming", True),
                 "has_opencode_key": bool(APP.upstream_key),
