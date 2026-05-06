@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-responses_chat_proxy_v9.py
+responses_chat_proxy_v11.py
 
 A small, dependency-free OpenAI Responses API -> OpenAI-compatible Chat Completions
 bridge with true upstream streaming, designed for Codex custom model providers that need to call OpenCode Go OSS
@@ -57,6 +57,7 @@ import os
 import queue
 import re
 import signal
+import subprocess
 import sqlite3
 import sys
 import threading
@@ -65,7 +66,7 @@ import traceback
 import urllib.error
 import urllib.request
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -394,13 +395,20 @@ class ReadLedger:
 def extract_allowed_paths(handoff_text: str) -> list:
     """Extract explicit read paths from READ-ONLY PATHS or OWNED PATHS lines."""
     paths = []
-    for line in handoff_text.split("\n"):
-        line = line.strip()
-        if "READ-ONLY PATHS:" in line.upper() or "OWNED PATHS:" in line.upper() or "ALLOWED PATHS:" in line.upper():
-            # Extract everything after the colon
-            after = line.split(":", 1)[1] if ":" in line else ""
-            parts = [p.strip().strip(",") for p in after.replace(";", ",").split(",")]
-            paths.extend([p for p in parts if p and not p.lower().startswith(("no ", "none", "do not"))])
+    for sep in ("READ-ONLY PATHS:", "OWNED PATHS:", "ALLOWED PATHS:"):
+        if sep in handoff_text:
+            after = handoff_text.split(sep, 1)[1]
+            # Stop at the next section marker
+            for marker in (". DELIVERABLE:", ". COMPLETION:", ". ESCALATION:", ". VERIFICATION:",
+                           ". DO NOT TOUCH:", ". PREREQUISITES:", ". RELEVANT:", ". RULES:", ". RETURN:",
+                           "COMPLETION RULE:", "ESCALATION RULE:", "VERIFICATION STEPS:",
+                           "DO NOT TOUCH:", "PREREQUISITES:"):
+                if marker in after:
+                    after = after.split(marker, 1)[0]
+            # Also stop at period-space-capital if the period isn't part of a file extension
+            parts = [p.strip().strip(",") for p in after.replace(";", ",").replace("\n", ",").split(",")]
+            paths.extend([p for p in parts if p and not p.lower().startswith(("no ", "none", "do not", "git ")) and len(p) > 1])
+            break
     return paths
 
 
@@ -527,6 +535,136 @@ def _has_evidence_ledger(body: JSON) -> bool:
         if isinstance(item, dict) and "EVIDENCE LEDGER" in str(item.get("content", "")):
             return True
     return False
+
+
+# ── v11: Task session + execution modes ──
+
+@dataclass
+class TaskSession:
+    task_session_id: str
+    root_response_id: str
+    task_class: str
+    execution_mode: str  # context_pack, managed_autonomy, bounded_write, escalate
+    max_tool_exchanges: int
+    tool_exchanges_used: int = 0
+    duplicate_suppressions: int = 0
+    required_paths: list = field(default_factory=list)
+    required_commands: list = field(default_factory=list)
+    read_paths: dict = field(default_factory=dict)
+    commands_run: list = field(default_factory=list)
+    required_outputs: list = field(default_factory=list)
+    handoff_text: str = ""
+
+
+def select_execution_mode(handoff_text: str) -> str:
+    """Choose execution mode based on handoff content."""
+    task_class = extract_task_class(handoff_text)
+    paths = extract_allowed_paths(handoff_text)
+    # Paths are explicit known sources → context pack is best
+    if task_class in ("prep_report", "scout") and len(paths) >= 2:
+        return "context_pack"
+    if task_class in ("bounded_write", "bounded_test_write", "implementation"):
+        return "bounded_write"
+    if task_class == "proof_critical":
+        return "escalate"
+    # Discovery tasks — model needs to search, not read known files
+    if not paths:
+        return "managed_autonomy"
+    # Single known file → one read + finish
+    return "context_pack" if len(paths) == 1 else "managed_autonomy"
+
+
+def build_task_session(body: JSON, handoff_text: str, response_id: str) -> TaskSession:
+    """Create a TaskSession from the handoff and initial response."""
+    task_class = extract_task_class(handoff_text)
+    mode = select_execution_mode(handoff_text)
+    paths = extract_allowed_paths(handoff_text)
+    fields = extract_required_deliverables(handoff_text)
+    budget = get_task_budget(task_class)
+
+    # Extract required commands from verification steps
+    cmd_lines = []
+    for line in handoff_text.split("\n"):
+        if any(kw in line.upper() for kw in ("VERIFICATION", "GIT STATUS", "GIT REV-PARSE", "GIT LOG")):
+            cmd_lines.append(line.strip())
+
+    return TaskSession(
+        task_session_id=new_id("tsk"),
+        root_response_id=response_id,
+        task_class=task_class,
+        execution_mode="context_pack" if mode == "context_pack" else mode,
+        max_tool_exchanges=budget if mode != "context_pack" else 0,
+        required_paths=paths,
+        required_commands=cmd_lines,
+        required_outputs=fields,
+        handoff_text=handoff_text,
+    )
+
+
+def build_context_pack(session: TaskSession, project_root: str) -> str:
+    """Gather all required sources and return as context pack string."""
+    sections = []
+    for path in session.required_paths:
+        full = os.path.normpath(os.path.join(project_root, path))
+        try:
+            raw = open(full, encoding="utf-8", errors="replace").read()
+            MAX = 8000
+            if len(raw) > MAX:
+                sections.append(f"=== {path} (TRUNCATED: {len(raw)} chars total, showing first {MAX}) ===\n"
+                                f"{raw[:MAX]}\n[... {len(raw) - MAX} more chars ...]\n")
+            else:
+                sections.append(f"=== {path} ({len(raw)} chars) ===\n{raw}\n")
+        except Exception as e:
+            sections.append(f"=== {path} ===\n[ERROR: {e}]\n")
+
+    # Run git commands if requested
+    for cmd_text in session.required_commands:
+        cmd_text = cmd_text.strip().lstrip("- ").strip().strip(".")
+        if "git" in cmd_text.lower():
+            try:
+                args = [a for a in cmd_text.split() if a and not a.startswith(("-", "git", "VERIFICA"))]
+                if not args:
+                    continue
+                import subprocess
+                out = subprocess.run(["git"] + args, cwd=project_root,
+                                     capture_output=True, text=True, timeout=15)
+                sections.append(f"=== git {' '.join(args)} ===\nexit_code: {out.returncode}\n{out.stdout}\n{out.stderr}\n")
+                session.commands_run.append(args)
+            except Exception as e:
+                sections.append(f"=== git ({cmd_text}) ===\n[ERROR: {e}]\n")
+
+    return "\n".join(sections)
+
+
+def validate_report(text: str, required_fields: list) -> tuple:
+    """Check if the output is a valid report. Returns (is_valid, missing_fields)."""
+    if len(text.strip()) < 50:
+        return False, ["report_too_short"]
+    if "Running the" in text and "startup" in text.lower():
+        return False, ["startup_sentence_not_report"]
+    missing = [f for f in required_fields if f.lower() not in text.lower()]
+    return len(missing) == 0, missing
+
+
+def suppress_duplicate_read(tool_call: dict, session: TaskSession) -> Optional[str]:
+    """Return a synthetic observation for duplicate reads, or None if new."""
+    path, _ = normalize_tool_args(tool_call.get("arguments", "{}"),
+                                   tool_call.get("name", "unknown"))
+    if not path or path not in session.read_paths:
+        return None
+
+    session.duplicate_suppressions += 1
+    remaining = [p for p in session.required_paths if p not in session.read_paths]
+    return (f"[ALREADY READ]\n"
+            f"Path: {path}\n"
+            f"Status: already inspected completely\n\n"
+            f"Still required:\n"
+            + "\n".join(f"- {r}" for r in remaining) +
+            f"\n\nDo not request {path} again. Continue with next unread source "
+            f"or return a partial report.")
+
+
+# ── End v11 preamble ──
 
 
 def is_setup_read(path: str) -> bool:
@@ -2269,7 +2407,7 @@ class ResponseEmitter:
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "ResponsesChatProxy/9.0"
+    server_version = "ResponsesChatProxy/11.0"
 
     def _send_json(self, status: int, obj: Any) -> None:
         data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
@@ -2310,7 +2448,7 @@ class Handler(BaseHTTPRequestHandler):
             status_info = {
                 "ok": True,
                 "service": "responses-chat-proxy",
-                "bridge_version": "9.0",
+                "bridge_version": "11.0",
                 "time": now(),
                 "pid": os.getpid(),
                 "argv": sys.argv,
@@ -2524,34 +2662,87 @@ class Handler(BaseHTTPRequestHandler):
         if turn < max_exchanges and prev_state:
             APP.log("continuation_continue", turn=turn, max_exchanges=max_exchanges)
 
-            # Build evidence ledger from conversation history
-            read_paths = _extract_read_paths_from_history(prev_state.messages)
+            # Determine execution mode from handoff
             handoff_text = _extract_handoff_text(prev_state.messages)
-            required_paths = extract_allowed_paths(handoff_text)
-            remaining = [p for p in required_paths if p not in read_paths]
+            mode = select_execution_mode(handoff_text)
 
-            if remaining and not _has_evidence_ledger(body):
-                APP.log("evidence_ledger", read_count=len(read_paths), remaining=len(remaining))
-                # Inject evidence ledger as a system message in the input
-                ledger_text = "EVIDENCE LEDGER\n"
-                if read_paths:
-                    ledger_text += f"Already read: {', '.join(sorted(read_paths))}\n"
-                ledger_text += f"Still required: {', '.join(remaining)}\n"
-                ledger_text += f"Tool budget remaining: {max_exchanges - turn}\n"
-                ledger_text += "Do not reread completed files. Continue with the next unread source."
-                input_items = list(body.get("input", []))
-                input_items.insert(0, {"role": "system", "content": ledger_text})
-                body["input"] = input_items
+            # Context-pack: gather sources, one no-tools model call
+            context_pack_attempted = False
+            if mode == "context_pack" and not _has_evidence_ledger(body):
+                context_pack_attempted = True
+                APP.log("context_pack", mode=mode, paths=extract_allowed_paths(handoff_text))
+                session = build_task_session(body, handoff_text, prev_id or "unknown")
+                # Track what's been read from history
+                read_paths = _extract_read_paths_from_history(prev_state.messages)
+                session.read_paths = {p: {"complete": True} for p in read_paths}
+                # Build context pack with remaining files
+                pack = build_context_pack(session, os.getcwd())
+                # Send as no-tools finalizer call
+                finalizer_payload = {
+                    "model": map_model(APP.continuation_model, APP.model_map),
+                    "messages": [{"role": "system", "content":
+                        f"You are producing a report from the provided source pack.\n"
+                        f"Required outputs: {', '.join(session.required_outputs)}\n\n"
+                        f"SOURCE PACK:\n{pack}\n\n"
+                        f"Do not request tools. Produce a structured report including all required outputs."}],
+                    "stream": False,
+                    "tools": [],
+                }
+                try:
+                    chat_resp = APP.call_continuation_with_deadline(
+                        finalizer_payload, APP.continuation_deadline)
+                    text = chat_resp.get("choices", [{}])[0].get("message", {}).get("content", "")
+                    emitter = ResponseEmitter(self, new_id("resp"), model_alias, bool(body.get("stream")))
+                    emitter.emit_text_message(text)
+                    emitter.complete()
+                    APP.log("context_pack_complete")
+                    return
+                except Exception as e:
+                    APP.log("context_pack_failed", error=str(e))
+                    # Fall through to finalizer — skip managed autonomy below
 
-            self._handle_fresh_turn(body)
-            # Update state with incremented turn count
-            if prev_id:
-                refreshed = APP.state.get(str(prev_id))
-                if refreshed:
-                    refreshed.tool_exchange_count = turn
-                    refreshed.task_max_exchanges = max_exchanges
-                    APP.state.put(refreshed)
-            return
+            # Skip managed autonomy if context-pack was attempted
+            if not context_pack_attempted:
+                # Managed autonomy: suppress duplicate reads
+                if mode == "managed_autonomy":
+                    read_paths = _extract_read_paths_from_history(prev_state.messages)
+                    # Check if current tool call is for an already-read path
+                    dup_msg = suppress_duplicate_read(
+                        {"name": tool_name_raw, "arguments": json.dumps(
+                            body.get("input", [{}])[0] if body.get("input") else {})},
+                        TaskSession(task_session_id="", root_response_id="", task_class="",
+                                    execution_mode="", max_tool_exchanges=max_exchanges,
+                                    read_paths={p: {"complete": True} for p in read_paths},
+                                    required_paths=extract_allowed_paths(handoff_text)))
+                    if dup_msg:
+                        APP.log("duplicate_suppressed", tool=tool_name_raw)
+                        input_items = list(body.get("input", []))
+                        input_items.insert(0, {"role": "system", "content": f"[RUNTIME SUPPRESSION]\n{dup_msg}"})
+                        body["input"] = input_items
+
+                # Inject evidence ledger for managed autonomy
+                required_paths = extract_allowed_paths(handoff_text)
+                remaining = [p for p in required_paths if p not in read_paths]
+                if remaining and not _has_evidence_ledger(body):
+                    ledger_text = "EVIDENCE LEDGER\n"
+                    if read_paths:
+                        ledger_text += f"Already read: {', '.join(sorted(read_paths))}\n"
+                    ledger_text += f"Still required: {', '.join(remaining)}\n"
+                    ledger_text += f"Tool budget remaining: {max_exchanges - turn}\n"
+                    ledger_text += "Do not reread completed files."
+                    input_items = list(body.get("input", []))
+                    input_items.insert(0, {"role": "system", "content": ledger_text})
+                    body["input"] = input_items
+
+                self._handle_fresh_turn(body)
+                # Update state with incremented turn count
+                if prev_id:
+                    refreshed = APP.state.get(str(prev_id))
+                    if refreshed:
+                        refreshed.tool_exchange_count = turn
+                        refreshed.task_max_exchanges = max_exchanges
+                        APP.state.put(refreshed)
+                return
 
         # Finalizer call for reads — no tools, short deadline, compacted output
         finalizer_model = map_model(APP.continuation_model, APP.model_map)
@@ -2604,6 +2795,14 @@ class Handler(BaseHTTPRequestHandler):
                         break
                 emitter.emit_text_message(text or "Finalizer completed.")
                 emitter.complete()
+                # Validate report quality
+                handoff_text = _extract_handoff_text(finalizer_messages)
+                required = extract_required_deliverables(handoff_text)
+                is_valid, missing = validate_report(text, required)
+                if not is_valid and text:
+                    APP.log("report_invalid", missing=missing, text_len=len(text))
+                elif not is_valid and not text:
+                    APP.log("report_empty")
             else:
                 emitter._json_response = resp_obj
                 emitter.complete()
