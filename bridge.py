@@ -798,9 +798,11 @@ def is_intent_or_status(text: str) -> bool:
     import re
     intent_match = re.search(INTENT_PATTERNS, text, re.IGNORECASE)
     if intent_match:
-        has_evidence = any(marker in text.lower() for marker in
-            ("pass", "fail", "confidence", "caveat", "file", "command", "read", "inspected"))
-        if not has_evidence:
+        # Evidence markers must be report-structure indicators, not just common words
+        report_markers = ("oss_report_begin", "pass\n", "fail\n", "status:", "confidence:", "caveat:",
+                          "files inspected:", "commands run:", "commands used:")
+        has_report_structure = any(marker in text.lower() for marker in report_markers)
+        if not has_report_structure:
             return True
     return False
 
@@ -2914,10 +2916,12 @@ class Handler(BaseHTTPRequestHandler):
                     chat_resp = APP.call_continuation_with_deadline(
                         finalizer_payload, APP.continuation_deadline)
                     text = chat_resp.get("choices", [{}])[0].get("message", {}).get("content", "")
-                    # v12: Reject intent/status text — retry once
+                    # v12: Reject intent/status text — retry once if budget
                     if is_intent_or_status(text):
                         APP.log("intent_rejected", text_len=len(text))
-                        retry_payload = {
+                        remaining = request_deadline - (time.time() - request_start)
+                        if remaining > 20:
+                            retry_payload = {
                             "model": finalizer_payload["model"],
                             "messages": finalizer_payload["messages"] + [
                                 {"role": "user", "content":
