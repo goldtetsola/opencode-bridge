@@ -40,6 +40,10 @@ def main():
     # status
     sub.add_parser("status", help="Show bridge health")
 
+    # validate-handoff
+    vh = sub.add_parser("validate-handoff", help="Validate an OSS_HANDOFF_JSON handoff file")
+    vh.add_argument("file", help="Markdown or text file containing OSS_HANDOFF_JSON")
+
     # up — foreground supervisor
     up = sub.add_parser("up", help="Start bridge with foreground supervisor (keep terminal open)")
     up.add_argument("--port", type=int, default=4000)
@@ -50,6 +54,9 @@ def main():
     run = sub.add_parser("run", help="Start bridge, run command, stop bridge")
     run.add_argument("--port", type=int, default=4000)
     run.add_argument("cmd", nargs=argparse.REMAINDER, help="Command to run while bridge is alive")
+
+    sd = sub.add_parser("supervise-daemon", help=argparse.SUPPRESS)
+    sd.add_argument("--port", type=int, default=4000)
 
     args = parser.parse_args()
 
@@ -74,15 +81,53 @@ def main():
     elif args.command == "status":
         _bridge_status()
 
+    elif args.command == "validate-handoff":
+        sys.exit(_validate_handoff(args.file))
+
     elif args.command == "up":
         sys.exit(_supervise(args.port, daemon=args.daemon, foreground=args.foreground))
 
     elif args.command == "run":
         sys.exit(_run_with_bridge(args.port, args.cmd))
 
+    elif args.command == "supervise-daemon":
+        sys.exit(_daemon_supervisor(args.port))
+
     else:
         parser.print_help()
         sys.exit(1)
+
+
+def _validate_handoff(path: str) -> int:
+    import json
+    from pathlib import Path
+
+    from .handoff import validate_handoff_text
+
+    try:
+        text = Path(path).read_text()
+    except OSError as exc:
+        print(json.dumps({"valid": False, "error": str(exc)}, indent=2))
+        return 1
+
+    envelope = validate_handoff_text(text)
+    if envelope.get("schema_error"):
+        print(json.dumps({
+            "valid": False,
+            "error": envelope["schema_error"],
+        }, indent=2))
+        return 1
+
+    print(json.dumps({
+        "valid": True,
+        "role": envelope["role"],
+        "task_type": envelope["task_type"],
+        "read_only_paths": envelope["read_only_paths"],
+        "owned_paths": envelope["owned_paths"],
+        "deliverable_fields": envelope["deliverable_fields"],
+        "write_allowed": envelope["write_allowed"],
+    }, indent=2))
+    return 0
 
 
 def _start_bridge(port: int, mode: str):
@@ -170,8 +215,21 @@ def _stop_bridge(port: int = 4000):
     import os
     import signal
 
-    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    pid_file = os.path.join(repo_root, ".codex-oss", "run", "bridge.pid")
+    run_dir = os.path.join(os.getcwd(), ".codex-oss", "run")
+    pid_file = os.path.join(run_dir, "bridge.pid")
+    supervisor_pid_file = os.path.join(run_dir, "supervisor.pid")
+    supervisor_file = os.path.join(run_dir, "supervisor.json")
+
+    if os.path.exists(supervisor_pid_file):
+        with open(supervisor_pid_file) as f:
+            supervisor_pid = int(f.read().strip())
+        try:
+            os.kill(supervisor_pid, signal.SIGTERM)
+            os.remove(supervisor_pid_file)
+            print(f"Bridge supervisor stopped (PID: {supervisor_pid})")
+        except ProcessLookupError:
+            os.remove(supervisor_pid_file)
+            print("Bridge supervisor was not running (stale PID file removed)")
 
     if os.path.exists(pid_file):
         with open(pid_file) as f:
@@ -179,9 +237,11 @@ def _stop_bridge(port: int = 4000):
         try:
             os.kill(pid, signal.SIGTERM)
             os.remove(pid_file)
+            os.remove(supervisor_file) if os.path.exists(supervisor_file) else None
             print(f"Bridge stopped (PID: {pid})")
         except ProcessLookupError:
             os.remove(pid_file)
+            os.remove(supervisor_file) if os.path.exists(supervisor_file) else None
             print("Bridge was not running (stale PID file removed)")
     else:
         # Fallback: kill by port
@@ -236,6 +296,9 @@ def _supervise(port: int, daemon: bool = False, foreground: bool = False) -> int
     env = os.environ.copy()
     env["PROXY_PORT"] = str(port)
     env["CODEX_OSS_SUPERVISOR_MODE"] = "foreground"
+    state_dir = os.path.join(os.getcwd(), ".codex-oss", "state")
+    os.makedirs(state_dir, exist_ok=True)
+    env["PROXY_STATE_DB"] = env.get("PROXY_STATE_DB", os.path.join(state_dir, "proxy.sqlite3"))
 
     if not env.get("OPENCODE_GO_API_KEY"):
         env_file = os.path.join(os.getcwd(), ".codex-oss", "env", "opencode-go.env")
@@ -267,6 +330,10 @@ def _supervise(port: int, daemon: bool = False, foreground: bool = False) -> int
     source_hash = _get_hash()
     print(f"  OpenCode Go key: loaded")
     print(f"  bridge.py source hash: {source_hash}")
+
+    if daemon:
+        return _start_daemon_supervisor(port, env, source_hash)
+
     print(f"  Starting bridge on port {port}...")
 
     proc = subprocess.Popen(
@@ -363,6 +430,135 @@ def _supervise(port: int, daemon: bool = False, foreground: bool = False) -> int
     return 0
 
 
+def _start_daemon_supervisor(port: int, env: dict, source_hash: str) -> int:
+    import os, subprocess, sys, time, urllib.request, json
+
+    run_dir = os.path.join(os.getcwd(), ".codex-oss", "run")
+    log_dir = os.path.join(os.getcwd(), ".codex-oss", "logs")
+    os.makedirs(run_dir, exist_ok=True)
+    os.makedirs(log_dir, exist_ok=True)
+
+    supervisor_pid_file = os.path.join(run_dir, "supervisor.pid")
+    if os.path.exists(supervisor_pid_file):
+        try:
+            with open(supervisor_pid_file) as f:
+                existing = int(f.read().strip())
+            os.kill(existing, 0)
+            print(f"  Bridge supervisor already running (PID: {existing})")
+            return 0
+        except (OSError, ValueError):
+            os.remove(supervisor_pid_file)
+
+    package_dir = os.path.dirname(os.path.abspath(__file__))
+    repo_root = os.path.dirname(package_dir)
+    cli_path = os.path.join(repo_root, "bin", "codex-oss")
+    env = env.copy()
+    env["CODEX_OSS_SUPERVISOR_MODE"] = "daemon-supervisor"
+    out = open(os.path.join(log_dir, "supervisor.log"), "a")
+    err = open(os.path.join(log_dir, "supervisor.err.log"), "a")
+    proc = subprocess.Popen(
+        [sys.executable, cli_path, "supervise-daemon", "--port", str(port)],
+        cwd=os.getcwd(), env=env, stdout=out, stderr=err, start_new_session=True,
+    )
+    with open(supervisor_pid_file, "w") as f:
+        f.write(str(proc.pid))
+
+    for _ in range(30):
+        try:
+            req = urllib.request.Request(f"http://127.0.0.1:{port}/health")
+            key = env.get("LITELLM_MASTER_KEY", "sk-local-codex-bridge")
+            req.add_header("Authorization", f"Bearer {key}")
+            if json.loads(urllib.request.urlopen(req, timeout=2).read()).get("ok"):
+                print(f"  Bridge supervisor started (PID: {proc.pid})")
+                print(f"  bridge.py source hash: {source_hash}")
+                print(f"  Logs: .codex-oss/logs/")
+                print(f"  Stop with: codex-oss stop")
+                return 0
+        except Exception:
+            time.sleep(0.5)
+
+    print("  WARN: supervised bridge did not respond to health check within 15s")
+    return 1
+
+
+def _daemon_supervisor(port: int) -> int:
+    import os, signal, subprocess, sys, time, json, hashlib
+
+    package_dir = os.path.dirname(os.path.abspath(__file__))
+    repo_root = os.path.dirname(package_dir)
+    bridge_path = os.path.join(repo_root, "bridge.py")
+    run_dir = os.path.join(os.getcwd(), ".codex-oss", "run")
+    log_dir = os.path.join(os.getcwd(), ".codex-oss", "logs")
+    os.makedirs(run_dir, exist_ok=True)
+    os.makedirs(log_dir, exist_ok=True)
+
+    env = os.environ.copy()
+    env["PROXY_PORT"] = str(port)
+    env["CODEX_OSS_SUPERVISOR_MODE"] = "daemon-supervisor"
+    state_dir = os.path.join(os.getcwd(), ".codex-oss", "state")
+    os.makedirs(state_dir, exist_ok=True)
+    env["PROXY_STATE_DB"] = env.get("PROXY_STATE_DB", os.path.join(state_dir, "proxy.sqlite3"))
+
+    child = None
+    stopping = False
+    pid_file = os.path.join(run_dir, "bridge.pid")
+    supervisor_file = os.path.join(run_dir, "supervisor.json")
+
+    def _source_hash() -> str:
+        try:
+            with open(bridge_path, "rb") as f:
+                return hashlib.sha256(f.read()).hexdigest()[:12]
+        except Exception:
+            return "unknown"
+
+    def _write_supervisor(child_pid: int):
+        with open(supervisor_file, "w") as f:
+            json.dump({
+                "mode": "daemon-supervisor",
+                "pid": os.getpid(),
+                "child_pid": child_pid,
+                "port": port,
+                "source_hash": _source_hash(),
+                "started_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "project_root": os.getcwd(),
+            }, f)
+
+    def _shutdown(signum=None, frame=None):
+        nonlocal stopping, child
+        stopping = True
+        if child and child.poll() is None:
+            child.terminate()
+
+    signal.signal(signal.SIGINT, _shutdown)
+    signal.signal(signal.SIGTERM, _shutdown)
+
+    while not stopping:
+        out_log = open(os.path.join(log_dir, "bridge.log"), "a")
+        err_log = open(os.path.join(log_dir, "bridge.err.log"), "a")
+        child = subprocess.Popen(
+            [sys.executable, bridge_path],
+            env=env, stdout=out_log, stderr=err_log, start_new_session=True,
+        )
+        with open(pid_file, "w") as f:
+            f.write(str(child.pid))
+        _write_supervisor(child.pid)
+        rc = child.wait()
+        out_log.close()
+        err_log.close()
+        if stopping:
+            break
+        with open(os.path.join(log_dir, "supervisor.log"), "a") as log:
+            log.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} bridge exited rc={rc}; restarting\n")
+        time.sleep(1)
+
+    for path in (pid_file, supervisor_file):
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+    return 0
+
+
 def _run_with_bridge(port: int, cmd: list) -> int:
     """Start bridge, run command, stop bridge when done."""
     import os, time, subprocess, urllib.request, json
@@ -375,6 +571,9 @@ def _run_with_bridge(port: int, cmd: list) -> int:
     # Start bridge
     env = os.environ.copy()
     env["PROXY_PORT"] = str(port)
+    state_dir = os.path.join(os.getcwd(), ".codex-oss", "state")
+    os.makedirs(state_dir, exist_ok=True)
+    env["PROXY_STATE_DB"] = env.get("PROXY_STATE_DB", os.path.join(state_dir, "proxy.sqlite3"))
 
     package_dir = os.path.dirname(os.path.abspath(__file__))
     bridge_path = os.path.join(os.path.dirname(package_dir), "bridge.py")

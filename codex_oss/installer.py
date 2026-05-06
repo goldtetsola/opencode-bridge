@@ -33,12 +33,12 @@ When spawning OSS agents, always use fork_turns: "none":
 
 Spawn <oss_agent> with fork_turns: "none".
 
-Task: <concrete sub-task>
-Risk tier: <low / medium / high>
-Allowed paths: <files or directories>
-Forbidden: <paths or modules>
-Verification: <what to check after completion>
-Return: files inspected, files changed, confidence, caveats, escalation recommendation.
+Include a machine-readable handoff block before prose. The bridge validates this before trusting task routing:
+
+OSS_HANDOFF_JSON:
+{"schema_version":1,"role":"<worker role>","goal":"<concrete sub-task>","task_type":"scout|review|docs_support|bounded_write|implementation","owned_paths":[],"read_only_paths":["<files or dirs>"],"forbidden_actions":["<paths or operations>"],"verification_steps":["<checks>"],"deliverable_fields":["files inspected","confidence","caveats","escalation recommendation"],"completion_rule":"stop after the requested deliverable","escalation_rule":"stop if scope or critical-path risk appears"}
+
+After the JSON block, add any human-readable context needed for the worker. For reusable or high-stakes handoffs, validate the draft first with `codex-oss validate-handoff /path/to/handoff.md`.
 
 ### Critical paths (never route to OSS)
 - Authentication, authorization, session management

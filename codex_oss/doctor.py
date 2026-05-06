@@ -222,6 +222,14 @@ def _check_agreements(root: Path, report: DoctorReport):
             "AGENTS.md does not specify fork_turns: none for OSS agents",
             "Add fork_turns: \"none\" to OSS delegation rules in AGENTS.md")
 
+    if "OSS_HANDOFF_JSON" in content:
+        report.add("agreements.structured_handoff", "PASS",
+            "AGENTS.md includes the structured OSS handoff contract")
+    else:
+        report.add("agreements.structured_handoff", "WARN",
+            "AGENTS.md does not mention OSS_HANDOFF_JSON; OSS routing may rely on brittle prose parsing",
+            "Add the OSS_HANDOFF_JSON schema to OSS delegation rules in AGENTS.md")
+
     if "recursive" in content.lower() or ("codex exec" in content.lower() and "never" in content.lower()):
         report.add("agreements.no_recursive", "PASS",
             "AGENTS.md warns against recursive codex exec")
@@ -267,6 +275,15 @@ def _check_bridge(url: str, report: DoctorReport):
 
     if health.get("ok"):
         report.add("bridge.running", "PASS", f"Bridge at {health_url}")
+
+    supervisor = health.get("supervisor") or {}
+    if supervisor.get("mode") == "daemon-supervisor" and health.get("ppid") not in (None, 1):
+        report.add("bridge.supervisor", "PASS",
+            f"Bridge child is supervised (ppid={health.get('ppid')})")
+    else:
+        report.add("bridge.supervisor", "WARN",
+            f"Bridge is not running under daemon-supervisor mode ({supervisor})",
+            "Run `codex-oss stop && codex-oss up --daemon`")
 
     # GPT rejection test
     api_url = f"{url}/v1/responses"
@@ -320,13 +337,13 @@ def _check_bridge(url: str, report: DoctorReport):
 
     # State DB persistence — read from health endpoint
     state_db = health.get("state_db", "")
-    if state_db and "/tmp/" in state_db:
+    if not state_db or state_db == "unknown":
+        report.add("bridge.state_db", "WARN",
+            "State DB path unknown",
+            "Set PROXY_STATE_DB to a persistent path")
+    elif "/tmp/" in state_db:
         report.add("bridge.state_db", "WARN",
             f"State DB in /tmp ({state_db}) — may be cleaned",
             "Set PROXY_STATE_DB to a persistent path")
     elif state_db:
         report.add("bridge.state_db", "PASS", f"State DB: {state_db}")
-    else:
-        report.add("bridge.state_db", "WARN",
-            "State DB path unknown",
-            "Set PROXY_STATE_DB to a persistent path")

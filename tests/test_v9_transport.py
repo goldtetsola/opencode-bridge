@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""v9 transport self-test: verify stream=true always gets terminal SSE event."""
+"""Transport self-test: verify stream=true always gets terminal SSE event."""
 
 import json
 import os
@@ -45,8 +45,13 @@ class FakeUpstream(http.server.BaseHTTPRequestHandler):
         pass
 
 
+class ReusableTCPServer(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+
 def start_fake_upstream():
-    server = socketserver.ThreadingTCPServer(("127.0.0.1", FAKE_UPSTREAM_PORT), FakeUpstream)
+    server = ReusableTCPServer(("127.0.0.1", FAKE_UPSTREAM_PORT), FakeUpstream)
     t = threading.Thread(target=server.serve_forever, daemon=True)
     t.start()
     return server
@@ -148,11 +153,12 @@ def test_stream_degraded_on_stall():
 
 
 def test_health_identity():
-    """Health endpoint must show v9, pid, and transport_contract."""
+    """Health endpoint must show version, pid, and transport_contract."""
     req = urllib.request.Request(f"http://127.0.0.1:{BRIDGE_PORT}/health")
     req.add_header("Authorization", "Bearer sk-local-codex-bridge")
     d = json.loads(urllib.request.urlopen(req, timeout=5).read())
-    assert d.get("bridge_version") == "9.0", f"Expected 9.0, got {d.get('bridge_version')}"
+    version = d.get("bridge_version")
+    assert version and tuple(map(int, version.split("."))) >= (9, 0), f"Expected bridge >=9.0, got {version}"
     assert d.get("pid"), "Health must include pid"
     tc = d.get("transport_contract", {})
     assert tc.get("stream_terminal_guarantee"), "Transport contract must show stream guarantee"
@@ -213,6 +219,7 @@ def main():
         bridge_proc.terminate()
         bridge_proc.wait()
         upstream.shutdown()
+        upstream.server_close()
 
 
 if __name__ == "__main__":

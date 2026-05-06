@@ -37,17 +37,17 @@ OPENCODE_GO_API_KEY=sk-... python3 ~/bridge/bin/codex-oss start --mode productio
 
 # 5. Verify everything
 python3 ~/bridge/bin/codex-oss doctor
-# Expected: 22 passed, 0 warnings, 0 failed
+# Expected: 24 passed, 0 warnings, 0 failed
 ```
 
-That's it. `codex-oss install` generates all config — `.codex/config.toml`, agent TOMLs, `AGENTS.md` routing rules, and recursive-codex-exec blocking. `codex-oss doctor` checks 22 invariants and tells you exactly what to fix.
+That's it. `codex-oss install` generates all config — `.codex/config.toml`, agent TOMLs, `AGENTS.md` routing rules, and recursive-codex-exec blocking. `codex-oss doctor` checks 23 invariants and tells you exactly what to fix.
 
 ## What `codex-oss` does
 
 | Command | What it does |
 |---|---|
 | `install` | Generates provider config, 3 agent TOMLs, AGENTS.md delegation contract, recursive-codex blocking rules, runtime directories, and gitignore entries. |
-| `doctor` | Checks 22 invariants: config correctness, agent configuration, AGENTS.md compliance, recursive-codex exec blocking, bridge health, GPT leakage, OSS inference, state DB persistence. PASS/WARN/FAIL with fix instructions. Supports `--json` for automation. |
+| `doctor` | Checks 24 invariants: config correctness, agent configuration, AGENTS.md compliance, structured handoff contract, recursive-codex exec blocking, bridge health, daemon supervision, GPT leakage, OSS inference, state DB persistence. PASS/WARN/FAIL with fix instructions. Supports `--json` for automation. |
 | `start` | Launches the bridge with mode selection (`production`/`compat-test`/`openai`). Refuses to start in production mode without a valid key. Sets project-local state paths. |
 | `stop` | Graceful shutdown via PID file or port. |
 | `status` | Queries the bridge health endpoint — shows version, mode, model health, and concurrency config. |
@@ -123,7 +123,7 @@ The bridge handles:
 | `OSS_NATIVE_MAX_TOOL_EXCHANGES` | `1` | Max tool calls per OSS subagent turn |
 | `CONTINUATION_TOOLS` | `none` | Tools for continuation turns (`none` = force finalization) |
 | `CONTINUATION_MODEL` | `kimi-k2.6` | Model for read-result finalizer |
-| `CONTINUATION_DEADLINE_SECONDS` | `45` | Deadline for finalizer model calls |
+| `CONTINUATION_DEADLINE_SECONDS` | `60` | Deadline for finalizer model calls |
 | `WRITE_RESULT_MODE` | `deterministic` | Write results: `deterministic` = no model call |
 | `MAX_TOOL_OUTPUT_CHARS` | `20000` | Compact tool outputs larger than this |
 | `UPSTREAM_FIRST_BYTE_TIMEOUT_SECONDS` | `30` | Timeout for first byte from upstream |
@@ -148,12 +148,13 @@ Also accepts OpenCode-style `opencode-go/<model>` model IDs.
 
 ## Bridge: OSS subagent runtime
 
-OSS agents are bounded transactions with deterministic finalization, managed autonomy, and context-pack mode for prep tasks. The bridge auto-detects subagent forks (GPT-5.5 with continuation context) and aliases to OSS — no `fork_turns` configuration needed.
+OSS agents are bounded transactions with deterministic finalization, managed autonomy, and context-pack mode for prep tasks. The bridge can reject or alias accidental GPT-family traffic according to `GPT_MODEL_STRATEGY`, but correct Codex orchestration still requires OSS agents to be spawned with `fork_turns: "none"` so the child does not inherit the parent GPT model/provider context.
 
 ### Execution modes
 
 The bridge selects the right mode based on the task handoff:
 
+- **`invalid_handoff`** — malformed `OSS_HANDOFF_JSON` blocks fail closed before delegated work is trusted.
 - **`no_tool_exact`** — exact output tasks (guardrail tests, control probes). No model decisions needed.
 - **`context_pack_report`** — read tasks with explicit `READ-ONLY PATHS` + `DELIVERABLE`. Bridge gathers all files internally, sends one no-tools synthesis call. Command-aware: `grep X in Y` steps get grep output, not full files.
 - **`managed_autonomy`** — discovery tasks where the model chooses what to inspect. Budget-capped, duplicate-suppressed, evidence-ledger-injected.
@@ -162,10 +163,25 @@ The bridge selects the right mode based on the task handoff:
 ### Guarantees
 
 - **Writes**: Deterministic — bridge writes file, reads back, reports result. No model self-report dependency.
-- **Reads**: Context-pack or managed autonomy with deadline control. Grimg detected, only grep output included (not full files).
+- **Reads**: Context-pack or managed autonomy with deadline control. Grep-directed searches include only grep output instead of full files.
 - **Intent rejection**: "I will", "Running...", "Starting..." rejected as non-terminal. Internal retry once, then deterministic report from gathered evidence.
 - **Timeout recovery**: Request-level deadline prevents serial timeout stacking. Deterministic PARTIAL report within deadline instead of client disconnect.
 - **Terminal guarantee**: Every path emits `response.completed` or `response.failed` before closing the SSE stream.
+
+### Structured handoff contract
+
+Prefer a machine-readable block before human prose. The bridge validates this block and uses it instead of guessing from accumulated conversation history:
+
+```text
+OSS_HANDOFF_JSON:
+{"schema_version":1,"role":"Read-only repo scout","goal":"Find exact evidence for a blocker","task_type":"scout","owned_paths":[],"read_only_paths":["scripts","docs"],"forbidden_actions":["edit files","print secrets"],"verification_steps":["Search for blocker_name"],"deliverable_fields":["confidence","evidence","caveats"],"completion_rule":"stop after the report","escalation_rule":"stop if a critical path appears"}
+```
+
+If the JSON is malformed or missing required fields, the bridge returns `FAIL` instead of guessing a mode from prose. You can validate a handoff before spawning an OSS subagent:
+
+```bash
+python3 ~/bridge/bin/codex-oss validate-handoff /path/to/handoff.md
+```
 
 ### Runtime environment variables
 
@@ -175,7 +191,7 @@ The bridge selects the right mode based on the task handoff:
 | `CONTINUATION_TOOLS` | `none` | Tools for continuation turns (`none` = no tools) |
 | `CONTINUATION_MODEL` | `kimi-k2.6` | Model for read finalizer |
 | `CONTINUATION_FALLBACK_MODELS` | `deepseek-v4-flash` | Fallback finalizer models |
-| `CONTINUATION_DEADLINE_SECONDS` | `45` | Deadline for finalizer calls |
+| `CONTINUATION_DEADLINE_SECONDS` | `60` | Deadline for finalizer calls |
 | `WRITE_RESULT_MODE` | `deterministic` | Write handling: `deterministic` = no model call |
 | `MAX_TOOL_OUTPUT_CHARS` | `20000` | Compact outputs larger than this |
 | `FORCE_SINGLE_TOOL_INSTRUCTIONS` | `1` | Enforce single-tool-per-turn (prevents parallel-call repair failures) |
@@ -373,7 +389,7 @@ self-test passed
 
 ## Troubleshooting
 
-**First step for any issue:** run `codex-oss doctor`. It checks 22 invariants and tells you exactly what to fix.
+**First step for any issue:** run `codex-oss doctor`. It checks 24 invariants and tells you exactly what to fix.
 
 Common issues the doctor catches:
 

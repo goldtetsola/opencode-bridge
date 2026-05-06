@@ -45,18 +45,14 @@ Every OSS delegation MUST include:
 ```
 Spawn <agent> with fork_turns: "none".
 
-Task: <concrete sub-task>
-Risk tier: <low / medium / high>
-Allowed scope: <paths / files / operations>
-Forbidden: <paths / modules / operations>
-Return:
-- files inspected
-- files changed (if any)
-- confidence marker: HIGH / MEDIUM / LOW
-- verification performed
-- failure-mode caveats
-- escalation recommendation
+OSS_HANDOFF_JSON:
+{"schema_version":1,"role":"<worker role>","goal":"<concrete sub-task>","task_type":"scout|review|docs_support|bounded_write|implementation","owned_paths":[],"read_only_paths":["<paths / files / dirs>"],"forbidden_actions":["<paths / modules / operations>"],"verification_steps":["<checks>"],"deliverable_fields":["files inspected","files changed","confidence","verification performed","failure-mode caveats","escalation recommendation"],"completion_rule":"stop after the requested deliverable","escalation_rule":"stop if scope, permissions, or critical-path risk appears"}
+
+Human context:
+<brief prose context only after the JSON block>
 ```
+
+If the JSON block is malformed, incomplete, or contradicts the prose, treat the delegation as invalid and rewrite it before spawning the OSS worker. For reusable or high-stakes handoffs, validate the draft first with `codex-oss validate-handoff /path/to/handoff.md`.
 
 ### Never
 

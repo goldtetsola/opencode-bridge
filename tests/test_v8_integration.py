@@ -49,8 +49,13 @@ class FakeUpstream(http.server.BaseHTTPRequestHandler):
         pass
 
 
+class ReusableTCPServer(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+
 def start_fake_upstream():
-    server = socketserver.ThreadingTCPServer(("127.0.0.1", FAKE_UPSTREAM_PORT), FakeUpstream)
+    server = ReusableTCPServer(("127.0.0.1", FAKE_UPSTREAM_PORT), FakeUpstream)
     t = threading.Thread(target=server.serve_forever, daemon=True)
     t.start()
     return server
@@ -215,6 +220,7 @@ def main():
         bridge_proc.terminate()
         bridge_proc.wait()
         upstream.shutdown()
+        upstream.server_close()
 
 
 if __name__ == "__main__":

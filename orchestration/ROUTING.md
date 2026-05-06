@@ -146,22 +146,22 @@ Create a new `.toml` in `.codex/agents/` following the existing format. Ensure:
 ```
 Spawn oss_kimi_rapid with fork_turns: "none".
 
-Task: Find all callers of validateUser() and describe the error-handling pattern.
-Risk tier: low
-Allowed scope: read-only repo navigation
-Forbidden: no edits, no auth/recovery/schema files
-Return: file paths, line numbers, pattern description, confidence, caveats.
+OSS_HANDOFF_JSON:
+{"schema_version":1,"role":"Read-only repo scout","goal":"Find all callers of validateUser() and describe the error-handling pattern","task_type":"scout","owned_paths":[],"read_only_paths":["src","tests"],"forbidden_actions":["edit files","inspect secrets","touch auth/session internals"],"verification_steps":["Search for validateUser references"],"deliverable_fields":["file paths","line numbers","pattern description","confidence","caveats"],"completion_rule":"stop after the read-only report","escalation_rule":"stop if critical auth/session logic is required"}
+
+Human context:
+Risk tier: low. Keep the result ready for a bounded implementation handoff.
 ```
 
 → Scout result. If bounded:
 ```
 Spawn oss_deepseek_pro with fork_turns: "none".
 
-Task: Add EmailValidationError handling to auth-router.ts following the existing pattern found by scout.
-Risk tier: medium (touches auth path, bounded change)
-Allowed files: src/auth-router.ts, src/auth/__tests__/auth-router.test.ts
-Forbidden: src/auth/token.js, src/auth/session.js
-Return: files changed, verification, confidence, GPT-5.4 review recommendation.
+OSS_HANDOFF_JSON:
+{"schema_version":1,"role":"Bounded implementation worker","goal":"Add EmailValidationError handling to auth-router.ts following the existing pattern found by scout","task_type":"bounded_write","owned_paths":["src/auth-router.ts","src/auth/__tests__/auth-router.test.ts"],"read_only_paths":["src/auth-router.ts","src/auth/__tests__/auth-router.test.ts"],"forbidden_actions":["touch src/auth/token.js","touch src/auth/session.js"],"verification_steps":["Run focused auth-router tests"],"deliverable_fields":["files changed","verification","confidence","GPT review recommendation"],"completion_rule":"stop after the bounded patch and verification summary","escalation_rule":"stop if token/session behavior or broader auth invariants are required","write_allowed":true}
+
+Human context:
+Risk tier: medium because this touches an auth-adjacent file; GPT review remains required before acceptance.
 ```
 
 ### Example 2: Ambiguous → Scout → Escalate
@@ -169,11 +169,11 @@ Return: files changed, verification, confidence, GPT-5.4 review recommendation.
 ```
 Spawn oss_kimi_rapid with fork_turns: "none".
 
-Task: Map all files involved in the payment flow. Identify test coverage for each.
-Risk tier: medium
-Allowed scope: read-only
-Forbidden: no edits
-Return: file list with line counts, test coverage per file, recommendation.
+OSS_HANDOFF_JSON:
+{"schema_version":1,"role":"Read-only architecture scout","goal":"Map all files involved in the payment flow and identify test coverage for each","task_type":"scout","owned_paths":[],"read_only_paths":["src","tests"],"forbidden_actions":["edit files","run live payment actions","print secrets"],"verification_steps":["Search for payment-related entry points","Search for matching tests"],"deliverable_fields":["file list","test coverage per file","recommendation","confidence","caveats"],"completion_rule":"stop after the read-only map","escalation_rule":"stop if payment authority changes are required"}
+
+Human context:
+Risk tier: medium. This is exploration only; GPT-5.5 decides any follow-up.
 ```
 
 → Scout returns: 7 files across 3 modules, no shared test suite. Recommendation: escalate.

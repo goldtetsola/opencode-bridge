@@ -70,7 +70,13 @@ from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from codex_oss.handoff import (
+    empty_task_envelope as _empty_task_envelope,
+    structured_handoff_to_envelope as _structured_handoff_to_envelope,
+)
+
 JSON = Dict[str, Any]
+BRIDGE_VERSION = "12.0"
 
 DEFAULT_MODEL_MAP = {
     "ocg-deepseek-v4-pro": "deepseek-v4-pro",
@@ -333,6 +339,13 @@ SETUP_PATH_PREFIXES = [
     ".codex/skills/",
 ]
 
+TASK_FIELD_LABELS = (
+    "ROLE", "GOAL", "TASK TYPE", "OWNED PATHS", "READ-ONLY PATHS",
+    "ALLOWED PATHS", "DO NOT TOUCH", "FORBIDDEN", "PREREQUISITES",
+    "RELEVANT CONVENTIONS", "VERIFICATION STEPS", "VERIFICATION",
+    "DELIVERABLE", "COMPLETION RULE", "ESCALATION RULE",
+)
+
 
 def _extract_budget(messages: List[JSON]) -> int:
     """Extract task-class budget from OSS handoff text in messages."""
@@ -395,6 +408,12 @@ class ReadLedger:
 def extract_allowed_paths(handoff_text: str) -> list:
     """Extract explicit read paths from READ-ONLY PATHS or OWNED PATHS lines."""
     paths = []
+    for label in ("READ-ONLY PATHS", "OWNED PATHS", "ALLOWED PATHS"):
+        section = _extract_labeled_section(handoff_text, label)
+        if section:
+            parts = _parse_path_list(section)
+            paths.extend([p for p in parts if p and not p.lower().startswith(("no ", "none", "do not", "git ")) and len(p) > 1])
+            return paths
     for sep in ("READ-ONLY PATHS:", "OWNED PATHS:", "ALLOWED PATHS:"):
         if sep in handoff_text:
             after = _extract_segment(handoff_text, sep)
@@ -406,6 +425,10 @@ def extract_allowed_paths(handoff_text: str) -> list:
 
 def extract_required_deliverables(handoff_text: str) -> list:
     """Extract required output fields from DELIVERABLE lines."""
+    section = _extract_labeled_section(handoff_text, "DELIVERABLE")
+    if section:
+        return [line.strip().strip("- ").strip() for line in section.splitlines() if line.strip()]
+
     fields = []
     capturing = False
     for line in handoff_text.split("\n"):
@@ -513,12 +536,28 @@ def _extract_read_paths_from_history(messages: list) -> set:
 
 
 def _extract_handoff_text(messages: list) -> str:
-    """Extract the OSS handoff text from system/developer messages."""
-    text = ""
+    """Extract the most likely current OSS handoff, not the whole history."""
+    best_text = ""
+    best_score = 0
     for msg in messages:
         if msg.get("role") in ("system", "developer", "user") and msg.get("content"):
-            text += " " + str(msg["content"])
-    return text
+            text = str(msg["content"])
+            score = _handoff_score(text)
+            if score >= best_score and score >= 2:
+                best_text = text
+                best_score = score
+    if best_text:
+        return best_text
+    return " ".join(
+        str(msg["content"])
+        for msg in messages
+        if msg.get("role") in ("system", "developer", "user") and msg.get("content")
+    )
+
+
+def _handoff_score(text: str) -> int:
+    upper = text.upper()
+    return sum(1 for label in TASK_FIELD_LABELS if label in upper)
 
 
 def _has_evidence_ledger(body: JSON) -> bool:
@@ -569,30 +608,111 @@ def select_execution_mode(handoff_text: str) -> str:
 
 def build_task_session(body: JSON, handoff_text: str, response_id: str) -> TaskSession:
     """Create a TaskSession from the handoff and initial response."""
-    task_class = extract_task_class(handoff_text)
-    mode = select_execution_mode(handoff_text)
-    paths = extract_allowed_paths(handoff_text)
-    fields = extract_required_deliverables(handoff_text)
+    envelope = parse_task_envelope(handoff_text)
+    task_class = envelope.get("task_type") or extract_task_class(handoff_text)
+    mode = select_mode(envelope)
+    paths = envelope.get("read_only_paths") or extract_allowed_paths(handoff_text)
+    fields = envelope.get("deliverable_fields") or extract_required_deliverables(handoff_text)
     budget = get_task_budget(task_class)
 
     # Extract required commands from verification steps
     cmd_lines = []
-    for line in handoff_text.split("\n"):
-        if any(kw in line.upper() for kw in ("VERIFICATION", "GIT STATUS", "GIT REV-PARSE", "GIT LOG")):
-            cmd_lines.append(line.strip())
+    if "OSS_HANDOFF_JSON" not in handoff_text:
+        for line in handoff_text.split("\n"):
+            if any(kw in line.upper() for kw in ("VERIFICATION", "GIT STATUS", "GIT REV-PARSE", "GIT LOG")):
+                cmd_lines.append(line.strip())
 
     return TaskSession(
         task_session_id=new_id("tsk"),
         root_response_id=response_id,
         task_class=task_class,
-        execution_mode="context_pack" if mode == "context_pack" else mode,
-        max_tool_exchanges=budget if mode != "context_pack" else 0,
+        execution_mode=mode,
+        max_tool_exchanges=budget if mode not in ("context_pack", "context_pack_report") else 0,
         required_paths=paths,
         required_commands=cmd_lines,
-        verification_steps=parse_task_envelope(handoff_text).get("verification_steps", []),
+        verification_steps=envelope.get("verification_steps", []),
         required_outputs=fields,
         handoff_text=handoff_text,
     )
+
+
+def _is_probable_search_term(term: str) -> bool:
+    """Keep machine-ish scout tokens; drop prose like 'query snippets'."""
+    if not term:
+        return False
+    lowered = term.lower().strip()
+    if lowered in {
+        "query snippets",
+        "relevant hits",
+        "exact files",
+        "the run dir",
+        "repo scripts/docs",
+        "repo scripts/docs/run dir",
+    }:
+        return False
+    if len(lowered) < 3:
+        return False
+    if re.search(r"[/:_.-]", term):
+        return True
+    if re.fullmatch(r"[0-9a-fA-F-]{12,}", term):
+        return True
+    if re.fullmatch(r"[A-Za-z][A-Za-z0-9_:-]*", term):
+        return True
+    return False
+
+
+def _search_term_rank(term: str) -> tuple:
+    lowered = term.lower()
+    if re.fullmatch(r"[0-9a-f]{8}-[0-9a-f-]{27,}", lowered):
+        return (0, -len(term), lowered)
+    if any(ch in term for ch in (":", "_")):
+        return (1, -len(term), lowered)
+    if any(ch in term for ch in ("/", ".", "-")):
+        return (2, -len(term), lowered)
+    if len(term) <= 8:
+        return (4, -len(term), lowered)
+    return (3, -len(term), lowered)
+
+
+def extract_search_terms_from_step(step: str) -> list:
+    """Extract grep terms from structured scout prose without repo-specific rules."""
+    step_lower = step.lower()
+    if not any(word in step_lower for word in ("search", "find", "grep", "locate")):
+        return []
+
+    candidates = []
+    quoted = re.findall(r"`([^`]+)`", step)
+    candidates.extend(quoted)
+    for token in re.findall(r"[A-Za-z][A-Za-z0-9_:\-]*", step):
+        if any(ch in token for ch in ("_", ":", "-")) or token.isupper():
+            candidates.append(token)
+
+    for_match = re.search(r"\bfor\b\s+(.+)", step, flags=re.IGNORECASE)
+    if for_match:
+        tail = for_match.group(1)
+        stop = re.search(
+            r"\b(inspect|determine|return|include|identify|if\s+found|after\s+fixing)\b",
+            tail,
+            flags=re.IGNORECASE,
+        )
+        if stop:
+            tail = tail[:stop.start()]
+        tail = re.sub(r"\band\b", ",", tail, flags=re.IGNORECASE)
+        candidates.extend(part.strip() for part in tail.split(","))
+
+    seen = set()
+    terms = []
+    for candidate in candidates:
+        term = candidate.strip().strip("`'\". ")
+        term = re.sub(r"^(and|or)\s+", "", term, flags=re.IGNORECASE).strip()
+        if not _is_probable_search_term(term):
+            continue
+        key = term.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        terms.append(term)
+    return sorted(terms, key=_search_term_rank)
 
 
 def build_context_pack(session: TaskSession, project_root: str) -> str:
@@ -609,6 +729,7 @@ def build_context_pack(session: TaskSession, project_root: str) -> str:
 
     # Parse verification steps into commands (grep, read) and paths
     cmd_requests: list = []  # (type, target, pattern)
+    search_terms = []
     for step in session.verification_steps + session.required_commands:
         step_lower = step.lower().strip("- ").strip()
         # Match "grep PATTERN in FILENAME" or "grep PATTERN FILENAME"
@@ -625,10 +746,19 @@ def build_context_pack(session: TaskSession, project_root: str) -> str:
                 target = parts[1].strip() if len(parts) > 1 else ""
             if pattern and target:
                 cmd_requests.append(("grep", target, pattern))
+        for term in extract_search_terms_from_step(step):
+            if term and term not in search_terms:
+                search_terms.append(term)
+
+    def _resolve_project_path(path: str) -> str:
+        root = os.path.abspath(project_root)
+        full = os.path.abspath(os.path.join(project_root, path))
+        if full != root and not full.startswith(root + os.sep):
+            raise PermissionError(f"path escapes project root: {path}")
+        return full
 
     # Process required paths
     for path in session.required_paths:
-        full = os.path.normpath(os.path.join(project_root, path))
         # Check if any grep request targets this file (by filename match)
         grep_pattern = None
         for ct, target, pattern in cmd_requests:
@@ -638,8 +768,8 @@ def build_context_pack(session: TaskSession, project_root: str) -> str:
                 grep_pattern = pattern
                 break
 
-        full = os.path.normpath(os.path.join(project_root, path))
         try:
+            full = _resolve_project_path(path)
             if grep_pattern:
                 # Run grep instead of full read
                 out = subprocess.run(
@@ -652,6 +782,46 @@ def build_context_pack(session: TaskSession, project_root: str) -> str:
                     f"matched lines:\n{out.stdout[:4000]}\n")
                 session.commands_run.append(["grep", grep_pattern, path])
                 continue
+
+            if os.path.isdir(full):
+                files_fully_read.add(path)
+                max_terms = int(os.getenv("CONTEXT_PACK_MAX_SEARCH_TERMS", "12"))
+                terms = search_terms[:max_terms]
+                if not terms:
+                    terms = []
+                if terms:
+                    for term in terms:
+                        out = subprocess.run(
+                            ["rtk", "grep", term, path],
+                            cwd=project_root, capture_output=True, text=True, timeout=20)
+                        _append_section(
+                            f"=== rtk grep {term} in {path} ===\n"
+                            f"exit_code: {out.returncode}\n"
+                            f"matched lines:\n{out.stdout[:5000]}\n"
+                            f"stderr:\n{out.stderr[:1000]}\n")
+                        session.commands_run.append(["grep", term, path])
+                else:
+                    out = subprocess.run(
+                        ["rtk", "find", path, "-maxdepth", "2", "-type", "f"],
+                        cwd=project_root, capture_output=True, text=True, timeout=20)
+                    _append_section(
+                        f"=== rtk find {path} -maxdepth 2 -type f ===\n"
+                        f"exit_code: {out.returncode}\n{out.stdout[:5000]}\n{out.stderr[:1000]}\n")
+                    session.commands_run.append(["find", path])
+                continue
+
+            if search_terms:
+                max_terms = int(os.getenv("CONTEXT_PACK_MAX_SEARCH_TERMS", "12"))
+                for term in search_terms[:max_terms]:
+                    out = subprocess.run(
+                        ["rtk", "grep", term, path],
+                        cwd=project_root, capture_output=True, text=True, timeout=20)
+                    if out.returncode == 0:
+                        _append_section(
+                            f"=== rtk grep {term} in {path} ===\n"
+                            f"exit_code: {out.returncode}\n"
+                            f"matched lines:\n{out.stdout[:5000]}\n")
+                        session.commands_run.append(["grep", term, path])
 
             raw = open(full, encoding="utf-8", errors="replace").read()
             files_fully_read.add(path)
@@ -670,16 +840,23 @@ def build_context_pack(session: TaskSession, project_root: str) -> str:
     # Run git commands if requested
     for cmd_text in session.required_commands:
         cmd_text = cmd_text.strip().lstrip("- ").strip().strip(".")
-        if "git" in cmd_text.lower():
+        cmd_lower = cmd_text.lower()
+        if cmd_lower.startswith("git ") or cmd_lower.startswith("rtk git "):
             try:
-                args = [a for a in cmd_text.split() if a and not a.startswith(("-", "git", "VERIFICA"))]
+                parts = cmd_text.split()
+                if parts[:2] == ["rtk", "git"]:
+                    args = parts[2:]
+                elif parts and parts[0] == "git":
+                    args = parts[1:]
+                else:
+                    args = []
                 if not args: continue
-                out = subprocess.run(["git"] + args, cwd=project_root,
+                out = subprocess.run(["rtk", "git"] + args, cwd=project_root,
                                      capture_output=True, text=True, timeout=15)
-                _append_section(f"=== git {' '.join(args)} ===\nexit_code: {out.returncode}\n{out.stdout}\n{out.stderr}\n")
+                _append_section(f"=== rtk git {' '.join(args)} ===\nexit_code: {out.returncode}\n{out.stdout}\n{out.stderr}\n")
                 session.commands_run.append(args)
             except Exception as e:
-                _append_section(f"=== git ({cmd_text}) ===\n[ERROR: {e}]\n")
+                _append_section(f"=== rtk git ({cmd_text}) ===\n[ERROR: {e}]\n")
 
     session.required_paths = list(files_fully_read)
     return "\n".join(sections)
@@ -698,28 +875,97 @@ def validate_report(text: str, required_fields: list) -> tuple:
 def build_context_pack_deterministic_report(session: TaskSession, pack: str, tool_output_text: str) -> str:
     """Build a terminal read report when the lightweight finalizer returns intent text."""
     source = pack or tool_output_text or ""
-    evidence = ""
-    for line in source.splitlines():
-        if "deterministic orchestrator" in line:
-            evidence = line.strip().strip("- ")
-            break
-    if not evidence:
-        for line in source.splitlines():
+    source_lines = source.splitlines()
+
+    grep_sections = []
+    for idx, line in enumerate(source_lines):
+        if line.startswith("=== rtk grep "):
+            snippet = []
+            for follow in source_lines[idx + 1: idx + 12]:
+                if follow.startswith("==="):
+                    break
+                stripped = follow.strip()
+                if stripped and not stripped.startswith(("exit_code:", "matched lines:", "stderr:")):
+                    snippet.append(stripped)
+                if len(snippet) >= 3:
+                    break
+            grep_sections.append((line.strip("= ").strip(), snippet))
+
+    def _has_match(snippet: list) -> bool:
+        if not snippet:
+            return False
+        text = "\n".join(snippet).lower()
+        return "0 matches" not in text and "no matches" not in text
+
+    def _section_snippet(heading: str, limit: int = 180) -> str:
+        in_section = False
+        snippets: List[str] = []
+        for line in source_lines:
             stripped = line.strip()
-            if stripped and not stripped.startswith("==="):
-                evidence = stripped[:240]
+            if stripped.lower().startswith(f"## {heading}".lower()):
+                in_section = True
+                continue
+            if in_section and stripped.startswith("## "):
                 break
+            if in_section and stripped and not stripped.startswith("|") and not set(stripped) <= {"-", "|"}:
+                item = stripped.strip("- ").strip()
+                snippets.append(item)
+                if len(snippets) >= 3 or len(" ".join(snippets)) >= limit:
+                    break
+        text = "; ".join(snippets).strip()
+        if len(text) <= limit:
+            return text
+        clipped = text[:limit].rsplit(" ", 1)[0].rstrip(".,;:")
+        return clipped + "..."
+
+    bullets = []
+    if grep_sections:
+        ordered_sections = (
+            [section for section in grep_sections if _has_match(section[1])]
+            + [section for section in grep_sections if not _has_match(section[1])]
+        )
+        for title, snippet in ordered_sections[:3]:
+            if snippet:
+                bullets.append(f"- {title}: " + " | ".join(snippet)[:220])
+            else:
+                bullets.append(f"- {title}: no matches in the gathered source pack")
+    goal = _section_snippet("Goal")
+    if goal:
+        bullets.append(f"- Goal: the document says this test should {goal[0].lower() + goal[1:] if goal else goal}")
+    success = _section_snippet("Success criteria", 220)
+    if success:
+        bullets.append(f"- Success criteria: the document lists planned checks, not observed results: {success}")
+    meta = _section_snippet("Meta-validation", 220)
+    if meta:
+        bullets.append(f"- Meta-validation: the document says setup can be checked offline by {meta[0].lower() + meta[1:] if meta else meta}")
+
+    evidence_lines = []
+    for line in source_lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("===") or stripped.startswith("[..."):
+            continue
+        if stripped.startswith(("# Napkin", "## Corrections", "|")):
+            continue
+        evidence_lines.append(stripped[:220])
+        if len(evidence_lines) >= 3:
+            break
+    evidence = "\n".join(f"- {line}" for line in evidence_lines) or "- No source text was available in the gathered pack."
+    while len(bullets) < 3:
+        idx = len(bullets)
+        fallback = evidence_lines[idx] if idx < len(evidence_lines) else "No additional source detail was available."
+        bullets.append(f"- Source evidence: {fallback}")
     command = "rtk read " + ", ".join(session.required_paths) if session.required_paths else "rtk read"
-    summary = (
-        "ORCHESTRATION.md defines the repository's orchestrator workflow: delegate meaningful repo work to subagents, "
-        "review their evidence, verify completeness, and maintain durable memory."
-    )
+    files = ", ".join(session.required_paths) if session.required_paths else "unknown"
+    outputs = ", ".join(session.required_outputs) if session.required_outputs else "concise findings, confidence, caveats"
+    summary = "\n".join(bullets[:3])
     return (
         "PASS\n"
         f"Command used: {command}\n"
-        f"Exact evidence phrase: {evidence}\n"
-        f"Concise summary: {summary}\n"
-        "Confidence/caveat: MEDIUM — deterministic bridge fallback produced the report from the gathered source pack because the lightweight finalizer returned intent text."
+        f"Files gathered: {files}\n"
+        f"Summary:\n{summary}\n"
+        f"Evidence snippets:\n{evidence}\n"
+        f"Requested deliverable: {outputs}\n"
+        "Confidence/caveat: MEDIUM — deterministic bridge fallback produced this report from the gathered source pack because model synthesis was unavailable."
     )
 
 
@@ -744,7 +990,8 @@ def suppress_duplicate_read(tool_call: dict, session: TaskSession) -> Optional[s
 # ── v12: Agent runtime — execution modes, intent rejection, bounded writes ──
 
 EXECUTION_MODES = ("no_tool_exact", "context_pack_report", "managed_autonomy",
-                    "bounded_write_exact", "bounded_write_patch", "escalate")
+                    "bounded_write_exact", "bounded_write_patch", "escalate",
+                    "invalid_handoff")
 
 INTENT_PATTERNS = (
     r"\b(I am|I'm|I will|I'll|I.m going to|I am going to|Running|Starting|"
@@ -753,17 +1000,12 @@ INTENT_PATTERNS = (
 
 MIN_REPORT_LENGTH = 80
 
-
 def parse_task_envelope(handoff_text: str) -> dict:
     """Parse structured task fields from OSS handoff text."""
-    envelope = {
-        "role": "", "goal": "", "task_type": "",
-        "read_only_paths": [], "owned_paths": [],
-        "forbidden_actions": [], "verification_steps": [],
-        "deliverable_fields": [], "write_allowed": False,
-        "exact_content": "", "no_tools_required": False,
-        "proof_critical": False,
-    }
+    structured = _structured_handoff_to_envelope(handoff_text)
+    if structured is not None:
+        return structured
+    envelope = _empty_task_envelope()
     current_field = None
 
     # Merge all lines but also handle single-line handoffs with multiple markers
@@ -773,23 +1015,47 @@ def parse_task_envelope(handoff_text: str) -> dict:
     # Extract fields by marker patterns
     _extract_field(envelope, merged, "ROLE:", "role")
     _extract_field(envelope, merged, "GOAL:", "goal")
-    if "TASK TYPE:" in upper_all:
+    role_section = _extract_labeled_section(handoff_text, "ROLE")
+    goal_section = _extract_labeled_section(handoff_text, "GOAL")
+    task_type_section = _extract_labeled_section(handoff_text, "TASK TYPE")
+    if role_section:
+        envelope["role"] = role_section
+    if goal_section:
+        envelope["goal"] = goal_section
+    if task_type_section:
+        envelope["task_type"] = task_type_section
+    elif "TASK TYPE:" in upper_all:
         envelope["task_type"] = _extract_after(merged, "TASK TYPE:")
-    if "READ-ONLY PATHS:" in upper_all:
+
+    read_section = _extract_labeled_section(handoff_text, "READ-ONLY PATHS")
+    owned_section = _extract_labeled_section(handoff_text, "OWNED PATHS")
+    forbidden_section = _extract_labeled_section(handoff_text, "DO NOT TOUCH") or _extract_labeled_section(handoff_text, "FORBIDDEN")
+    verification_section = _extract_labeled_section(handoff_text, "VERIFICATION STEPS") or _extract_labeled_section(handoff_text, "VERIFICATION")
+    deliverable_section = _extract_labeled_section(handoff_text, "DELIVERABLE")
+
+    if read_section:
+        envelope["read_only_paths"] = _parse_path_list(read_section)
+    elif "READ-ONLY PATHS:" in upper_all:
         envelope["read_only_paths"] = _parse_path_list(_extract_segment(merged, "READ-ONLY PATHS:"))
-    if "OWNED PATHS:" in upper_all:
-        owned_paths = _parse_path_list(_extract_segment(merged, "OWNED PATHS:"))
+    if owned_section or "OWNED PATHS:" in upper_all:
+        owned_paths = _parse_path_list(owned_section or _extract_segment(merged, "OWNED PATHS:"))
         envelope["owned_paths"] = owned_paths
         envelope["write_allowed"] = bool(owned_paths)
-    if "DO NOT TOUCH:" in upper_all or "FORBIDDEN:" in upper_all:
+    if forbidden_section:
+        envelope["forbidden_actions"] = _parse_path_list(forbidden_section)
+    elif "DO NOT TOUCH:" in upper_all or "FORBIDDEN:" in upper_all:
         marker = "DO NOT TOUCH:" if "DO NOT TOUCH:" in merged else "FORBIDDEN:"
         envelope["forbidden_actions"] = _parse_path_list(_extract_segment(merged, marker))
-    if "VERIFICATION STEPS:" in upper_all or "VERIFICATION:" in upper_all:
+    if verification_section:
+        envelope["verification_steps"] = [s.strip().strip("- ") for s in verification_section.replace("\n", ",").split(",") if s.strip()]
+    elif "VERIFICATION STEPS:" in upper_all or "VERIFICATION:" in upper_all:
         marker = "VERIFICATION STEPS:" if "VERIFICATION STEPS:" in merged else "VERIFICATION:"
         raw = _extract_segment(merged, marker)
         # Split by commas to get individual steps, but keep multi-word steps together
         envelope["verification_steps"] = [s.strip().strip("- ") for s in raw.split(",") if s.strip()]
-    if "DELIVERABLE:" in upper_all:
+    if deliverable_section:
+        envelope["deliverable_fields"] = [s.strip().strip("- ") for s in deliverable_section.splitlines() if s.strip()]
+    elif "DELIVERABLE:" in upper_all:
         raw = _extract_after(merged, "DELIVERABLE:")
         envelope["deliverable_fields"] = [raw.strip()] if raw else []
 
@@ -819,6 +1085,37 @@ def _extract_exact_content(text: str) -> str:
         if match:
             return match.group(1).strip().strip("`'\"")
     return ""
+
+
+def _is_field_label(line: str) -> bool:
+    normalized = line.strip().strip(":").upper()
+    return normalized in TASK_FIELD_LABELS
+
+
+def _extract_labeled_section(text: str, label: str) -> str:
+    """Extract a structured handoff section where the label may be on its own line."""
+    lines = text.splitlines()
+    label_upper = label.upper()
+    captured: List[str] = []
+    in_section = False
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            if in_section and captured:
+                captured.append("")
+            continue
+        upper = stripped.upper()
+        if upper == label_upper or upper == f"{label_upper}:":
+            in_section = True
+            continue
+        if upper.startswith(f"{label_upper}:"):
+            after = stripped.split(":", 1)[1].strip()
+            return after
+        if in_section and _is_field_label(stripped):
+            break
+        if in_section:
+            captured.append(stripped)
+    return "\n".join(line for line in captured if line).strip()
 
 
 def _extract_field(envelope: dict, text: str, marker: str, field: str):
@@ -861,7 +1158,7 @@ def _extract_segment(text: str, marker: str) -> str:
 
 def _parse_path_list(line: str) -> list:
     after = line.split(":", 1)[1] if ":" in line else line
-    parts = [p.strip().strip(",") for p in after.replace(";", ",").split(",")
+    parts = [p.strip().strip(",").strip("- ").strip() for p in after.replace(";", ",").replace("\n", ",").split(",")
             if p.strip() and not p.strip().lower().startswith(("no ", "none", "do not"))]
     normalized = []
     for p in parts:
@@ -885,6 +1182,8 @@ def _parse_path_list(line: str) -> list:
 
 
 def select_mode(envelope: dict) -> str:
+    if envelope.get("schema_error"):
+        return "invalid_handoff"
     if envelope.get("proof_critical"):
         return "escalate"
     if envelope.get("write_allowed") and envelope.get("owned_paths"):
@@ -1535,7 +1834,7 @@ class ProxyApp:
         self.continuation_fallbacks = [
             m.strip() for m in os.getenv("CONTINUATION_FALLBACK_MODELS", "deepseek-v4-flash").split(",") if m.strip()
         ]
-        self.continuation_deadline = float(os.getenv("CONTINUATION_DEADLINE_SECONDS", "45"))
+        self.continuation_deadline = float(os.getenv("CONTINUATION_DEADLINE_SECONDS", "60"))
         self.write_result_mode = os.getenv("WRITE_RESULT_MODE", "deterministic")
         self.write_report_deadline = float(os.getenv("WRITE_REPORT_DEADLINE_SECONDS", "20"))
         self.upstream_first_byte_timeout = float(os.getenv("UPSTREAM_FIRST_BYTE_TIMEOUT_SECONDS", "30"))
@@ -2750,7 +3049,7 @@ class Handler(BaseHTTPRequestHandler):
             status_info = {
                 "ok": True,
                 "service": "responses-chat-proxy",
-                "bridge_version": "12.0",
+                "bridge_version": BRIDGE_VERSION,
                 "time": now(),
                 "pid": os.getpid(),
                 "ppid": os.getppid(),
@@ -2763,7 +3062,7 @@ class Handler(BaseHTTPRequestHandler):
                 "gpt_model_strategy": APP.gpt_model_strategy,
                 "upstream_stream": getattr(APP, "upstream_streaming", True),
                 "has_opencode_key": bool(APP.upstream_key),
-                "state_db": APP.state.db_path if hasattr(APP.state, "db_path") else os.getenv("PROXY_STATE_DB", "unknown"),
+                "state_db": getattr(APP.state, "path", os.getenv("PROXY_STATE_DB", "unknown")),
                 "model_health": model_health,
                 "concurrency": {
                     "max_global": APP.max_global_concurrency,
@@ -2983,6 +3282,17 @@ class Handler(BaseHTTPRequestHandler):
             context_pack_attempted = False
 
             # no_tool_exact mode: just pass text through
+            if mode == "invalid_handoff":
+                emitter = ResponseEmitter(self, new_id("resp"), model_alias, bool(body.get("stream")))
+                emitter.emit_text_message(
+                    "FAIL\n"
+                    "Reason: invalid OSS handoff schema.\n"
+                    f"Schema error: {envelope.get('schema_error')}\n"
+                    "Confidence: HIGH — bridge rejected a malformed structured handoff before executing delegated work."
+                )
+                emitter.complete()
+                return
+
             if mode == "no_tool_exact":
                 context_pack_attempted = True
                 emitter = ResponseEmitter(self, new_id("resp"), model_alias, bool(body.get("stream")))
@@ -3062,7 +3372,9 @@ class Handler(BaseHTTPRequestHandler):
                         f"You are producing a report from the provided source pack.\n"
                         f"Required outputs: {', '.join(session.required_outputs)}\n\n"
                         f"SOURCE PACK:\n{pack}\n\n"
-                        f"Do not request tools. Produce a structured report including all required outputs."}],
+                        f"Do not request tools. Produce a structured report including all required outputs. "
+                        f"Distinguish source-document claims, planned success criteria, and actually observed verification. "
+                        f"Do not say tests passed, commands ran, files changed, or routing occurred unless the source pack explicitly contains that executed result."}],
                     "stream": False,
                     "tools": [],
                 }
@@ -3101,19 +3413,31 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 except Exception as e:
                     APP.log("context_pack_failed", error=str(e))
-                    # Emit deterministic partial — don't let client hang
-                    elapsed = time.time() - request_start
-                    partial_text = (
-                        f"PARTIAL\n"
-                        f"Reason: context-pack model call timed out after {elapsed:.0f}s\n"
-                        f"Files gathered: {', '.join(session.required_paths)}\n"
-                        f"Missing: model synthesis\n"
-                        f"Confidence: LOW\nCaveat: GPT review recommended"
-                    )
+                    text = ""
+                    for fb_model in APP.continuation_fallbacks:
+                        remaining = request_deadline - (time.time() - request_start)
+                        if remaining <= 5:
+                            break
+                        fallback_payload = dict(finalizer_payload)
+                        fallback_payload["model"] = map_model(fb_model, APP.model_map)
+                        try:
+                            APP.log("context_pack_fallback_try", fallback_model=fallback_payload["model"])
+                            chat_resp = APP.call_continuation_with_deadline(
+                                fallback_payload, min(APP.continuation_deadline, remaining - 2))
+                            text = chat_resp.get("choices", [{}])[0].get("message", {}).get("content", "")
+                            if text and not is_intent_or_status(text):
+                                APP.log("context_pack_fallback_ok", fallback_model=fallback_payload["model"], text_len=len(text))
+                                break
+                            APP.log("context_pack_fallback_invalid", fallback_model=fallback_payload["model"], text_len=len(text))
+                            text = ""
+                        except Exception as fallback_error:
+                            APP.log("context_pack_fallback_failed", fallback_model=fallback_payload["model"], error=str(fallback_error))
+                    if not text:
+                        text = build_context_pack_deterministic_report(session, pack, tool_output_text)
                     emitter = ResponseEmitter(self, new_id("resp"), model_alias, bool(body.get("stream")))
-                    emitter.emit_text_message(partial_text)
+                    emitter.emit_text_message(text)
                     emitter.complete()
-                    APP.log("context_pack_deterministic_partial")
+                    APP.log("context_pack_degraded_report", text_len=len(text))
                     return
 
             # Skip managed autonomy if context-pack was attempted
