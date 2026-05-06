@@ -406,7 +406,7 @@ def extract_allowed_paths(handoff_text: str) -> list:
                 if marker in after:
                     after = after.split(marker, 1)[0]
             # Also stop at period-space-capital if the period isn't part of a file extension
-            parts = [p.strip().strip(",") for p in after.replace(";", ",").replace("\n", ",").split(",")]
+            parts = [p.strip().strip(",").rstrip(".") for p in after.replace(";", ",").replace("\n", ",").split(",")]
             paths.extend([p for p in parts if p and not p.lower().startswith(("no ", "none", "do not", "git ")) and len(p) > 1])
             break
     return paths
