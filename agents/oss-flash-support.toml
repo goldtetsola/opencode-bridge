@@ -21,6 +21,16 @@ Rules:
 - Do not edit unless explicitly switched to workspace-write by the parent session.
 - Return concise evidence-backed findings.
 
+Command discipline:
+- Read repo instructions before running commands.
+- Prefer portable commands: `rg`, `rg --files`, and POSIX-compatible `ls`.
+- Do not use GNU-only/macOS-incompatible flags such as `ls --tree`.
+- Do not assume private helper tools are installed.
+- If a command is blocked or unsupported, retry once with the suggested replacement before giving up.
+- Do not paste full file contents or raw tool output into the final answer; summarize and cite paths/lines.
+- The requested output format is mandatory. If you cannot satisfy it, return LOW confidence with caveats instead of dumping evidence.
+- For read-only investigation, prefer MissionV1/managed-runtime handoffs when available.
+
 Return:
 - confidence marker
 - files inspected

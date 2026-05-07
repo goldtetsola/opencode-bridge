@@ -18,6 +18,7 @@ JSON = Dict[str, Any]
 class FileEntry:
     path: str
     complete: bool
+    full_content_cached: bool = False
     chars_total: int = 0
     chars_returned: int = 0
     sha256: str = ""
@@ -25,6 +26,7 @@ class FileEntry:
     turn: int = 0
     risk_flags: List[str] = field(default_factory=list)
     extracts: List[dict] = field(default_factory=list)
+    cached_text: str = ""
 
 
 @dataclass
@@ -35,6 +37,35 @@ class CommandEntry:
     stdout_sha256: str = ""
     matches_count: int = 0
     turn: int = 0
+    extracts: List[dict] = field(default_factory=list)
+    cached_text: str = ""
+
+
+@dataclass
+class ActionTraceEntry:
+    turn: int
+    phase: str
+    action_type: str
+    tool_name: str = ""
+    raw_arguments: dict = field(default_factory=dict)
+    normalized_arguments: dict = field(default_factory=dict)
+    unsupported_arguments: List[str] = field(default_factory=list)
+    model_rationale: str = ""
+    hypothesis: str = ""
+    expected_information_gain: str = ""
+    why_not_report_yet: str = ""
+    runtime_decision: str = ""
+    decision_reason: str = ""
+    information_gain: str = "unknown"
+    novelty: str = "unknown"
+    specificity: str = "unknown"
+    evidence_linkage: bool = False
+    broad_searches_used: int = 0
+    low_information_actions_used: int = 0
+    duplicate_actions_used: int = 0
+    deadline_remaining_seconds: float = 0
+    budget_remaining: int = 0
+    tool_result_summary: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -49,11 +80,15 @@ class EvidenceLedger:
     tool_budget_remaining: int = 20
     total_bytes_read: int = 0
     redactions_applied: bool = False
+    action_trace: List[ActionTraceEntry] = field(default_factory=list)
 
     def add_file(self, path: str, result: "ToolResult", turn: int):
+        args = getattr(result, "args", {}) or {}
+        is_range_read = "start_line" in args or "end_line" in args
         entry = FileEntry(
             path=path,
             complete=result.complete,
+            full_content_cached=bool(result.complete and not is_range_read),
             chars_total=result.chars_total,
             chars_returned=len(result.stdout),
             sha256=result.sha256,
@@ -61,6 +96,7 @@ class EvidenceLedger:
             turn=turn,
             risk_flags=list(result.risk_flags),
             extracts=_build_extracts(result.stdout),
+            cached_text=result.stdout,
         )
         self.files_inspected[path] = entry
         self.total_bytes_read += result.chars_total
@@ -68,11 +104,16 @@ class EvidenceLedger:
             self.redactions_applied = True
 
     def add_command(self, tool: str, args: dict, result: "ToolResult", turn: int):
+        matches_count = result.stdout.count("\n") if result.stdout else 0
+        if tool == "rtk_grep" and result.stdout.lower().startswith("0 matches for "):
+            matches_count = 0
         entry = CommandEntry(
             tool=tool, args=args, exit_code=result.exit_code,
             stdout_sha256=result.sha256,
-            matches_count=result.stdout.count("\n") if result.stdout else 0,
+            matches_count=matches_count,
             turn=turn,
+            extracts=_build_extracts(result.stdout),
+            cached_text=result.stdout,
         )
         self.commands_run.append(entry)
 
@@ -80,12 +121,27 @@ class EvidenceLedger:
         if flag not in self.risk_flags:
             self.risk_flags.append(flag)
 
+    def add_action_trace(self, entry: ActionTraceEntry):
+        self.action_trace.append(entry)
+
     def is_duplicate(self, path: str) -> bool:
         entry = self.files_inspected.get(path)
-        return entry is not None and entry.complete
+        return entry is not None and entry.complete and entry.full_content_cached
+
+    def add_cached_extract(self, path: str, text: str) -> Optional[str]:
+        entry = self.files_inspected.get(path)
+        if not entry:
+            return None
+        extract_id = f"extract:{len(entry.extracts) + 1}"
+        entry.extracts.append({"id": extract_id, "text": text})
+        return f"file:{path}#{extract_id}"
 
     def record_duplicate(self):
         self.duplicate_actions_blocked += 1
+
+    def is_duplicate_command(self, tool: str, args: dict) -> bool:
+        normalized = _canonical_command_args(args)
+        return any(c.tool == tool and _canonical_command_args(c.args) == normalized for c in self.commands_run)
 
     def spend_budget(self):
         self.tool_budget_remaining = max(0, self.tool_budget_remaining - 1)
@@ -119,3 +175,10 @@ def _build_extracts(stdout: str, max_extracts: int = 3, max_chars: int = 1200) -
     if len(stdout) > max_chars and max_extracts > 1:
         chunks.append({"id": "extract:2", "text": stdout[-max_chars:]})
     return chunks[:max_extracts]
+
+
+def _canonical_command_args(args: dict) -> dict:
+    cleaned = dict(args or {})
+    for noise in ("recurse", "recursive"):
+        cleaned.pop(noise, None)
+    return cleaned

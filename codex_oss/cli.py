@@ -48,6 +48,32 @@ def main():
     vh = sub.add_parser("validate-handoff", help="Validate an OSS_HANDOFF_JSON handoff file")
     vh.add_argument("file", help="Markdown or text file containing OSS_HANDOFF_JSON")
 
+    # mission — explicit runtime-backed delegation surface
+    mission = sub.add_parser("mission", help="Create or run MissionV1 runtime-backed OSS tasks")
+    mission_sub = mission.add_subparsers(dest="mission_command", help="Mission commands")
+
+    mt = mission_sub.add_parser("template", help="Print a MissionV1 JSON template")
+    mt.add_argument("--mission-id", default="mission_local_001")
+    mt.add_argument("--objective", required=True)
+    mt.add_argument("--tier", choices=["A2", "A3"], default="A3")
+    mt.add_argument("--risk-tier", choices=["low", "medium", "critical"], default="low")
+    mt.add_argument("--allowed-root", action="append", default=[])
+    mt.add_argument("--allowed-path", action="append", default=[])
+    mt.add_argument("--tool-budget", type=int, default=10)
+    mt.add_argument("--time-budget-seconds", type=int, default=90)
+    mt.add_argument("--allow-broad-read-scope", action="store_true")
+    mt.add_argument("--critical-path-read-allowed", action="store_true")
+    mt.add_argument("--critical-path-reason", default=None)
+
+    mr = mission_sub.add_parser("run", help="Run a MissionV1 through the local OSS Agent Runtime bridge")
+    mr.add_argument("file", help="Mission JSON file, handoff file containing <OSS_HANDOFF_JSON>, or '-' for stdin")
+    mr.add_argument("--model", default="mission-a3-kimi", help="Runtime alias, e.g. mission-a3-kimi")
+    mr.add_argument("--port", type=int, default=4000)
+    mr.add_argument("--base-url", default=None, help="Bridge base URL, default http://127.0.0.1:<port>/v1")
+    mr.add_argument("--auth", default=None, help="Bearer token, default LITELLM_MASTER_KEY/PROXY_API_KEY")
+    mr.add_argument("--timeout", type=float, default=120)
+    mr.add_argument("--json", action="store_true", help="Print raw Responses JSON instead of report text")
+
     # up — foreground supervisor
     up = sub.add_parser("up", help="Start bridge with foreground supervisor (keep terminal open)")
     up.add_argument("--port", type=int, default=4000)
@@ -95,6 +121,9 @@ def main():
     elif args.command == "validate-handoff":
         sys.exit(_validate_handoff(args.file))
 
+    elif args.command == "mission":
+        sys.exit(_mission(args))
+
     elif args.command == "up":
         sys.exit(_supervise(args.port, daemon=args.daemon, foreground=args.foreground))
 
@@ -139,6 +168,158 @@ def _validate_handoff(path: str) -> int:
         "write_allowed": envelope["write_allowed"],
     }, indent=2))
     return 0
+
+
+def _mission(args) -> int:
+    if args.mission_command == "template":
+        return _mission_template(args)
+    if args.mission_command == "run":
+        return _mission_run(args)
+    print("Usage: codex-oss mission <template|run>")
+    return 1
+
+
+def _mission_template(args) -> int:
+    import json
+
+    allowed_roots = args.allowed_root or []
+    allowed_paths = args.allowed_path or []
+    if not allowed_roots and not allowed_paths:
+        print("Mission template requires at least one --allowed-root or --allowed-path", file=sys.stderr)
+        return 1
+
+    mission = {
+        "schema_version": "oss_agent_mission.v1",
+        "mission_id": args.mission_id,
+        "tier": args.tier,
+        "mode": "guided_exploration" if args.tier == "A2" else "managed_investigation",
+        "objective": args.objective,
+        "risk_tier": args.risk_tier,
+        "write_allowed": False,
+        "allowed_roots": allowed_roots,
+        "allowed_paths": allowed_paths,
+        "forbidden_roots": [],
+        "forbidden_topics": [],
+        "tool_budget": args.tool_budget,
+        "time_budget_seconds": args.time_budget_seconds,
+        "allowed_tool_classes": ["read", "search", "list", "safe_git"],
+        "stop_conditions": [
+            "valid_report",
+            "budget_exhausted",
+            "critical_path_detected",
+            "deadline_reached",
+        ],
+        "report_schema": "managed_investigation_report.v1",
+        "required_outputs": [
+            "files_inspected",
+            "commands_run",
+            "findings",
+            "uncertainties",
+            "confidence",
+            "caveats",
+            "escalation_recommendation",
+        ],
+        "allow_broad_read_scope": bool(args.allow_broad_read_scope),
+        "critical_path_read_allowed": bool(args.critical_path_read_allowed),
+        "critical_path_reason": args.critical_path_reason,
+    }
+    print(json.dumps(mission, indent=2))
+    return 0
+
+
+def _read_mission_text(path: str) -> str:
+    import sys
+    from pathlib import Path
+
+    if path == "-":
+        return sys.stdin.read()
+    return Path(path).read_text(encoding="utf-8")
+
+
+def _mission_json_from_text(text: str) -> str:
+    import json
+    from codex_oss.runtime.policy import extract_single_handoff_block
+
+    stripped = text.strip()
+    if "<OSS_HANDOFF_JSON>" in stripped:
+        return extract_single_handoff_block(stripped)
+    parsed = json.loads(stripped)
+    if not isinstance(parsed, dict):
+        raise ValueError("Mission file must contain a JSON object")
+    return json.dumps(parsed)
+
+
+def _mission_run(args) -> int:
+    import json
+    import os
+    import urllib.error
+    import urllib.request
+
+    try:
+        mission_json = _mission_json_from_text(_read_mission_text(args.file))
+        mission = json.loads(mission_json)
+    except Exception as exc:
+        print(f"Invalid mission: {exc}", file=sys.stderr)
+        return 1
+
+    base_url = (args.base_url or f"http://127.0.0.1:{args.port}/v1").rstrip("/")
+    token = args.auth or os.getenv("PROXY_API_KEY") or os.getenv("LITELLM_MASTER_KEY") or "sk-local-codex-bridge"
+    body = {
+        "model": args.model,
+        "stream": False,
+        "input": [
+            {
+                "role": "user",
+                "content": "<OSS_HANDOFF_JSON>\n" + json.dumps(mission) + "\n</OSS_HANDOFF_JSON>",
+            }
+        ],
+    }
+    request = urllib.request.Request(
+        f"{base_url}/responses",
+        data=json.dumps(body).encode("utf-8"),
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=args.timeout) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.URLError as exc:
+        print(f"Mission request failed: {exc}", file=sys.stderr)
+        return 1
+
+    if args.json:
+        print(json.dumps(payload, indent=2))
+        return 0 if payload.get("status") == "completed" else 1
+
+    text = _extract_response_text(payload)
+    print(text)
+    if payload.get("status") != "completed":
+        return 1
+    if "Status: FAILED" in text:
+        return 1
+    return 0
+
+
+def _extract_response_text(payload: dict) -> str:
+    parts = []
+    for item in payload.get("output", []):
+        for content in item.get("content", []):
+            if isinstance(content, dict) and content.get("text"):
+                parts.append(str(content["text"]))
+    if parts:
+        return "\n".join(parts)
+    return json_dumps_safe(payload)
+
+
+def json_dumps_safe(value) -> str:
+    import json
+    try:
+        return json.dumps(value, indent=2)
+    except Exception:
+        return str(value)
 
 
 def _start_bridge(port: int, mode: str):

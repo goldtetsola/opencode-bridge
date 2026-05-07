@@ -98,6 +98,7 @@ The bridge handles:
 | Variable | Default | Description |
 |---|---|---|
 | `OPENCODE_GO_API_KEY` | (required) | Your OpenCode Go API key |
+| `UPSTREAM_API_KEY` | falls back to `OPENCODE_GO_API_KEY` | Generic upstream API key for non-OpenCode backends such as vLLM. Use this for backend experiments; keep `OPENCODE_GO_API_KEY` for the normal OpenCode Go path. |
 | `PROXY_API_KEY` | `LITELLM_MASTER_KEY` value | Key Codex sends to authenticate with the proxy |
 | `LITELLM_MASTER_KEY` | `sk-local-codex-bridge` | Auth key (shared name for Codex config compatibility). Leave empty for no auth on localhost. |
 | `PROXY_PORT` | `4000` | Port the proxy listens on |
@@ -145,6 +146,69 @@ The bridge handles:
 | `ocg-minimax-m2.7` | minimax-m2.7 | (untested) |
 
 Also accepts OpenCode-style `opencode-go/<model>` model IDs.
+
+## Optional vLLM backend exploration
+
+vLLM is worth testing as a backend, but it is not a replacement for the OSS Agent Runtime. The useful near-term lane is:
+
+```text
+Codex runtime-backed agent
+→ mission-a2/mission-a3 alias
+→ OSS Agent Runtime
+→ JSON action loop with tools=[] upstream
+→ vLLM-served reasoning model
+→ ValidatedReportV1
+```
+
+This keeps path policy, evidence ledgers, report validation, status-text rejection, and GPT-5.5 final judgment in the bridge runtime. vLLM may improve privacy, provider independence, and local/open-weight model testing, but it does not by itself prevent raw file dumps, unsupported final claims, bad command choices, or missing evidence refs.
+
+To try vLLM behind the runtime, start a vLLM server separately and launch the bridge with `examples/vllm-runtime.env.example`, replacing the served model names in `MODEL_MAP_JSON`.
+
+```bash
+# Example vLLM command; choose flags for your model/parser.
+vllm serve Qwen/Qwen3.6-27B \
+  --port 8000 \
+  --served-model-name Qwen/Qwen3.6-27B \
+  --enable-auto-tool-choice \
+  --tool-call-parser qwen3_coder
+
+set -a
+. examples/vllm-runtime.env.example
+set +a
+python3 bridge.py
+```
+
+For direct Codex-to-vLLM research, `config.toml.example` includes a commented `vllm_direct` provider using `wire_api = "responses"`. Treat that as an R&D comparison lane only. Serious OSS investigation should still enter through `oss_runtime` and MissionV1.
+
+Evaluation gates for vLLM:
+
+1. No-tool exact output succeeds.
+2. Responses terminal contract succeeds.
+3. MissionV1 runtime alias returns `COMPLETE`, `PARTIAL`, `ESCALATE`, or `FAILED`.
+4. Upstream receives `tools=[]` for A2/A3 runtime missions.
+5. Raw direct vLLM behavior is measured only as a baseline, not accepted as the product path.
+
+## Explicit MissionV1 delegation
+
+If the active Codex session cannot invoke repo-local runtime-backed agent TOMLs by name, use the CLI delegation surface. This is the reliable fallback for “spawn an OSS investigator” because it still enters the bridge through MissionV1 and the managed runtime.
+
+Create a mission:
+
+```bash
+bin/codex-oss mission template \
+  --mission-id mission_readme_scan \
+  --objective "Inspect README runtime-agent guidance and report caveats." \
+  --allowed-path README.md \
+  > /tmp/mission_readme_scan.json
+```
+
+Run it through the local bridge:
+
+```bash
+bin/codex-oss mission run /tmp/mission_readme_scan.json --model mission-a3-kimi
+```
+
+The command posts a `/v1/responses` request to the local bridge using `model = "mission-a3-kimi"` by default. The bridge then maps the runtime alias to the OSS reasoning model, uses `tools=[]` upstream, executes only runtime-owned tools, validates the report, and prints the final report text. If the bridge is not running, start it first with `bin/codex-oss up` or `bin/codex-oss start`.
 
 ## Bridge: OSS subagent runtime
 
@@ -224,6 +288,18 @@ python3 tests/test_protocol_conformance.py
 
 It covers malformed structured handoffs, exact-write routing, no-match search evidence, incomplete evidence coverage, bounded patch acceptance, verification claims, verification output failure detection, and scope-boundary checks.
 
+### OSS coding gauntlet
+
+Run the deterministic coding gauntlet before promoting A2/A3 behavior. It drives the internal runtime loop against a fixture repo and checks agent-facing behavior rather than only protocol mechanics:
+
+```bash
+python3 tests/test_oss_gauntlet.py
+```
+
+The gauntlet covers implementation-site discovery, file and command evidence refs, duplicate-read suppression, critical-risk escalation before model calls, status-text repair, budget exhaustion, broad-scope denial, unsupported false confidence, and zero-match search evidence. Live OSS provider burn-in is intentionally separate from this deterministic suite and should only be run with a supervised sidecar plus explicit live-mode setup.
+
+The suite generates its fixture under `tmp/oss-agent-runtime-gauntlet/`, which is ignored. It does not require a local RTK binary; the runtime-owned `rtk_*` tools have native fallbacks for public-repo testing while preserving the same model-facing tool names.
+
 ### Runtime environment variables
 
 | Variable | Default | Description |
@@ -288,6 +364,12 @@ Critical paths that must stay on GPT-5.5/5.4:
 - Cross-module invariants (>2 modules affected)
 - Any path where failure = data loss or security breach
 
+### Direct OSS subagent caveat
+
+Direct Codex OSS subagents still receive a broad Codex tool environment. They may choose non-portable shell commands or dump raw tool output unless the installed agent templates and handoff explicitly forbid that behavior. The managed A2/A3 MissionV1 runtime is the stricter path: it disables provider-native tools, executes only runtime-owned read/search/list/safe-git tools, validates evidence refs, and rejects status text or unsupported reports.
+
+For direct subagent use, `codex-oss install` writes agent instructions that require portable commands, one retry after blocked commands, no full-file output dumps, and mandatory output-format compliance. Treat direct OSS subagent reports as evidence, not final authority.
+
 ### Fork mode
 
 OSS subagents must be spawned with `fork_turns: "none"`. Full-history forks inherit the parent GPT-5.5 model and reasoning effort, which conflicts with the model/provider overrides OSS agents need. This is a known Codex limitation ([issue #20077](https://github.com/openai/codex/issues/20077)).
@@ -304,13 +386,16 @@ The AGENTS.md handoff template includes this requirement. See `orchestration/ROU
 
 ## Agent TOMLs
 
-Three pre-built agent files are provided in `orchestration/agents/` (recommended) and `agents/` (minimal):
+Runtime-controlled investigator agents and raw experimental agents are provided in `orchestration/agents/` (recommended) and `agents/` (minimal). Use runtime-controlled agents for normal A2/A3 read-only investigation:
 
 | Agent TOML | Model | Reasoning | Sandbox | Use case |
 |---|---|---|---|---|
-| `oss-deepseek-pro.toml` | deepseek-v4-pro | high | workspace-write | Bounded impl, debugging, analysis |
-| `oss-kimi-rapid.toml` | kimi-k2.6 | medium | read-only | Repo navigation, scouting, review |
-| `oss-flash-support.toml` | deepseek-v4-flash | medium | read-only | Docs, summaries, changelog, mechanical |
+| `oss-kimi-investigator.toml` | mission-a3-kimi | medium | read-only | Runtime-controlled repo navigation, scouting, review |
+| `oss-deepseek-investigator.toml` | mission-a3-deepseek | high | read-only | Runtime-controlled reasoning-heavy investigation |
+| `oss-flash-context.toml` | mission-a2-flash | medium | read-only | Runtime-controlled cheap context/report work |
+| `oss-deepseek-pro.toml` | deepseek-v4-pro | high | workspace-write | Raw experimental bounded impl/debugging baseline |
+| `oss-kimi-rapid.toml` | kimi-k2.6 | medium | read-only | Raw experimental repo navigation baseline |
+| `oss-flash-support.toml` | deepseek-v4-flash | medium | read-only | Raw experimental docs/support baseline |
 
 ### Creating your own agent
 
@@ -324,7 +409,16 @@ You can create agents for any model OpenCode Go supports:
 name = "oss_my_worker"
 description = "What this agent does. USE ME WHEN: <criteria>. DO NOT USE FOR: <boundaries>."
 
-model_provider = "opencode_bridge"       # always this
+model_provider = "oss_runtime"           # runtime-controlled A2/A3 agents
+model = "mission-a3-kimi"                # mission-a3-kimi / mission-a3-deepseek / mission-a2-flash
+model_reasoning_effort = "medium"
+sandbox_mode = "read-only"
+```
+
+For raw experimental agents only:
+
+```toml
+model_provider = "opencode_bridge"
 model = "ocg-<model-id>"                 # e.g. ocg-qwen3.6-plus
 model_reasoning_effort = "high"          # high / medium / low
 sandbox_mode = "workspace-write"         # or "read-only"

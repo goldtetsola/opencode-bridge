@@ -60,6 +60,19 @@ If the JSON block is malformed, incomplete, or contradicts the prose, treat the 
 - Never delegate critical paths to OSS (see safety check below)
 - Never spawn multiple OSS agents writing to the same file simultaneously
 
+### Portable command discipline
+
+Direct OSS subagents are not guaranteed to know local command wrappers or platform-specific flags. Every direct OSS handoff should include:
+
+- Read repo instructions before running commands.
+- Prefer portable search/list commands: `rg`, `rg --files`, and POSIX-compatible `ls`.
+- Do not use GNU-only/macOS-incompatible flags such as `ls --tree`.
+- Do not assume private helper tools are installed.
+- If a command is blocked or unsupported, retry once with the suggested replacement and mention the blocked command in the report.
+- Do not paste full file contents or raw tool output into the final answer; summarize and cite paths/lines.
+- The requested output format is mandatory. If the worker cannot satisfy it, it must return LOW confidence with caveats instead of dumping evidence.
+- For A2/A3 read-only investigation, prefer MissionV1 through the bridge runtime over broad shell access.
+
 ---
 
 ## Routing Rules
@@ -81,18 +94,18 @@ If the task touches any of these, handle with GPT-5.5/5.4 directly. STOP.
 
 **Exploration or navigation**
 Find callers, map dependencies, grep patterns, trace imports, scout blast radius.
-→ Delegate to `oss_kimi_rapid` (read-only, fork_turns: "none", handoff required)
+→ Delegate to `oss_kimi_investigator` (runtime-controlled read-only, fork_turns: "none", MissionV1 required)
 
 **Docs, changelog, summaries, mechanical**
 Write changelog, summarize changes, test inventory, format code.
-→ Delegate to `oss_flash_support` (read-only, fork_turns: "none", handoff required)
+→ Delegate to `oss_flash_context` for read-only context/report work. Use `oss_flash_support` only as a raw/manual experimental baseline.
 
 **Bounded implementation**
 Single file/module change. Tests exist for target code. Requirements clear.
 → Delegate to `oss_deepseek_pro` (workspace-write, fork_turns: "none", handoff required)
 
 **Ambiguous scope**
-→ Delegate to `oss_kimi_rapid` first (scout). Then based on findings, delegate or escalate.
+→ Delegate to `oss_kimi_investigator` first (runtime-controlled scout). Then based on findings, delegate or escalate.
 
 ### 3. AFTER DELEGATION — validate
 
@@ -114,11 +127,14 @@ Single file/module change. Tests exist for target code. Requirements clear.
 
 | Agent | Model | Best for | Write? |
 |---|---|---|---|
-| `oss_kimi_rapid` | kimi-k2.6 (via bridge) | Repo nav, review, scouting | read-only |
-| `oss_deepseek_pro` | deepseek-v4-pro (via bridge) | Bounded impl, debugging | workspace-write |
-| `oss_flash_support` | deepseek-v4-flash (via bridge) | Docs, changelog, mechanical | read-only |
+| `oss_kimi_investigator` | mission-a3-kimi (runtime) | Repo nav, review, scouting | read-only |
+| `oss_deepseek_investigator` | mission-a3-deepseek (runtime) | Reasoning-heavy read-only investigation | read-only |
+| `oss_flash_context` | mission-a2-flash (runtime) | Cheap context/report tasks | read-only |
+| `oss_deepseek_pro` | deepseek-v4-pro (raw experimental) | Bounded impl/debugging baseline | workspace-write |
+| `oss_kimi_rapid` | kimi-k2.6 (raw experimental) | Manual repo nav baseline | read-only |
+| `oss_flash_support` | deepseek-v4-flash (raw experimental) | Manual docs/support baseline | read-only |
 
-All three require: `fork_turns: "none"`, explicit handoff, `model_provider = "opencode_bridge"`.
+Runtime-controlled agents require: `fork_turns: "none"`, explicit MissionV1 handoff, `model_provider = "oss_runtime"`.
 
 ---
 

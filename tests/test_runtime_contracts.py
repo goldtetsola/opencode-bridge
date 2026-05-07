@@ -4,8 +4,11 @@
 from __future__ import annotations
 
 import os
+import json
 import sys
 import tempfile
+import threading
+import time
 
 os.environ["ALLOW_MISSING_OPENCODE_KEY"] = "1"
 ROOT = os.path.dirname(os.path.dirname(__file__))
@@ -16,8 +19,15 @@ from codex_oss.health import build_health_status
 from codex_oss.managed_bridge import run_managed_mission_from_body
 from codex_oss.mission import InvalidHandoffError, _build_mission
 from codex_oss.runtime import ToolResult, resolve_path
-from codex_oss.runtime.loop import run_loop
-from codex_oss.runtime.policy import is_broad_root
+from codex_oss.runtime.loop import (
+    _evidence_ref_summary,
+    _extract_model_text,
+    _normalize_action_arguments,
+    _normalize_arguments,
+    run_loop,
+)
+from codex_oss.runtime.policy import detect_critical_finality, is_broad_root
+from codex_oss.runtime.objectives import classify_objective, synthesize_objective_finding
 from codex_oss.validation import validate_report
 
 
@@ -57,6 +67,11 @@ def assert_run_loop_accepts_valid_final_report():
 
     def fake_model(messages, tools, timeout):
         assert tools == [], tools
+        assert "Allowed roots:" in messages[0]["content"], messages[0]["content"]
+        assert "codex_oss/" in messages[0]["content"], messages[0]["content"]
+        assert "Do not guess alternate filenames or read '.'" in messages[0]["content"], messages[0]["content"]
+        assert '"action_type":"tool_call"' in messages[0]["content"], messages[0]["content"]
+        assert '"action_type":"final_report"' in messages[0]["content"], messages[0]["content"]
         return {
             "choices": [
                 {
@@ -78,6 +93,19 @@ def assert_run_loop_accepts_valid_final_report():
     result = run_loop(m, ledger, fake_model, [], None, m.allowed_roots, m.allowed_paths, request_deadline=30)
     assert result["status"] == "PARTIAL", result
     assert result["report"]["status"] == "PARTIAL", result
+
+
+def assert_model_text_extraction_handles_provider_variants():
+    text = '{"action_type":"final_report"}'
+    variants = [
+        text,
+        {"choices": [text]},
+        {"choices": [{"message": text}]},
+        {"choices": [{"message": {"content": text}}]},
+        {"choices": [{"message": {"content": [{"type": "text", "text": text}]}}]},
+    ]
+    for response in variants:
+        assert _extract_model_text(response) == text, response
 
 
 def assert_mission_requires_scope_and_tool_contract():
@@ -130,6 +158,15 @@ def assert_broad_roots_are_exactly_broad():
         assert is_broad_root(root), root
 
 
+def assert_critical_finality_uses_word_boundaries():
+    fixture_claim = (
+        "Runtime-backed OSS agents use MissionV1, a managed JSON action loop, "
+        "runtime-owned read/search/list tools, evidence refs, and report validation."
+    )
+    assert not detect_critical_finality(fixture_claim)
+    assert detect_critical_finality("The finalizer is 100% correct and safe to merge.")
+
+
 def assert_file_extract_refs_resolve():
     ledger = EvidenceLedger(mission_id="mission_runtime_test")
     result = ToolResult(
@@ -163,6 +200,28 @@ def assert_file_extract_refs_resolve():
     }
     validation = validate_report(report, ledger)
     assert validation.is_valid, validation.errors
+    refs = _evidence_ref_summary(ledger)
+    assert "file:codex_oss/runtime/loop.py#extract:1" in refs, refs
+
+
+def assert_report_validation_rejects_non_object_findings_without_crashing():
+    ledger = EvidenceLedger(mission_id="mission_runtime_test")
+    report = {
+        "oss_report_version": "1.0",
+        "mission_id": "mission_runtime_test",
+        "status": "COMPLETE",
+        "confidence": "LOW",
+        "files_inspected": [],
+        "commands_run": [],
+        "findings": ["plain string finding from a loose provider"],
+        "uncertainties": [],
+        "caveats": [],
+        "escalation_recommendation": "GPT-5.5 review required",
+        "missing_fields": [],
+    }
+    validation = validate_report(report, ledger)
+    assert not validation.is_valid
+    assert "finding[0] is not an object" in validation.errors, validation.errors
 
 
 def assert_managed_bridge_returns_terminal_report_on_runtime_error():
@@ -226,7 +285,236 @@ def assert_managed_bridge_returns_terminal_report_on_runtime_error():
     assert "invalid entrypoint" in invalid_result.report_text, invalid_result.report_text
 
 
+def assert_runtime_model_alias_requires_mission_and_maps_reasoning_model():
+    calls = []
+
+    def call_payload(payload, timeout):
+        calls.append(payload)
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": (
+                            '{"action_type":"final_report","report":'
+                            '{"oss_report_version":"1.0","mission_id":"mission_alias_test",'
+                            '"status":"PARTIAL","confidence":"LOW","files_inspected":[],'
+                            '"commands_run":[],"findings":[],"uncertainties":[],'
+                            '"caveats":["alias smoke"],'
+                            '"escalation_recommendation":"GPT-5.5 review required",'
+                            '"missing_fields":[]}}'
+                        )
+                    }
+                }
+            ]
+        }
+
+    missing = run_managed_mission_from_body(
+        {"input": [{"role": "user", "content": "Investigate README.md"}]},
+        "mission-a3-kimi",
+        lambda *args, **kwargs: None,
+        call_payload,
+        lambda model: model,
+        request_deadline=30,
+    )
+    assert missing.handled, missing
+    assert missing.status == "FAILED", missing
+    assert "requires exactly one OSS_HANDOFF_JSON MissionV1" in missing.report_text, missing.report_text
+    assert calls == [], calls
+
+    body = {
+        "input": [
+            {
+                "role": "user",
+                "content": (
+                    "<OSS_HANDOFF_JSON>\n"
+                    '{"schema_version":"oss_agent_mission.v1","mission_id":"mission_alias_test",'
+                    '"tier":"A3","mode":"managed_investigation","objective":"Alias route smoke",'
+                    '"risk_tier":"low","write_allowed":false,"allowed_roots":["codex_oss/"],'
+                    '"allowed_paths":[],"tool_budget":1,"time_budget_seconds":30,'
+                    '"allowed_tool_classes":["read"],"stop_conditions":["valid_report"],'
+                    '"report_schema":"managed_investigation_report.v1",'
+                    '"required_outputs":["files_inspected","commands_run","findings","uncertainties",'
+                    '"confidence","caveats","escalation_recommendation"]}'
+                    "\n</OSS_HANDOFF_JSON>"
+                ),
+            }
+        ]
+    }
+    handled = run_managed_mission_from_body(
+        body,
+        "mission-a3-kimi",
+        lambda *args, **kwargs: None,
+        call_payload,
+        lambda model: {"ocg-kimi-k2.6": "kimi-k2.6"}[model],
+        request_deadline=30,
+    )
+    assert handled.handled, handled
+    assert handled.status == "PARTIAL", handled
+    assert calls[-1]["model"] == "kimi-k2.6", calls[-1]
+    assert calls[-1]["tools"] == [], calls[-1]
+
+
+def assert_runtime_model_alias_uses_fallback_on_model_failure():
+    calls = []
+    logs = []
+
+    def call_payload(payload, timeout):
+        calls.append(payload)
+        if len(calls) == 1:
+            raise RuntimeError("simulated primary model 500")
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": (
+                            '{"action_type":"final_report","report":'
+                            '{"oss_report_version":"1.0","mission_id":"mission_fallback_test",'
+                            '"status":"PARTIAL","confidence":"LOW","files_inspected":[],'
+                            '"commands_run":[],"findings":[],"uncertainties":[],'
+                            '"caveats":["fallback smoke"],'
+                            '"escalation_recommendation":"GPT-5.5 review required",'
+                            '"missing_fields":[]}}'
+                        )
+                    }
+                }
+            ]
+        }
+
+    body = {
+        "input": [
+            {
+                "role": "user",
+                "content": (
+                    "<OSS_HANDOFF_JSON>\n"
+                    '{"schema_version":"oss_agent_mission.v1","mission_id":"mission_fallback_test",'
+                    '"tier":"A3","mode":"managed_investigation","objective":"Fallback route smoke",'
+                    '"risk_tier":"low","write_allowed":false,"allowed_roots":["codex_oss/"],'
+                    '"allowed_paths":[],"tool_budget":1,"time_budget_seconds":30,'
+                    '"allowed_tool_classes":["read"],"stop_conditions":["valid_report"],'
+                    '"report_schema":"managed_investigation_report.v1",'
+                    '"required_outputs":["files_inspected","commands_run","findings","uncertainties",'
+                    '"confidence","caveats","escalation_recommendation"]}'
+                    "\n</OSS_HANDOFF_JSON>"
+                ),
+            }
+        ]
+    }
+    handled = run_managed_mission_from_body(
+        body,
+        "mission-a3-deepseek",
+        lambda event, **fields: logs.append((event, fields)),
+        call_payload,
+        lambda model: {"ocg-deepseek-v4-pro": "deepseek-pro", "ocg-kimi-k2.6": "kimi"}[model],
+        request_deadline=30,
+    )
+    assert handled.handled, handled
+    assert handled.status == "PARTIAL", handled
+    assert [call["model"] for call in calls] == ["deepseek-pro", "kimi"], calls
+    assert any(event == "mission_model_primary_failed" for event, _ in logs), logs
+    assert any(event == "mission_model_fallback_ok" for event, _ in logs), logs
+
+
+def assert_runtime_mission_time_budget_extends_internal_deadline():
+    timeouts = []
+
+    def call_payload(payload, timeout):
+        timeouts.append(timeout)
+        assert "Budget: 20 tool calls remaining" in payload["messages"][0]["content"], payload["messages"][0]["content"]
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps({
+                            "action_type": "final_report",
+                            "report": {
+                                "oss_report_version": "1.0",
+                                "mission_id": "mission_deadline_extension_test",
+                                "status": "PARTIAL",
+                                "confidence": "LOW",
+                                "files_inspected": [],
+                                "commands_run": [],
+                                "findings": [],
+                                "uncertainties": [],
+                                "caveats": ["deadline extension smoke"],
+                                "escalation_recommendation": "GPT-5.5 review required",
+                                "missing_fields": [],
+                            },
+                        })
+                    }
+                }
+            ]
+        }
+
+    body = {
+        "input": [
+            {
+                "role": "user",
+                "content": (
+                    "<OSS_HANDOFF_JSON>\n"
+                    '{"schema_version":"oss_agent_mission.v1","mission_id":"mission_deadline_extension_test",'
+                    '"tier":"A3","mode":"managed_investigation","objective":"Deadline route smoke",'
+                    '"risk_tier":"low","write_allowed":false,"allowed_roots":["codex_oss/"],'
+                    '"allowed_paths":[],"tool_budget":20,"time_budget_seconds":180,'
+                    '"allowed_tool_classes":["read"],"stop_conditions":["valid_report"],'
+                    '"report_schema":"managed_investigation_report.v1",'
+                    '"required_outputs":["files_inspected","commands_run","findings","uncertainties",'
+                    '"confidence","caveats","escalation_recommendation"]}'
+                    "\n</OSS_HANDOFF_JSON>"
+                ),
+            }
+        ]
+    }
+    handled = run_managed_mission_from_body(
+        body,
+        "mission-a3-deepseek",
+        lambda *args, **kwargs: None,
+        call_payload,
+        lambda model: model,
+        request_deadline=30,
+    )
+    assert handled.handled, handled
+    assert handled.status == "PARTIAL", handled
+    assert timeouts and timeouts[0] > 100, timeouts
+
+
 def assert_tool_classes_are_enforced_and_aliases_normalize():
+    normalized = _normalize_arguments({"pattern": "alias", "root": "codex_oss/"})
+    assert normalized == {"pattern": "alias", "path": "codex_oss/"}, normalized
+    read_args, unsupported = _normalize_action_arguments(
+        "rtk_read",
+        {"path": "codex_oss/managed_bridge.py", "offset": 1, "limit": 30},
+    )
+    assert read_args == {
+        "path": "codex_oss/managed_bridge.py",
+        "start_line": 2,
+        "end_line": 31,
+    }, read_args
+    assert unsupported == [], unsupported
+    grep_args, unsupported = _normalize_action_arguments(
+        "rtk_grep",
+        {
+            "path": "codex_oss/",
+            "pattern": "autonomy",
+            "output_context_lines": 2,
+            "options": "-r",
+        },
+    )
+    assert grep_args == {
+        "path": "codex_oss/",
+        "pattern": "autonomy",
+        "context_lines": 2,
+    }, grep_args
+    assert unsupported == [], unsupported
+    plural_path_args, unsupported = _normalize_action_arguments(
+        "rtk_grep",
+        {"paths": ["codex_oss/managed_bridge.py"], "pattern": "mission-a2-flash"},
+    )
+    assert plural_path_args == {
+        "path": "codex_oss/managed_bridge.py",
+        "pattern": "mission-a2-flash",
+    }, plural_path_args
+    assert unsupported == [], unsupported
+
     m = mission(allowed_tool_classes=["read"], tool_budget=2)
     ledger = EvidenceLedger(mission_id=m.mission_id, tool_budget_remaining=m.tool_budget)
     calls = []
@@ -259,6 +547,1965 @@ def assert_tool_classes_are_enforced_and_aliases_normalize():
     assert any("Tool not allowed" in item for item in calls), calls
 
 
+def assert_duplicate_searches_are_suppressed():
+    m = mission(allowed_tool_classes=["search"], tool_budget=3)
+    ledger = EvidenceLedger(mission_id=m.mission_id, tool_budget_remaining=m.tool_budget)
+    calls = []
+
+    def fake_model(messages, tools, timeout):
+        calls.append(messages[-1]["content"])
+        if len(calls) == 1:
+            return {"choices": [{"message": {"content": '{"action_type":"tool_call","tool_name":"rtk_grep","arguments":{"pattern":"MissionV1","path":"codex_oss/","recurse":true}}'}}]}
+        if len(calls) == 2:
+            return {"choices": [{"message": {"content": '{"action_type":"tool_call","tool_name":"rtk_grep","arguments":{"pattern":"MissionV1","root":"codex_oss/","recursive":true}}'}}]}
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": (
+                            '{"action_type":"final_report","report":'
+                            '{"oss_report_version":"1.0","mission_id":"mission_runtime_test",'
+                            '"status":"PARTIAL","confidence":"LOW","files_inspected":[],'
+                            '"commands_run":[],"findings":[],"uncertainties":[],'
+                            '"caveats":["duplicate search suppressed"],'
+                            '"escalation_recommendation":"GPT-5.5 review required",'
+                            '"missing_fields":[]}}'
+                        )
+                    }
+                }
+            ]
+        }
+
+    result = run_loop(m, ledger, fake_model, [], None, m.allowed_roots, m.allowed_paths, request_deadline=30)
+    assert result["status"] == "PARTIAL", result
+    assert ledger.duplicate_actions_blocked == 1, ledger.duplicate_actions_blocked
+    assert len(ledger.commands_run) == 1, ledger.commands_run
+    assert any("[DUPLICATE TOOL]" in item for item in calls), calls
+
+
+def assert_near_deadline_requests_final_report_when_evidence_exists():
+    fixture_path = "runtime_deadline_fixture.txt"
+    with open(fixture_path, "w", encoding="utf-8") as handle:
+        handle.write("deadline fixture evidence\n")
+    try:
+        m = mission(
+            allowed_roots=[],
+            allowed_paths=[fixture_path],
+            allowed_tool_classes=["read"],
+            tool_budget=2,
+        )
+        ledger = EvidenceLedger(mission_id=m.mission_id, tool_budget_remaining=m.tool_budget)
+        calls = []
+        timeouts = []
+
+        def fake_model(messages, tools, timeout):
+            timeouts.append(timeout)
+            calls.append(messages[-1]["content"])
+            if len(calls) == 1:
+                time.sleep(1.2)
+                return {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": (
+                                    '{"action_type":"tool_call","tool_name":"rtk_read",'
+                                    f'"arguments":{{"path":"{fixture_path}"}},'
+                                    '"reason":"Read fixture evidence."}'
+                                )
+                            }
+                        }
+                    ]
+                }
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": (
+                                '{"action_type":"final_report","report":'
+                                '{"oss_report_version":"1.0","mission_id":"mission_runtime_test",'
+                                '"status":"COMPLETE","confidence":"LOW",'
+                                f'"files_inspected":[{{"path":"{fixture_path}","complete":true}}],'
+                                '"commands_run":[],'
+                                '"findings":[{"claim":"The deadline fixture was inspected.",'
+                                f'"evidence_refs":["file:{fixture_path}#extract:1"],'
+                                '"confidence":"LOW"}],'
+                                '"uncertainties":[],"caveats":["deadline final-report path exercised"],'
+                                '"escalation_recommendation":"No escalation required",'
+                                '"missing_fields":[]}}'
+                            )
+                        }
+                    }
+                ]
+            }
+
+        result = run_loop(m, ledger, fake_model, [], None, m.allowed_roots, m.allowed_paths, request_deadline=26)
+        assert result["status"] == "COMPLETE", result
+        assert any("Deadline is near" in item for item in calls), calls
+    finally:
+        try:
+            os.unlink(fixture_path)
+        except FileNotFoundError:
+            pass
+
+
+def assert_runtime_forces_final_report_after_file_evidence_when_budget_is_low():
+    fixture_path = "runtime_low_budget_fixture.txt"
+    with open(fixture_path, "w", encoding="utf-8") as handle:
+        handle.write("runtime alias evidence\n")
+    try:
+        m = mission(
+            allowed_roots=["codex_oss/"],
+            allowed_paths=[fixture_path],
+            allowed_tool_classes=["read", "search"],
+            tool_budget=2,
+        )
+        ledger = EvidenceLedger(mission_id=m.mission_id, tool_budget_remaining=m.tool_budget)
+        calls = []
+        timeouts = []
+
+        def fake_model(messages, tools, timeout):
+            timeouts.append(timeout)
+            calls.append(messages[-1]["content"])
+            if len(calls) == 1:
+                return {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": (
+                                    '{"action_type":"tool_call","tool_name":"rtk_read",'
+                                    f'"arguments":{{"path":"{fixture_path}"}},'
+                                    '"reason":"Read known evidence."}'
+                                )
+                            }
+                        }
+                    ]
+                }
+            if len(calls) == 2:
+                return {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": (
+                                    '{"action_type":"tool_call","tool_name":"rtk_grep",'
+                                    '"arguments":{"pattern":"alias","path":"codex_oss/"},'
+                                    '"reason":"Search again."}'
+                                )
+                            }
+                        }
+                    ]
+                }
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": (
+                                '{"action_type":"final_report","report":'
+                                '{"oss_report_version":"1.0","mission_id":"mission_runtime_test",'
+                                '"status":"COMPLETE","confidence":"LOW",'
+                                f'"files_inspected":[{{"path":"{fixture_path}","complete":true}}],'
+                                '"commands_run":[],'
+                                '"findings":[{"claim":"File evidence was gathered before finalization.",'
+                                f'"evidence_refs":["file:{fixture_path}#extract:1"],'
+                                '"confidence":"LOW"}],'
+                                '"uncertainties":[],"caveats":["runtime forced final report after evidence"],'
+                                '"escalation_recommendation":"No escalation required",'
+                                '"missing_fields":[]}}'
+                            )
+                        }
+                    }
+                ]
+            }
+
+        result = run_loop(m, ledger, fake_model, [], None, m.allowed_roots, m.allowed_paths, request_deadline=90)
+        assert result["status"] == "COMPLETE", result
+        assert len(ledger.commands_run) == 1, ledger.commands_run
+        assert any("After file evidence exists" in item or "Adaptive autonomy budget requires closure" in item for item in calls), calls
+    finally:
+        try:
+            os.unlink(fixture_path)
+        except FileNotFoundError:
+            pass
+
+
+def assert_runtime_traces_followup_search_after_file_evidence():
+    fixture_path = "runtime_after_file_fixture.txt"
+    with open(fixture_path, "w", encoding="utf-8") as handle:
+        handle.write("runtime alias evidence\n")
+    try:
+        m = mission(
+            allowed_roots=["codex_oss/"],
+            allowed_paths=[fixture_path],
+            allowed_tool_classes=["read", "search"],
+            tool_budget=6,
+        )
+        ledger = EvidenceLedger(mission_id=m.mission_id, tool_budget_remaining=m.tool_budget)
+        calls = []
+        timeouts = []
+
+        def fake_model(messages, tools, timeout):
+            timeouts.append(timeout)
+            calls.append(messages[-1]["content"])
+            if len(calls) == 1:
+                return {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": (
+                                    '{"action_type":"tool_call","tool_name":"rtk_read",'
+                                    f'"arguments":{{"path":"{fixture_path}"}},'
+                                    '"reason":"Read known evidence."}'
+                                )
+                            }
+                        }
+                    ]
+                }
+            if len(calls) == 2:
+                return {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": (
+                                    '{"action_type":"tool_call","tool_name":"rtk_grep",'
+                                    '"arguments":{"pattern":"alias","path":"codex_oss/"},'
+                                    '"reason":"Verify the file finding with a targeted follow-up search.",'
+                                    '"hypothesis":"The alias term may have additional confirming references.",'
+                                    '"expected_information_gain":"Confirm whether the file evidence is representative.",'
+                                    '"why_not_report_yet":"Need verification evidence before finalizing."}'
+                                )
+                            }
+                        }
+                    ]
+                }
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": (
+                                '{"action_type":"final_report","report":'
+                                '{"oss_report_version":"1.0","mission_id":"mission_runtime_test",'
+                                '"status":"COMPLETE","confidence":"LOW",'
+                                f'"files_inspected":[{{"path":"{fixture_path}","complete":true}}],'
+                                '"commands_run":[],'
+                                '"findings":[{"claim":"Runtime traced follow-up exploration after file evidence.",'
+                                f'"evidence_refs":["file:{fixture_path}#extract:1"],'
+                                '"confidence":"LOW"}],'
+                                '"uncertainties":[],"caveats":["follow-up exploration was allowed and traced"],'
+                                '"escalation_recommendation":"No escalation required",'
+                                '"missing_fields":[]}}'
+                            )
+                        }
+                    }
+                ]
+            }
+
+        result = run_loop(m, ledger, fake_model, [], None, m.allowed_roots, m.allowed_paths, request_deadline=90)
+        assert result["status"] == "COMPLETE", result
+        assert len(ledger.commands_run) == 2, ledger.commands_run
+        assert len(ledger.action_trace) >= 2, ledger.action_trace
+        assert ledger.action_trace[-1].runtime_decision == "allowed", ledger.action_trace[-1]
+        assert ledger.action_trace[-1].tool_name == "rtk_grep", ledger.action_trace[-1]
+    finally:
+        try:
+            os.unlink(fixture_path)
+        except FileNotFoundError:
+            pass
+
+
+def assert_duplicate_range_read_is_served_from_cached_evidence():
+    fixture_path = "runtime_cached_range_fixture.txt"
+    with open(fixture_path, "w", encoding="utf-8") as handle:
+        handle.write("one\ntwo profile limit\nthree\nfour\n")
+    try:
+        m = mission(
+            allowed_roots=[],
+            allowed_paths=[fixture_path],
+            allowed_tool_classes=["read"],
+            tool_budget=4,
+        )
+        ledger = EvidenceLedger(mission_id=m.mission_id, tool_budget_remaining=m.tool_budget)
+        calls = []
+        timeouts = []
+
+        def fake_model(messages, tools, timeout):
+            timeouts.append(timeout)
+            calls.append(messages[-1]["content"])
+            if len(calls) == 1:
+                return {"choices": [{"message": {"content": json.dumps({
+                    "action_type": "tool_call",
+                    "tool_name": "rtk_read",
+                    "arguments": {"path": fixture_path},
+                    "reason": "Read the whole allowed file.",
+                    "hypothesis": "The fixture contains the profile limit.",
+                    "expected_information_gain": "Gather file evidence.",
+                    "why_not_report_yet": "Need evidence first.",
+                })}}]}
+            if len(calls) == 2:
+                return {"choices": [{"message": {"content": json.dumps({
+                    "action_type": "tool_call",
+                    "tool_name": "rtk_read",
+                    "arguments": {"path": fixture_path, "start_line": 2, "end_line": 2},
+                    "reason": "Extract the exact profile line.",
+                    "hypothesis": "The useful evidence is line 2.",
+                    "expected_information_gain": "Get precise extract.",
+                    "why_not_report_yet": "Need exact line evidence.",
+                })}}]}
+            return {"choices": [{"message": {"content": json.dumps({
+                "action_type": "final_report",
+                "report": {
+                    "oss_report_version": "1.0",
+                    "mission_id": "mission_runtime_test",
+                    "status": "COMPLETE",
+                    "confidence": "LOW",
+                    "files_inspected": [{"path": fixture_path, "complete": True}],
+                    "commands_run": [],
+                    "findings": [{
+                        "claim": "The cached line-range extract was available as evidence.",
+                        "evidence_refs": [f"file:{fixture_path}#extract:2"],
+                        "confidence": "LOW",
+                    }],
+                    "uncertainties": [],
+                    "caveats": [],
+                    "escalation_recommendation": "No escalation required",
+                    "missing_fields": [],
+                },
+            })}}]}
+
+        result = run_loop(m, ledger, fake_model, [], None, m.allowed_roots, m.allowed_paths, request_deadline=90)
+        assert result["status"] == "COMPLETE", result
+        assert ledger.tool_budget_remaining == m.tool_budget - 1, ledger.tool_budget_remaining
+        assert ledger.action_trace[1].runtime_decision == "cache_hit", ledger.action_trace[1]
+        assert ledger.files_inspected[fixture_path].extracts[1]["text"] == "two profile limit\n"
+        assert "Cached range result" in calls[-1], calls
+    finally:
+        try:
+            os.unlink(fixture_path)
+        except FileNotFoundError:
+            pass
+
+
+def assert_duplicate_full_read_returns_cached_extracts_and_requests_report():
+    fixture_path = "runtime_cached_duplicate_fixture.txt"
+    with open(fixture_path, "w", encoding="utf-8") as handle:
+        handle.write("profile limit evidence\n")
+    try:
+        m = mission(
+            allowed_roots=[],
+            allowed_paths=[fixture_path],
+            allowed_tool_classes=["read"],
+            tool_budget=4,
+        )
+        ledger = EvidenceLedger(mission_id=m.mission_id, tool_budget_remaining=m.tool_budget)
+        calls = []
+        duplicate_read_timeouts = []
+
+        def fake_model(messages, tools, timeout):
+            duplicate_read_timeouts.append(timeout)
+            calls.append(messages[-1]["content"])
+            if len(calls) == 1:
+                return {"choices": [{"message": {"content": json.dumps({
+                    "action_type": "tool_call",
+                    "tool_name": "rtk_read",
+                    "arguments": {"path": fixture_path},
+                    "reason": "Read the evidence file.",
+                    "hypothesis": "The file contains the needed evidence.",
+                    "expected_information_gain": "Gather evidence.",
+                    "why_not_report_yet": "Need evidence first.",
+                })}}]}
+            if len(calls) == 2:
+                return {"choices": [{"message": {"content": json.dumps({
+                    "action_type": "tool_call",
+                    "tool_name": "rtk_read",
+                    "arguments": {"path": fixture_path},
+                    "reason": "Read it again for context.",
+                    "hypothesis": "The file may need rechecking.",
+                    "expected_information_gain": "Maybe more context.",
+                    "why_not_report_yet": "Need confidence.",
+                })}}]}
+            return {"choices": [{"message": {"content": json.dumps({
+                "action_type": "final_report",
+                "report": {
+                    "oss_report_version": "1.0",
+                    "mission_id": "mission_runtime_test",
+                    "status": "COMPLETE",
+                    "confidence": "LOW",
+                    "files_inspected": [{"path": fixture_path, "complete": True}],
+                    "commands_run": [],
+                    "findings": [{
+                        "claim": "Cached extracts were enough to report after a duplicate read.",
+                        "evidence_refs": [f"file:{fixture_path}#extract:1"],
+                        "confidence": "LOW",
+                    }],
+                    "uncertainties": [],
+                    "caveats": [],
+                    "escalation_recommendation": "No escalation required",
+                    "missing_fields": [],
+                },
+            })}}]}
+
+        result = run_loop(m, ledger, fake_model, [], None, m.allowed_roots, m.allowed_paths, request_deadline=90)
+        assert result["status"] == "COMPLETE", result
+        assert ledger.duplicate_actions_blocked == 1, ledger.duplicate_actions_blocked
+        assert ledger.action_trace[1].runtime_decision == "redirected", ledger.action_trace[1]
+        assert "Cached extracts" in calls[-1], calls
+        assert "Return exactly one final_report" in calls[-1], calls
+        assert max(duplicate_read_timeouts[2:]) <= 20, duplicate_read_timeouts
+    finally:
+        try:
+            os.unlink(fixture_path)
+        except FileNotFoundError:
+            pass
+
+
+def assert_unsupported_followup_after_file_evidence_redirects_to_report():
+    fixture_path = "runtime_followup_redirect_fixture.txt"
+    with open(fixture_path, "w", encoding="utf-8") as handle:
+        handle.write("runtime autonomy profile lives here\n")
+    try:
+        m = mission(
+            allowed_roots=["codex_oss/"],
+            allowed_paths=[fixture_path],
+            allowed_tool_classes=["read", "search"],
+            tool_budget=6,
+        )
+        ledger = EvidenceLedger(mission_id=m.mission_id, tool_budget_remaining=m.tool_budget)
+        calls = []
+
+        def fake_model(messages, tools, timeout):
+            calls.append(messages[-1]["content"])
+            if len(calls) == 1:
+                return {"choices": [{"message": {"content": json.dumps({
+                    "action_type": "tool_call",
+                    "tool_name": "rtk_read",
+                    "arguments": {"path": fixture_path},
+                    "reason": "Read the relevant fixture.",
+                    "hypothesis": "The fixture has the evidence.",
+                    "expected_information_gain": "Gather file evidence.",
+                    "why_not_report_yet": "Need evidence first.",
+                })}}]}
+            if len(calls) == 2:
+                return {"choices": [{"message": {"content": json.dumps({
+                    "action_type": "tool_call",
+                    "tool_name": "rtk_grep",
+                    "arguments": {"path": fixture_path, "pattern": "autonomy", "flags": "-ri"},
+                    "reason": "Try one more search.",
+                    "hypothesis": "Search may verify the file evidence.",
+                    "expected_information_gain": "Verification.",
+                    "why_not_report_yet": "Need verification.",
+                })}}]}
+            return {"choices": [{"message": {"content": json.dumps({
+                "action_type": "final_report",
+                "report": {
+                    "oss_report_version": "1.0",
+                    "mission_id": "mission_runtime_test",
+                    "status": "COMPLETE",
+                    "confidence": "LOW",
+                    "files_inspected": [{"path": fixture_path, "complete": True}],
+                    "commands_run": [],
+                    "findings": [{
+                        "claim": "File evidence was gathered before the unsupported follow-up.",
+                        "evidence_refs": [f"file:{fixture_path}#extract:1"],
+                        "confidence": "LOW",
+                    }],
+                    "uncertainties": [],
+                    "caveats": [],
+                    "escalation_recommendation": "No escalation required",
+                    "missing_fields": [],
+                },
+            })}}]}
+
+        result = run_loop(m, ledger, fake_model, [], None, m.allowed_roots, m.allowed_paths, request_deadline=90)
+        assert result["status"] == "COMPLETE", result
+        assert ledger.action_trace[1].runtime_decision == "redirected", ledger.action_trace[1]
+        assert "do not call another tool" in calls[-1], calls
+    finally:
+        try:
+            os.unlink(fixture_path)
+        except FileNotFoundError:
+            pass
+
+
+def assert_model_failure_after_evidence_returns_finding_not_empty_partial():
+    fixture_path = "runtime_evidence_finalizer_fixture.txt"
+    with open(fixture_path, "w", encoding="utf-8") as handle:
+        handle.write("mission profile evidence\n")
+    try:
+        m = mission(
+            allowed_roots=[],
+            allowed_paths=[fixture_path],
+            allowed_tool_classes=["read"],
+            tool_budget=3,
+        )
+        ledger = EvidenceLedger(mission_id=m.mission_id, tool_budget_remaining=m.tool_budget)
+        calls = []
+
+        def fake_model(messages, tools, timeout):
+            calls.append(messages[-1]["content"])
+            if len(calls) == 1:
+                return {"choices": [{"message": {"content": json.dumps({
+                    "action_type": "tool_call",
+                    "tool_name": "rtk_read",
+                    "arguments": {"path": fixture_path},
+                    "reason": "Read evidence before finalizing.",
+                    "hypothesis": "The fixture has evidence.",
+                    "expected_information_gain": "Gather evidence.",
+                    "why_not_report_yet": "Need evidence first.",
+                })}}]}
+            raise RuntimeError("simulated finalizer outage")
+
+        result = run_loop(m, ledger, fake_model, [], None, m.allowed_roots, m.allowed_paths, request_deadline=90)
+        assert result["status"] == "PARTIAL", result
+        report = result["report"]
+        assert report["findings"], report
+        assert report["findings"][0]["evidence_refs"] == [f"file:{fixture_path}#extract:1"], report
+        assert "model_call_failed" in " ".join(report["caveats"]), report
+    finally:
+        try:
+            os.unlink(fixture_path)
+        except FileNotFoundError:
+            pass
+
+
+def assert_deterministic_finalizer_extracts_profile_limits_from_cached_evidence():
+    fixture_path = "runtime_profile_finalizer_fixture.py"
+    with open(fixture_path, "w", encoding="utf-8") as handle:
+        handle.write(
+            'RUNTIME_AUTONOMY_PROFILES = {\n'
+            '    "mission-a3-deepseek": {"max_tool_budget": 20, "max_time_seconds": 180},\n'
+            '}\n'
+        )
+    try:
+        m = mission(
+            objective="Find where runtime autonomy profiles are defined and name the DeepSeek A3 limits.",
+            allowed_roots=[],
+            allowed_paths=[fixture_path],
+            allowed_tool_classes=["read"],
+            tool_budget=3,
+        )
+        ledger = EvidenceLedger(mission_id=m.mission_id, tool_budget_remaining=m.tool_budget)
+        calls = []
+
+        def fake_model(messages, tools, timeout):
+            calls.append(messages[-1]["content"])
+            if len(calls) == 1:
+                return {"choices": [{"message": {"content": json.dumps({
+                    "action_type": "tool_call",
+                    "tool_name": "rtk_read",
+                    "arguments": {"path": fixture_path},
+                    "reason": "Read the profile fixture.",
+                    "hypothesis": "The fixture contains profile limits.",
+                    "expected_information_gain": "Gather profile evidence.",
+                    "why_not_report_yet": "Need evidence first.",
+                })}}]}
+            raise RuntimeError("simulated finalizer outage")
+
+        result = run_loop(m, ledger, fake_model, [], None, m.allowed_roots, m.allowed_paths, request_deadline=90)
+        assert result["status"] == "PARTIAL", result
+        finding = result["report"]["findings"][0]
+        assert "mission-a3-deepseek" in finding["claim"], finding
+        assert "max_tool_budget=20" in finding["claim"], finding
+        assert "max_time_seconds=180" in finding["claim"], finding
+        assert finding["evidence_refs"] == [f"file:{fixture_path}#extract:1"], finding
+    finally:
+        try:
+            os.unlink(fixture_path)
+        except FileNotFoundError:
+            pass
+
+
+def assert_deterministic_finalizer_mines_cached_text_beyond_default_extracts():
+    fixture_path = "runtime_profile_finalizer_long_fixture.py"
+    with open(fixture_path, "w", encoding="utf-8") as handle:
+        handle.write("# filler\n" * 180)
+        handle.write(
+            'RUNTIME_AUTONOMY_PROFILES = {\n'
+            '    "mission-a3-deepseek": {"max_tool_budget": 20, "max_time_seconds": 180},\n'
+            '}\n'
+        )
+        handle.write("# trailing filler\n" * 180)
+    try:
+        m = mission(
+            objective="Find where runtime autonomy profiles are defined and name the DeepSeek A3 limits.",
+            allowed_roots=[],
+            allowed_paths=[fixture_path],
+            allowed_tool_classes=["read"],
+            tool_budget=3,
+        )
+        ledger = EvidenceLedger(mission_id=m.mission_id, tool_budget_remaining=m.tool_budget)
+        calls = []
+
+        def fake_model(messages, tools, timeout):
+            calls.append(messages[-1]["content"])
+            if len(calls) == 1:
+                return {"choices": [{"message": {"content": json.dumps({
+                    "action_type": "tool_call",
+                    "tool_name": "rtk_read",
+                    "arguments": {"path": fixture_path},
+                    "reason": "Read the long profile fixture.",
+                    "hypothesis": "The file contains profile limits beyond the first extract.",
+                    "expected_information_gain": "Gather profile evidence.",
+                    "why_not_report_yet": "Need evidence first.",
+                })}}]}
+            raise RuntimeError("simulated finalizer outage")
+
+        result = run_loop(m, ledger, fake_model, [], None, m.allowed_roots, m.allowed_paths, request_deadline=90)
+        finding = result["report"]["findings"][0]
+        assert "mission-a3-deepseek" in finding["claim"], finding
+        assert "max_tool_budget=20" in finding["claim"], finding
+        assert "max_time_seconds=180" in finding["claim"], finding
+        assert finding["evidence_refs"][-1].startswith(f"file:{fixture_path}#extract:"), finding
+    finally:
+        try:
+            os.unlink(fixture_path)
+        except FileNotFoundError:
+            pass
+
+
+def assert_deterministic_finalizer_does_not_treat_symbol_mentions_as_definitions():
+    fixture_path = "runtime_profile_mention_not_definition_fixture.py"
+    with open(fixture_path, "w", encoding="utf-8") as handle:
+        handle.write(
+            'def helper(text):\n'
+            '    if "RUNTIME_AUTONOMY_PROFILES" not in text:\n'
+            '        return None\n'
+            '    return "mission-a3-deepseek"\n'
+        )
+    try:
+        m = mission(
+            objective="Find where runtime autonomy profiles are defined and name the DeepSeek A3 limits.",
+            allowed_roots=[],
+            allowed_paths=[fixture_path],
+            allowed_tool_classes=["read"],
+            tool_budget=3,
+        )
+        ledger = EvidenceLedger(mission_id=m.mission_id, tool_budget_remaining=m.tool_budget)
+        calls = []
+
+        def fake_model(messages, tools, timeout):
+            calls.append(messages[-1]["content"])
+            if len(calls) == 1:
+                return {"choices": [{"message": {"content": json.dumps({
+                    "action_type": "tool_call",
+                    "tool_name": "rtk_read",
+                    "arguments": {"path": fixture_path},
+                    "reason": "Read helper fixture.",
+                    "hypothesis": "The fixture may mention profile terms.",
+                    "expected_information_gain": "Gather evidence.",
+                    "why_not_report_yet": "Need evidence first.",
+                })}}]}
+            raise RuntimeError("simulated finalizer outage")
+
+        result = run_loop(m, ledger, fake_model, [], None, m.allowed_roots, m.allowed_paths, request_deadline=90)
+        finding = result["report"]["findings"][0]
+        assert "are defined in" not in finding["claim"], finding
+        assert "max_tool_budget" not in finding["claim"], finding
+    finally:
+        try:
+            os.unlink(fixture_path)
+        except FileNotFoundError:
+            pass
+
+
+def assert_range_read_does_not_block_later_full_read_or_finalizer_claim():
+    fixture_path = "runtime_range_then_full_profile_fixture.py"
+    with open(fixture_path, "w", encoding="utf-8") as handle:
+        handle.write(
+            'RUNTIME_AUTONOMY_PROFILES = {\n'
+            '    "mission-a3-deepseek": {"max_tool_budget": 20, "max_time_seconds": 180},\n'
+            '}\n'
+            '# filler\n' * 140
+        )
+    try:
+        m = mission(
+            objective="Find where runtime autonomy profiles are defined and name the DeepSeek A3 limits.",
+            allowed_roots=[],
+            allowed_paths=[fixture_path],
+            allowed_tool_classes=["read"],
+            tool_budget=4,
+        )
+        ledger = EvidenceLedger(mission_id=m.mission_id, tool_budget_remaining=m.tool_budget)
+        calls = []
+
+        def fake_model(messages, tools, timeout):
+            calls.append(messages[-1]["content"])
+            if len(calls) == 1:
+                return {"choices": [{"message": {"content": json.dumps({
+                    "action_type": "tool_call",
+                    "tool_name": "rtk_read",
+                    "arguments": {"path": fixture_path, "start_line": 100, "end_line": 120},
+                    "reason": "Read an initially wrong range.",
+                    "hypothesis": "The useful profile may be lower in the file.",
+                    "expected_information_gain": "Try a candidate range.",
+                    "why_not_report_yet": "Need profile evidence.",
+                })}}]}
+            if len(calls) == 2:
+                return {"choices": [{"message": {"content": json.dumps({
+                    "action_type": "tool_call",
+                    "tool_name": "rtk_read",
+                    "arguments": {"path": fixture_path},
+                    "reason": "Read the full file after the range was insufficient.",
+                    "hypothesis": "The profile definition may be elsewhere in the file.",
+                    "expected_information_gain": "Gather complete file evidence.",
+                    "why_not_report_yet": "Need exact limits.",
+                })}}]}
+            raise RuntimeError("simulated finalizer outage")
+
+        result = run_loop(m, ledger, fake_model, [], None, m.allowed_roots, m.allowed_paths, request_deadline=90)
+        assert len(ledger.commands_run) == 2, ledger.commands_run
+        assert ledger.files_inspected[fixture_path].complete is True, ledger.files_inspected[fixture_path]
+        finding = result["report"]["findings"][0]
+        assert "mission-a3-deepseek" in finding["claim"], finding
+        assert "max_tool_budget=20" in finding["claim"], finding
+    finally:
+        try:
+            os.unlink(fixture_path)
+        except FileNotFoundError:
+            pass
+
+
+def assert_definition_claims_require_definition_shaped_evidence():
+    path = "codex_oss/runtime/policy.py"
+    ledger = EvidenceLedger(mission_id="mission_runtime_test", tool_budget_remaining=1)
+    result = ToolResult(
+        tool="rtk_read",
+        args={"path": path},
+        stdout=(
+            'needles.extend(["RUNTIME_AUTONOMY_PROFILES", "mission-a3-deepseek"])\n'
+            'if not re.search(r"\\\\bRUNTIME_AUTONOMY_PROFILES\\\\s*=", text):\n'
+            "    return None\n"
+        ),
+        stderr="",
+        exit_code=0,
+        complete=True,
+    )
+    ledger.add_file(path, result, 0)
+    report = {
+        "oss_report_version": "1.0",
+        "mission_id": "mission_runtime_test",
+        "status": "COMPLETE",
+        "confidence": "LOW",
+        "files_inspected": [{"path": path, "complete": True}],
+        "commands_run": [],
+        "findings": [
+            {
+                "claim": (
+                    "Runtime autonomy profiles are defined in codex_oss/runtime/policy.py; "
+                    "the file contains a RUNTIME_AUTONOMY_PROFILES dictionary."
+                ),
+                "evidence_refs": [f"file:{path}#extract:1"],
+                "confidence": "LOW",
+            }
+        ],
+        "uncertainties": [],
+        "caveats": [],
+        "escalation_recommendation": "No escalation required",
+        "missing_fields": [],
+    }
+
+    validation = validate_report(report, ledger)
+    assert validation.is_valid is False, validation
+    assert "definition assignment" in " ".join(validation.errors), validation.errors
+
+
+def assert_definition_claims_can_be_supported_by_command_evidence():
+    ledger = EvidenceLedger(mission_id="mission_runtime_test", tool_budget_remaining=1)
+    command_result = ToolResult(
+        tool="rtk_grep",
+        args={"path": "codex_oss/", "pattern": "RUNTIME_AUTONOMY_PROFILES"},
+        stdout="codex_oss/managed_bridge.py:40:RUNTIME_AUTONOMY_PROFILES = {\n",
+        stderr="",
+        exit_code=0,
+        complete=True,
+    )
+    ledger.add_command("rtk_grep", command_result.args, command_result, 0)
+    report = {
+        "oss_report_version": "1.0",
+        "mission_id": "mission_runtime_test",
+        "status": "COMPLETE",
+        "confidence": "LOW",
+        "files_inspected": [],
+        "commands_run": [{"tool": "rtk_grep", "args": command_result.args}],
+        "findings": [
+            {
+                "claim": "Runtime autonomy profiles are defined in codex_oss/managed_bridge.py by RUNTIME_AUTONOMY_PROFILES.",
+                "evidence_refs": ["command:0"],
+                "confidence": "LOW",
+            }
+        ],
+        "uncertainties": [],
+        "caveats": [],
+        "escalation_recommendation": "No escalation required",
+        "missing_fields": [],
+    }
+
+    validation = validate_report(report, ledger)
+    assert validation.is_valid is True, validation.errors
+
+
+def assert_deterministic_finalizer_mines_command_profile_evidence():
+    from codex_oss.runtime.policy import build_deterministic_partial_report
+
+    m = mission(
+        objective="Find where runtime autonomy profiles are defined and name the DeepSeek A3 limits.",
+        allowed_tool_classes=["search"],
+    )
+    ledger = EvidenceLedger(mission_id=m.mission_id, tool_budget_remaining=1)
+    definition = ToolResult(
+        tool="rtk_grep",
+        args={"path": "codex_oss/", "pattern": "RUNTIME_AUTONOMY_PROFILES"},
+        stdout="codex_oss/managed_bridge.py:40:RUNTIME_AUTONOMY_PROFILES = {\n",
+        stderr="",
+        exit_code=0,
+        complete=True,
+    )
+    profile = ToolResult(
+        tool="rtk_grep",
+        args={"path": "codex_oss/", "pattern": "mission-a3-deepseek"},
+        stdout='codex_oss/managed_bridge.py:45:    "mission-a3-deepseek": {"max_tool_budget": 20, "max_time_seconds": 180},\n',
+        stderr="",
+        exit_code=0,
+        complete=True,
+    )
+    ledger.add_command("rtk_grep", definition.args, definition, 0)
+    ledger.add_command("rtk_grep", profile.args, profile, 1)
+
+    report = build_deterministic_partial_report(m, ledger, "deadline_reached")
+    finding = report["findings"][0]
+    assert "codex_oss/managed_bridge.py" in finding["claim"], finding
+    assert "max_tool_budget=20" in finding["claim"], finding
+    assert finding["evidence_refs"] == ["command:0", "command:1"], finding
+
+
+def assert_deterministic_finalizer_mines_alias_mapping_from_file_evidence():
+    from codex_oss.runtime.policy import build_deterministic_partial_report
+
+    m = mission(
+        objective="Find where runtime model aliases map mission-a3-kimi to the underlying reasoning model.",
+        allowed_tool_classes=["read"],
+    )
+    ledger = EvidenceLedger(mission_id=m.mission_id, tool_budget_remaining=1)
+    result = ToolResult(
+        tool="rtk_read",
+        args={"path": "codex_oss/managed_bridge.py"},
+        stdout=(
+            'RUNTIME_MODEL_ALIASES = {\n'
+            '    "mission-a2-kimi": "ocg-kimi-k2.6",\n'
+            '    "mission-a3-kimi": "ocg-kimi-k2.6",\n'
+            '}\n'
+        ),
+        stderr="",
+        exit_code=0,
+        complete=True,
+    )
+    ledger.add_file("codex_oss/managed_bridge.py", result, 0)
+
+    report = build_deterministic_partial_report(m, ledger, "model_call_failed")
+    finding = report["findings"][0]
+    assert "mission-a3-kimi" in finding["claim"], finding
+    assert "ocg-kimi-k2.6" in finding["claim"], finding
+    assert finding["evidence_refs"] == ["file:codex_oss/managed_bridge.py#extract:1"], finding
+
+
+def assert_deterministic_finalizer_mines_validator_module_evidence():
+    from codex_oss.runtime.policy import build_deterministic_partial_report
+
+    m = mission(
+        objective="Find whether the runtime has a ValidatedReportV1 validator module.",
+        allowed_tool_classes=["read"],
+    )
+    ledger = EvidenceLedger(mission_id=m.mission_id, tool_budget_remaining=1)
+    result = ToolResult(
+        tool="rtk_read",
+        args={"path": "codex_oss/validation/__init__.py"},
+        stdout=(
+            '"""ValidatedReportV1 — strict report schema validation with evidence refs."""\n'
+            "def validate_report(report: dict, ledger=None):\n"
+            "    return ValidationResult(True)\n"
+        ),
+        stderr="",
+        exit_code=0,
+        complete=True,
+    )
+    ledger.add_file("codex_oss/validation/__init__.py", result, 0)
+
+    report = build_deterministic_partial_report(m, ledger, "model_call_failed")
+    finding = report["findings"][0]
+    assert "ValidatedReportV1 validator module" in finding["claim"], finding
+    assert "codex_oss/validation/__init__.py" in finding["claim"], finding
+
+
+def assert_objective_specs_handle_generic_config_function_and_zero_match():
+    config_mission = mission(
+        objective="Find APP_LIMITS worker config values max_jobs and timeout_seconds.",
+        allowed_tool_classes=["read"],
+    )
+    config_ledger = EvidenceLedger(mission_id=config_mission.mission_id, tool_budget_remaining=1)
+    config_result = ToolResult(
+        tool="rtk_read",
+        args={"path": "settings.py"},
+        stdout='APP_LIMITS = {"worker": {"max_jobs": 4, "timeout_seconds": 60}}\n',
+        stderr="",
+        exit_code=0,
+        complete=True,
+    )
+    config_ledger.add_file("settings.py", config_result, 0)
+    config_spec = classify_objective(config_mission)
+    assert config_spec.objective_type == "config_value_extraction", config_spec
+    config_finding = synthesize_objective_finding(config_mission, config_ledger)
+    assert "max_jobs=4" in config_finding["claim"], config_finding
+    assert "timeout_seconds=60" in config_finding["claim"], config_finding
+
+    function_mission = mission(
+        objective="Find function locate_widget and return the file path.",
+        allowed_tool_classes=["read"],
+    )
+    function_ledger = EvidenceLedger(mission_id=function_mission.mission_id, tool_budget_remaining=1)
+    function_result = ToolResult(
+        tool="rtk_read",
+        args={"path": "widgets.py"},
+        stdout="def locate_widget(name):\n    return name\n",
+        stderr="",
+        exit_code=0,
+        complete=True,
+    )
+    function_ledger.add_file("widgets.py", function_result, 0)
+    function_spec = classify_objective(function_mission)
+    assert function_spec.objective_type == "function_location", function_spec
+    function_finding = synthesize_objective_finding(function_mission, function_ledger)
+    assert "locate_widget is defined in widgets.py" in function_finding["claim"], function_finding
+
+    grep_function_ledger = EvidenceLedger(mission_id=function_mission.mission_id, tool_budget_remaining=1)
+    grep_function_result = ToolResult(
+        tool="rtk_grep",
+        args={"pattern": "locate_widget", "path": "widgets.py"},
+        stdout="widgets.py:1:def locate_widget(name):\nwidgets.py:2:    return name\n",
+        stderr="",
+        exit_code=0,
+        complete=True,
+    )
+    grep_function_ledger.add_command("rtk_grep", grep_function_result.args, grep_function_result, 0)
+    grep_function_finding = synthesize_objective_finding(function_mission, grep_function_ledger)
+    assert grep_function_finding is not None, "grep-prefixed function definitions should satisfy function_location"
+    assert grep_function_finding["evidence_refs"] == ["command:0"], grep_function_finding
+    assert "locate_widget is defined in widgets.py" in grep_function_finding["claim"], grep_function_finding
+
+    rtk_grep_function_ledger = EvidenceLedger(mission_id=function_mission.mission_id, tool_budget_remaining=1)
+    rtk_grep_function_result = ToolResult(
+        tool="rtk_grep",
+        args={"pattern": "locate_widget", "path": "widgets.py"},
+        stdout="1 matches in 1F:\n\n[file] widgets.py (1):\n    1: def locate_widget(name):\n",
+        stderr="",
+        exit_code=0,
+        complete=True,
+    )
+    rtk_grep_function_ledger.add_command("rtk_grep", rtk_grep_function_result.args, rtk_grep_function_result, 0)
+    rtk_grep_function_finding = synthesize_objective_finding(function_mission, rtk_grep_function_ledger)
+    assert rtk_grep_function_finding is not None, "RTK-formatted grep definitions should satisfy function_location"
+    assert rtk_grep_function_finding["evidence_refs"] == ["command:0"], rtk_grep_function_finding
+    assert "locate_widget is defined in widgets.py" in rtk_grep_function_finding["claim"], rtk_grep_function_finding
+
+    zero_mission = mission(
+        objective='Confirm zero-match evidence for "unsafe_command" under src/.',
+        allowed_tool_classes=["search"],
+    )
+    zero_ledger = EvidenceLedger(mission_id=zero_mission.mission_id, tool_budget_remaining=1)
+    zero_result = ToolResult(
+        tool="rtk_grep",
+        args={"pattern": "unsafe_command", "path": "src/"},
+        stdout="0 matches for unsafe_command\n",
+        stderr="",
+        exit_code=1,
+        complete=True,
+    )
+    zero_ledger.add_command("rtk_grep", zero_result.args, zero_result, 0)
+    zero_spec = classify_objective(zero_mission)
+    assert zero_spec.objective_type == "zero_match_evidence", zero_spec
+    zero_finding = synthesize_objective_finding(zero_mission, zero_ledger)
+    assert "No matches for 'unsafe_command'" in zero_finding["claim"], zero_finding
+    assert zero_finding["evidence_refs"] == ["command:0#zero_match"], zero_finding
+
+
+def assert_config_value_extraction_uses_target_block_not_first_fields():
+    config_mission = mission(
+        objective="Find mission-a3-deepseek profile limits.",
+        allowed_tool_classes=["read"],
+        allow_heuristic_objective=False,
+        objective_spec={
+            "schema_version": "objective_spec.v1",
+            "objective_type": "config_value_extraction",
+            "target": {"key": "mission-a3-deepseek"},
+            "required_values": ["max_tool_budget", "max_time_seconds"],
+            "required_outputs": ["file_path", "max_tool_budget", "max_time_seconds", "evidence_ref"],
+            "required_evidence_shapes": ["dictionary_entry"],
+        },
+    )
+    config_ledger = EvidenceLedger(mission_id=config_mission.mission_id, tool_budget_remaining=1)
+    config_result = ToolResult(
+        tool="rtk_read",
+        args={"path": "managed_bridge.py"},
+        stdout=(
+            'RUNTIME_MODEL_ALIASES = {"mission-a3-deepseek": "ocg-deepseek-v4-pro"}\n'
+            'RUNTIME_AUTONOMY_PROFILES = {\n'
+            '    "mission-a2-flash": {"max_tool_budget": 8, "max_time_seconds": 90},\n'
+            '    "mission-a3-deepseek": {"max_tool_budget": 20, "max_time_seconds": 180},\n'
+            '}\n'
+        ),
+        stderr="",
+        exit_code=0,
+        complete=True,
+    )
+    config_ledger.add_file("managed_bridge.py", config_result, 0)
+    config_finding = synthesize_objective_finding(config_mission, config_ledger)
+    assert "max_tool_budget=20" in config_finding["claim"], config_finding
+    assert "max_time_seconds=180" in config_finding["claim"], config_finding
+    assert "max_tool_budget=8" not in config_finding["claim"], config_finding
+
+
+def assert_mission_accepts_explicit_objective_spec_and_strict_mode():
+    explicit = mission(
+        objective="Locate the runtime report validator.",
+        allow_heuristic_objective=False,
+        objective_spec={
+            "schema_version": "objective_spec.v1",
+            "objective_type": "function_location",
+            "target": {"symbol": "validate_report"},
+            "required_outputs": ["file_path", "symbol_name", "evidence_ref"],
+            "required_evidence_shapes": ["function_definition"],
+        },
+    )
+    assert explicit.objective_spec["objective_type"] == "function_location", explicit.objective_spec
+    assert explicit.allow_heuristic_objective is False, explicit
+    spec = classify_objective(explicit)
+    assert spec.explicit is True, spec
+    assert spec.target == "validate_report", spec
+
+    try:
+        mission(allow_heuristic_objective=False)
+    except InvalidHandoffError as exc:
+        assert "objective_spec" in str(exc), exc
+    else:
+        raise AssertionError("strict A3 mission without objective_spec should fail closed")
+
+    try:
+        mission(objective_spec={"schema_version": "objective_spec.v1", "objective_type": "made_up"})
+    except InvalidHandoffError as exc:
+        assert "objective_spec.objective_type" in str(exc), exc
+    else:
+        raise AssertionError("unknown objective_spec type should fail closed")
+
+
+def assert_explicit_objective_spec_overrides_prose_classifier():
+    m = mission(
+        objective="Find function mission-a3-kimi and return file path.",
+        allowed_tool_classes=["read"],
+        allow_heuristic_objective=False,
+        objective_spec={
+            "schema_version": "objective_spec.v1",
+            "objective_type": "mapping_lookup",
+            "target": {"key": "mission-a3-kimi"},
+            "required_outputs": ["mapped_value", "mapping_file", "evidence_ref"],
+            "required_evidence_shapes": ["mapping_assignment"],
+        },
+    )
+    spec = classify_objective(m)
+    assert spec.objective_type == "mapping_lookup", spec
+    assert spec.target == "mission-a3-kimi", spec
+
+    ledger = EvidenceLedger(mission_id=m.mission_id, tool_budget_remaining=1)
+    result = ToolResult(
+        tool="rtk_read",
+        args={"path": "bridge_models.py"},
+        stdout='ALIASES = {"mission-a3-kimi": "ocg-kimi-k2.6"}\n',
+        stderr="",
+        exit_code=0,
+        complete=True,
+    )
+    ledger.add_file("bridge_models.py", result, 0)
+    finding = synthesize_objective_finding(m, ledger)
+    assert "mission-a3-kimi" in finding["claim"], finding
+    assert "ocg-kimi-k2.6" in finding["claim"], finding
+
+
+def assert_complete_report_with_explicit_spec_requires_required_value():
+    fixture_path = "runtime_explicit_alias_fixture.py"
+    with open(fixture_path, "w", encoding="utf-8") as handle:
+        handle.write('ALIASES = {"mission-a3-kimi": "ocg-kimi-k2.6"}\n')
+    try:
+        m = mission(
+            objective="Return the mapped runtime model.",
+            allowed_roots=[],
+            allowed_paths=[fixture_path],
+            allowed_tool_classes=["read"],
+            tool_budget=3,
+            allow_heuristic_objective=False,
+            objective_spec={
+                "schema_version": "objective_spec.v1",
+                "objective_type": "mapping_lookup",
+                "target": {"key": "mission-a3-kimi"},
+                "required_outputs": ["mapped_value", "mapping_file", "evidence_ref"],
+                "required_evidence_shapes": ["mapping_assignment"],
+            },
+        )
+        ledger = EvidenceLedger(mission_id=m.mission_id, tool_budget_remaining=m.tool_budget)
+        calls = []
+
+        def fake_model(messages, tools, timeout):
+            calls.append(messages[-1]["content"])
+            if len(calls) == 1:
+                return {"choices": [{"message": {"content": json.dumps({
+                    "action_type": "tool_call",
+                    "tool_name": "rtk_read",
+                    "arguments": {"path": fixture_path},
+                    "reason": "Read explicit alias contract evidence.",
+                    "hypothesis": "The file contains a key/value alias mapping.",
+                    "expected_information_gain": "Find the mapped model value.",
+                    "why_not_report_yet": "Need evidence first.",
+                })}}]}
+            if len(calls) == 2:
+                return {"choices": [{"message": {"content": json.dumps({
+                    "action_type": "final_report",
+                    "report": {
+                        "oss_report_version": "1.0",
+                        "mission_id": "mission_runtime_test",
+                        "status": "COMPLETE",
+                        "confidence": "LOW",
+                        "files_inspected": [{"path": fixture_path, "complete": True}],
+                        "commands_run": [],
+                        "findings": [{
+                            "claim": f"Runtime model alias mission-a3-kimi is listed in {fixture_path}.",
+                            "evidence_refs": [f"file:{fixture_path}#extract:1"],
+                            "confidence": "LOW",
+                        }],
+                        "uncertainties": ["mapped value omitted"],
+                        "caveats": [],
+                        "escalation_recommendation": "No escalation required",
+                        "missing_fields": [],
+                    },
+                })}}]}
+            return {"choices": [{"message": {"content": json.dumps({
+                "action_type": "final_report",
+                "report": {
+                    "oss_report_version": "1.0",
+                    "mission_id": "mission_runtime_test",
+                    "status": "COMPLETE",
+                    "confidence": "LOW",
+                    "files_inspected": [{"path": fixture_path, "complete": True}],
+                    "commands_run": [],
+                    "findings": [{
+                        "claim": f"Runtime model alias mission-a3-kimi maps to underlying reasoning model ocg-kimi-k2.6 in {fixture_path}.",
+                        "evidence_refs": [f"file:{fixture_path}#extract:1"],
+                        "confidence": "LOW",
+                    }],
+                    "uncertainties": [],
+                    "caveats": [],
+                    "escalation_recommendation": "No escalation required",
+                    "missing_fields": [],
+                },
+            })}}]}
+
+        result = run_loop(m, ledger, fake_model, [], None, m.allowed_roots, m.allowed_paths, request_deadline=90)
+        assert result["status"] == "COMPLETE", result
+        assert any("objective coverage" in item for item in calls), calls
+        assert "ocg-kimi-k2.6" in result["report"]["findings"][0]["claim"], result
+    finally:
+        try:
+            os.unlink(fixture_path)
+        except FileNotFoundError:
+            pass
+
+
+def assert_explicit_objective_satisfaction_switches_to_short_closure():
+    fixture_path = "runtime_explicit_satisfied_fixture.py"
+    with open(fixture_path, "w", encoding="utf-8") as handle:
+        handle.write('ALIASES = {"mission-a3-kimi": "ocg-kimi-k2.6"}\n')
+    try:
+        m = mission(
+            objective="Return the mapped runtime model.",
+            allowed_roots=[],
+            allowed_paths=[fixture_path],
+            allowed_tool_classes=["read"],
+            tool_budget=4,
+            allow_heuristic_objective=False,
+            objective_spec={
+                "schema_version": "objective_spec.v1",
+                "objective_type": "mapping_lookup",
+                "target": {"key": "mission-a3-kimi"},
+                "required_outputs": ["mapped_value", "mapping_file", "evidence_ref"],
+                "required_evidence_shapes": ["mapping_assignment"],
+            },
+        )
+        ledger = EvidenceLedger(mission_id=m.mission_id, tool_budget_remaining=m.tool_budget)
+        calls = []
+        closure_timeouts = []
+
+        def fake_model(messages, tools, timeout):
+            closure_timeouts.append(timeout)
+            calls.append(messages[-1]["content"])
+            if len(calls) == 1:
+                return {"choices": [{"message": {"content": json.dumps({
+                    "action_type": "tool_call",
+                    "tool_name": "rtk_read",
+                    "arguments": {"path": fixture_path},
+                    "reason": "Read alias evidence.",
+                    "hypothesis": "The mapping is in this allowed file.",
+                    "expected_information_gain": "Capture the mapped model.",
+                    "why_not_report_yet": "Need evidence first.",
+                })}}]}
+            return {"choices": [{"message": {"content": json.dumps({
+                "action_type": "final_report",
+                "report": {
+                    "oss_report_version": "1.0",
+                    "mission_id": "mission_runtime_test",
+                    "status": "COMPLETE",
+                    "confidence": "LOW",
+                    "files_inspected": [{"path": fixture_path, "complete": True}],
+                    "commands_run": [],
+                    "findings": [{
+                        "claim": f"Runtime model alias mission-a3-kimi maps to underlying reasoning model ocg-kimi-k2.6 in {fixture_path}.",
+                        "evidence_refs": [f"file:{fixture_path}#extract:1"],
+                        "confidence": "LOW",
+                    }],
+                    "uncertainties": [],
+                    "caveats": [],
+                    "escalation_recommendation": "No escalation required",
+                    "missing_fields": [],
+                },
+            })}}]}
+
+        result = run_loop(m, ledger, fake_model, [], None, m.allowed_roots, m.allowed_paths, request_deadline=90)
+        assert result["status"] == "COMPLETE", result
+        assert any("explicit objective_spec appears satisfied" in item for item in calls), calls
+        assert closure_timeouts[1] <= 20, closure_timeouts
+    finally:
+        try:
+            os.unlink(fixture_path)
+        except FileNotFoundError:
+            pass
+
+
+def assert_deterministic_finalizer_can_complete_explicit_satisfied_objective():
+    from codex_oss.runtime.policy import build_deterministic_partial_report
+
+    m = mission(
+        objective="Return the mapped runtime model.",
+        allowed_tool_classes=["read"],
+        allow_heuristic_objective=False,
+        objective_spec={
+            "schema_version": "objective_spec.v1",
+            "objective_type": "mapping_lookup",
+            "target": {"key": "mission-a3-kimi"},
+            "required_outputs": ["mapped_value", "mapping_file", "evidence_ref"],
+            "required_evidence_shapes": ["mapping_assignment"],
+        },
+    )
+    ledger = EvidenceLedger(mission_id=m.mission_id, tool_budget_remaining=1)
+    result = ToolResult(
+        tool="rtk_read",
+        args={"path": "managed_bridge.py"},
+        stdout='ALIASES = {"mission-a3-kimi": "ocg-kimi-k2.6"}\n',
+        stderr="",
+        exit_code=0,
+        complete=True,
+    )
+    ledger.add_file("managed_bridge.py", result, 0)
+    report = build_deterministic_partial_report(m, ledger, "deadline_final_report_ignored")
+    assert report["status"] == "COMPLETE", report
+    assert "runtime-synthesized" in report["escalation_recommendation"], report
+    assert report["report_source"] == "runtime_finalizer", report
+
+
+def assert_deterministic_finalizer_can_complete_explicit_rtk_grep_function_location():
+    from codex_oss.runtime.policy import build_deterministic_partial_report
+
+    m = mission(
+        objective="Find where run_managed_mission_from_body is defined and return the file path.",
+        allowed_tool_classes=["search"],
+        allow_heuristic_objective=False,
+        objective_spec={
+            "schema_version": "objective_spec.v1",
+            "objective_type": "function_location",
+            "target": {"symbol": "run_managed_mission_from_body"},
+            "required_outputs": ["file_path", "symbol_name", "evidence_ref"],
+            "required_evidence_shapes": ["function_definition"],
+        },
+    )
+    ledger = EvidenceLedger(mission_id=m.mission_id, tool_budget_remaining=1)
+    result = ToolResult(
+        tool="rtk_grep",
+        args={"pattern": "run_managed_mission_from_body", "path": "codex_oss/managed_bridge.py"},
+        stdout=(
+            "1 matches in 1F:\n\n"
+            "[file] codex_oss/managed_bridge.py (1):\n"
+            "    75: def run_managed_mission_from_body(\n"
+        ),
+        stderr="",
+        exit_code=0,
+        complete=True,
+    )
+    ledger.add_command("rtk_grep", result.args, result, 0)
+
+    report = build_deterministic_partial_report(m, ledger, "report_validation_failed")
+    assert report["status"] == "COMPLETE", report
+    assert "run_managed_mission_from_body" in report["findings"][0]["claim"], report
+    assert "codex_oss/managed_bridge.py" in report["findings"][0]["claim"], report
+    assert report["findings"][0]["evidence_refs"] == ["command:0"], report
+
+
+def assert_model_reports_are_annotated_with_runtime_provenance():
+    m = mission()
+    m.runtime_model_alias = "mission-a3-kimi"
+    m.last_reasoning_model = "ocg-kimi-k2.6"
+    ledger = EvidenceLedger(mission_id=m.mission_id, tool_budget_remaining=m.tool_budget)
+
+    calls = []
+
+    def fake_model(messages, tools, timeout):
+        calls.append(messages)
+        if len(calls) == 1:
+            return {"choices": [{"message": {"content": json.dumps({
+                "action_type": "tool_call",
+                "tool_name": "rtk_read",
+                "arguments": {"path": "codex_oss/runtime/loop.py"},
+                "reason": "Collect evidence.",
+                "hypothesis": "Runtime loop file contains the relevant text.",
+                "expected_information_gain": "Evidence ref for report.",
+                "why_not_report_yet": "Need evidence first.",
+            })}}]}
+        return {"choices": [{"message": {"content": json.dumps({
+            "action_type": "final_report",
+            "report": {
+                "oss_report_version": "1.0",
+                "mission_id": m.mission_id,
+                "status": "PARTIAL",
+                "confidence": "LOW",
+                "files_inspected": [{"path": "codex_oss/runtime/loop.py", "complete": True}],
+                "commands_run": [],
+                "findings": [{
+                    "claim": "The runtime loop file was inspected.",
+                    "evidence_refs": ["file:codex_oss/runtime/loop.py#extract:1"],
+                    "confidence": "LOW",
+                }],
+                "uncertainties": [],
+                "caveats": [],
+                "escalation_recommendation": "GPT-5.5 review required",
+                "missing_fields": [],
+            },
+        })}}]}
+
+    result = run_loop(m, ledger, fake_model, [], None, m.allowed_roots, m.allowed_paths, request_deadline=30)
+    report = result["report"]
+    assert report["report_source"] == "model_report", report
+    assert report["runtime_model_alias"] == "mission-a3-kimi", report
+    assert report["explorer_model"] == "ocg-kimi-k2.6", report
+
+
+def assert_concurrency_policy_serializes_with_small_queue():
+    from codex_oss.runtime import policy
+
+    with policy._active_missions_lock:
+        policy._active_missions.clear()
+        policy._waiting_missions = 0
+
+    acquired, reason = policy.acquire_mission_slot("mission_first")
+    assert acquired, reason
+    result = {}
+
+    def acquire_second():
+        result["value"] = policy.acquire_mission_slot("mission_second")
+
+    thread = threading.Thread(target=acquire_second)
+    thread.start()
+    time.sleep(0.2)
+    assert "value" not in result, result
+    policy.release_mission_slot("mission_first")
+    thread.join(timeout=2)
+    assert result.get("value", (False, "missing"))[0] is True, result
+    policy.release_mission_slot("mission_second")
+
+
+def assert_adaptive_autonomy_budget_redirects_excess_broad_searches():
+    first_path = "runtime_broad_one.py"
+    second_path = "runtime_broad_two.py"
+    with open(first_path, "w", encoding="utf-8") as handle:
+        handle.write("alpha = 1\n")
+    with open(second_path, "w", encoding="utf-8") as handle:
+        handle.write("beta = 2\n")
+    try:
+        m = mission(
+            objective="Explore broad runtime terms, then report.",
+            allowed_roots=[],
+            allowed_paths=[first_path, second_path],
+            allowed_tool_classes=["search"],
+            tool_budget=4,
+            max_broad_searches=1,
+        )
+        ledger = EvidenceLedger(mission_id=m.mission_id, tool_budget_remaining=m.tool_budget)
+        calls = []
+
+        def fake_model(messages, tools, timeout):
+            calls.append(messages[-1]["content"])
+            if len(calls) == 1:
+                content = {
+                    "action_type": "tool_call",
+                    "tool_name": "rtk_grep",
+                    "arguments": {"path": first_path, "pattern": "alpha"},
+                    "reason": "Initial broad search.",
+                    "hypothesis": "A relevant marker may exist.",
+                    "expected_information_gain": "Find first marker.",
+                    "why_not_report_yet": "Need evidence.",
+                }
+            elif len(calls) == 2:
+                content = {
+                    "action_type": "tool_call",
+                    "tool_name": "rtk_grep",
+                    "arguments": {"path": second_path, "pattern": "beta"},
+                    "reason": "Second broad search.",
+                    "hypothesis": "Another marker may exist.",
+                    "expected_information_gain": "Find second marker.",
+                    "why_not_report_yet": "Need more coverage.",
+                }
+            else:
+                content = {
+                    "action_type": "final_report",
+                    "report": {
+                        "oss_report_version": "1.0",
+                        "mission_id": "mission_runtime_test",
+                        "status": "PARTIAL",
+                        "confidence": "LOW",
+                        "files_inspected": [],
+                        "commands_run": [{"tool": "rtk_grep", "args": {"path": first_path, "pattern": "alpha"}}],
+                        "findings": [{
+                            "claim": "The first broad search gathered evidence.",
+                            "evidence_refs": ["command:0"],
+                            "confidence": "LOW",
+                        }],
+                        "uncertainties": ["Second broad search was redirected by adaptive budget."],
+                        "caveats": [],
+                        "escalation_recommendation": "No escalation required",
+                        "missing_fields": [],
+                    },
+                }
+            return {"choices": [{"message": {"content": json.dumps(content)}}]}
+
+        result = run_loop(m, ledger, fake_model, [], None, m.allowed_roots, m.allowed_paths, request_deadline=90)
+        assert result["status"] == "PARTIAL", result
+        assert len(ledger.commands_run) == 1, ledger.commands_run
+        assert ledger.action_trace[1].runtime_decision == "redirected", ledger.action_trace
+        assert "Broad exploration budget is exhausted" in calls[-1], calls
+    finally:
+        for path in (first_path, second_path):
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+
+
+def assert_adaptive_autonomy_budget_allows_post_evidence_verification_with_rationale():
+    fixture_path = "runtime_verify_fixture.py"
+    with open(fixture_path, "w", encoding="utf-8") as handle:
+        handle.write("target = 'value'\n")
+    try:
+        m = mission(
+            objective="Read evidence, then verify target usage.",
+            allowed_roots=[],
+            allowed_paths=[fixture_path],
+            allowed_tool_classes=["read", "search"],
+            tool_budget=4,
+        )
+        ledger = EvidenceLedger(mission_id=m.mission_id, tool_budget_remaining=m.tool_budget)
+        calls = []
+
+        def fake_model(messages, tools, timeout):
+            calls.append(messages[-1]["content"])
+            if len(calls) == 1:
+                content = {
+                    "action_type": "tool_call",
+                    "tool_name": "rtk_read",
+                    "arguments": {"path": fixture_path},
+                    "reason": "Read primary evidence.",
+                    "hypothesis": "The target value is in this file.",
+                    "expected_information_gain": "Confirm target assignment.",
+                    "why_not_report_yet": "Need primary evidence.",
+                }
+            elif len(calls) == 2:
+                content = {
+                    "action_type": "tool_call",
+                    "tool_name": "rtk_grep",
+                    "arguments": {"path": fixture_path, "pattern": "target", "max_results": 5},
+                    "reason": "Verify the finding with a targeted search.",
+                    "hypothesis": "The finding should be confirmed by a search hit.",
+                    "expected_information_gain": "Confirm evidence location for the finding.",
+                    "why_not_report_yet": "Need verification evidence before reporting.",
+                }
+            else:
+                content = {
+                    "action_type": "final_report",
+                    "report": {
+                        "oss_report_version": "1.0",
+                        "mission_id": "mission_runtime_test",
+                        "status": "COMPLETE",
+                        "confidence": "LOW",
+                        "files_inspected": [{"path": fixture_path, "complete": True}],
+                        "commands_run": [{"tool": "rtk_grep", "args": {"path": fixture_path, "pattern": "target", "max_results": 5}}],
+                        "findings": [{
+                            "claim": "The target value was read and then verified by search.",
+                            "evidence_refs": [f"file:{fixture_path}#extract:1", "command:0"],
+                            "confidence": "LOW",
+                        }],
+                        "uncertainties": [],
+                        "caveats": [],
+                        "escalation_recommendation": "No escalation required",
+                        "missing_fields": [],
+                    },
+                }
+            return {"choices": [{"message": {"content": json.dumps(content)}}]}
+
+        result = run_loop(m, ledger, fake_model, [], None, m.allowed_roots, m.allowed_paths, request_deadline=90)
+        assert result["status"] == "COMPLETE", result
+        assert len(ledger.commands_run) == 2, ledger.commands_run
+        assert ledger.action_trace[1].runtime_decision == "allowed", ledger.action_trace
+    finally:
+        try:
+            os.unlink(fixture_path)
+        except FileNotFoundError:
+            pass
+
+
+def assert_complete_alias_report_must_name_mapped_model():
+    fixture_path = "runtime_alias_objective_fixture.py"
+    with open(fixture_path, "w", encoding="utf-8") as handle:
+        handle.write(
+            'RUNTIME_MODEL_ALIASES = {\n'
+            '    "mission-a3-kimi": "ocg-kimi-k2.6",\n'
+            '}\n'
+        )
+    try:
+        m = mission(
+            objective="Find where runtime model aliases map mission-a3-kimi to the underlying reasoning model.",
+            allowed_roots=[],
+            allowed_paths=[fixture_path],
+            allowed_tool_classes=["read"],
+            tool_budget=3,
+        )
+        ledger = EvidenceLedger(mission_id=m.mission_id, tool_budget_remaining=m.tool_budget)
+        calls = []
+
+        def fake_model(messages, tools, timeout):
+            calls.append(messages[-1]["content"])
+            if len(calls) == 1:
+                return {"choices": [{"message": {"content": json.dumps({
+                    "action_type": "tool_call",
+                    "tool_name": "rtk_read",
+                    "arguments": {"path": fixture_path},
+                    "reason": "Read alias mapping file.",
+                    "hypothesis": "The alias map is in this file.",
+                    "expected_information_gain": "Find mapped model.",
+                    "why_not_report_yet": "Need evidence.",
+                })}}]}
+            if len(calls) == 2:
+                return {"choices": [{"message": {"content": json.dumps({
+                    "action_type": "final_report",
+                    "report": {
+                        "oss_report_version": "1.0",
+                        "mission_id": "mission_runtime_test",
+                        "status": "COMPLETE",
+                        "confidence": "LOW",
+                        "files_inspected": [{"path": fixture_path, "complete": True}],
+                        "commands_run": [],
+                        "findings": [{
+                            "claim": f"Runtime model aliases are defined in {fixture_path}.",
+                            "evidence_refs": [f"file:{fixture_path}#extract:1"],
+                            "confidence": "LOW",
+                        }],
+                        "uncertainties": ["The exact mapped model is not verified."],
+                        "caveats": [],
+                        "escalation_recommendation": "No escalation required",
+                        "missing_fields": [],
+                    },
+                })}}]}
+            return {"choices": [{"message": {"content": json.dumps({
+                "action_type": "final_report",
+                "report": {
+                    "oss_report_version": "1.0",
+                    "mission_id": "mission_runtime_test",
+                    "status": "COMPLETE",
+                    "confidence": "LOW",
+                    "files_inspected": [{"path": fixture_path, "complete": True}],
+                    "commands_run": [],
+                    "findings": [{
+                        "claim": f"Runtime model alias mission-a3-kimi maps to underlying reasoning model ocg-kimi-k2.6 in {fixture_path}.",
+                        "evidence_refs": [f"file:{fixture_path}#extract:1"],
+                        "confidence": "LOW",
+                    }],
+                    "uncertainties": [],
+                    "caveats": [],
+                    "escalation_recommendation": "No escalation required",
+                    "missing_fields": [],
+                },
+            })}}]}
+
+        result = run_loop(m, ledger, fake_model, [], None, m.allowed_roots, m.allowed_paths, request_deadline=90)
+        assert result["status"] == "COMPLETE", result
+        assert "ocg-kimi-k2.6" in result["report"]["findings"][0]["claim"], result
+        assert any("objective coverage" in item for item in calls), calls
+    finally:
+        try:
+            os.unlink(fixture_path)
+        except FileNotFoundError:
+            pass
+
+
+def assert_grep_definition_result_provides_targeted_read_hint():
+    fixture_path = "runtime_profile_hint_fixture.py"
+    with open(fixture_path, "w", encoding="utf-8") as handle:
+        handle.write('RUNTIME_AUTONOMY_PROFILES = {\n    "mission-a3-deepseek": {"max_tool_budget": 20, "max_time_seconds": 180},\n}\n')
+    try:
+        m = mission(
+            objective="Find where runtime autonomy profiles are defined.",
+            allowed_roots=[],
+            allowed_paths=[fixture_path],
+            allowed_tool_classes=["search"],
+            tool_budget=2,
+        )
+        ledger = EvidenceLedger(mission_id=m.mission_id, tool_budget_remaining=m.tool_budget)
+        calls = []
+
+        def fake_model(messages, tools, timeout):
+            calls.append(messages[-1]["content"])
+            if len(calls) == 1:
+                return {"choices": [{"message": {"content": json.dumps({
+                    "action_type": "tool_call",
+                    "tool_name": "rtk_grep",
+                    "arguments": {"path": fixture_path, "pattern": "RUNTIME_AUTONOMY_PROFILES"},
+                    "reason": "Find the definition.",
+                    "hypothesis": "The constant is defined in the allowed file.",
+                    "expected_information_gain": "Get the definition line.",
+                    "why_not_report_yet": "Need evidence.",
+                })}}]}
+            return {"choices": [{"message": {"content": json.dumps({
+                "action_type": "final_report",
+                "report": {
+                    "oss_report_version": "1.0",
+                    "mission_id": "mission_runtime_test",
+                    "status": "PARTIAL",
+                    "confidence": "LOW",
+                    "files_inspected": [],
+                    "commands_run": [{"tool": "rtk_grep", "args": {"path": fixture_path, "pattern": "RUNTIME_AUTONOMY_PROFILES"}}],
+                    "findings": [{
+                        "claim": "Runtime autonomy profiles are defined by RUNTIME_AUTONOMY_PROFILES.",
+                        "evidence_refs": ["command:0"],
+                        "confidence": "LOW",
+                    }],
+                    "uncertainties": [],
+                    "caveats": [],
+                    "escalation_recommendation": "No escalation required",
+                    "missing_fields": [],
+                },
+            })}}]}
+
+        result = run_loop(m, ledger, fake_model, [], None, m.allowed_roots, m.allowed_paths, request_deadline=30)
+        assert result["status"] == "PARTIAL", result
+        assert "Runtime next-action hint" in calls[-1], calls[-1]
+        assert '"start_line":1' in calls[-1], calls[-1]
+    finally:
+        try:
+            os.unlink(fixture_path)
+        except FileNotFoundError:
+            pass
+
+
+def assert_unsupported_tool_args_are_reported_without_execution():
+    m = mission(allowed_tool_classes=["search"], tool_budget=2)
+    ledger = EvidenceLedger(mission_id=m.mission_id, tool_budget_remaining=m.tool_budget)
+    calls = []
+
+    def fake_model(messages, tools, timeout):
+        calls.append(messages[-1]["content"])
+        if len(calls) == 1:
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": (
+                                '{"action_type":"tool_call","tool_name":"rtk_grep",'
+                                '"arguments":{"pattern":"alias","path":"codex_oss/","flags":"-ri"},'
+                                '"reason":"Try a refined search.",'
+                                '"hypothesis":"Alias definitions live in Python files.",'
+                                '"expected_information_gain":"Find the alias map.",'
+                                '"why_not_report_yet":"No evidence has been gathered."}'
+                            )
+                        }
+                    }
+                ]
+            }
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": (
+                            '{"action_type":"final_report","report":'
+                            '{"oss_report_version":"1.0","mission_id":"mission_runtime_test",'
+                            '"status":"PARTIAL","confidence":"LOW","files_inspected":[],'
+                            '"commands_run":[],"findings":[],"uncertainties":[],'
+                            '"caveats":["unsupported grep args were rejected"],'
+                            '"escalation_recommendation":"GPT-5.5 review required",'
+                            '"missing_fields":[]}}'
+                        )
+                    }
+                }
+            ]
+        }
+
+    result = run_loop(m, ledger, fake_model, [], None, m.allowed_roots, m.allowed_paths, request_deadline=30)
+    assert result["status"] == "PARTIAL", result
+    assert ledger.tool_budget_remaining == m.tool_budget, ledger.tool_budget_remaining
+    assert len(ledger.commands_run) == 0, ledger.commands_run
+    assert ledger.action_trace[0].runtime_decision == "repaired", ledger.action_trace[0]
+    assert ledger.action_trace[0].unsupported_arguments == ["flags"], ledger.action_trace[0]
+    assert any("Unsupported arguments for rtk_grep" in item for item in calls), calls
+
+
+def assert_advanced_grep_args_are_supported():
+    fixture_path = "runtime_grep_args_fixture.py"
+    with open(fixture_path, "w", encoding="utf-8") as handle:
+        handle.write("Runtime_Model_Alias = True\n")
+    try:
+        m = mission(
+            allowed_roots=[],
+            allowed_paths=[fixture_path],
+            allowed_tool_classes=["search"],
+            tool_budget=2,
+        )
+        ledger = EvidenceLedger(mission_id=m.mission_id, tool_budget_remaining=m.tool_budget)
+        calls = []
+
+        def fake_model(messages, tools, timeout):
+            calls.append(messages[-1]["content"])
+            if len(calls) == 1:
+                content = json.dumps({
+                    "action_type": "tool_call",
+                    "tool_name": "rtk_grep",
+                    "arguments": {
+                        "pattern": "runtime_model_alias",
+                        "path": fixture_path,
+                        "include": "*.py",
+                        "case_sensitive": False,
+                        "max_results": 5,
+                    },
+                    "reason": "Run a refined case-insensitive search.",
+                    "hypothesis": "The alias name may differ in case.",
+                    "expected_information_gain": "Find the matching line.",
+                    "why_not_report_yet": "Need search evidence first.",
+                })
+                return {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": content
+                            }
+                        }
+                    ]
+                }
+            content = json.dumps({
+                "action_type": "final_report",
+                "report": {
+                    "oss_report_version": "1.0",
+                    "mission_id": "mission_runtime_test",
+                    "status": "COMPLETE",
+                    "confidence": "LOW",
+                    "files_inspected": [],
+                    "commands_run": [
+                        {
+                            "tool": "rtk_grep",
+                            "args": {
+                                "pattern": "runtime_model_alias",
+                                "path": fixture_path,
+                                "case_sensitive": False,
+                                "include_glob": "*.py",
+                                "max_results": 5,
+                            },
+                        }
+                    ],
+                    "findings": [
+                        {
+                            "claim": "The advanced grep found the alias line.",
+                            "evidence_refs": ["command:0#match:0"],
+                            "confidence": "LOW",
+                        }
+                    ],
+                    "uncertainties": [],
+                    "caveats": [],
+                    "escalation_recommendation": "No escalation required",
+                    "missing_fields": [],
+                },
+            })
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": content
+                        }
+                    }
+                ]
+            }
+
+        result = run_loop(m, ledger, fake_model, [], None, m.allowed_roots, m.allowed_paths, request_deadline=30)
+        assert result["status"] == "COMPLETE", result
+        assert len(ledger.commands_run) == 1, ledger.commands_run
+        assert ledger.action_trace[0].unsupported_arguments == [], ledger.action_trace[0]
+        assert ledger.commands_run[0].matches_count >= 1, ledger.commands_run[0]
+    finally:
+        try:
+            os.unlink(fixture_path)
+        except FileNotFoundError:
+            pass
+
+
+def assert_read_line_ranges_are_supported():
+    fixture_path = "runtime_range_fixture.txt"
+    with open(fixture_path, "w", encoding="utf-8") as handle:
+        handle.write("one\ntwo\nthree\nfour\n")
+    try:
+        m = mission(
+            allowed_roots=[],
+            allowed_paths=[fixture_path],
+            allowed_tool_classes=["read"],
+            tool_budget=2,
+        )
+        ledger = EvidenceLedger(mission_id=m.mission_id, tool_budget_remaining=m.tool_budget)
+        calls = []
+
+        def fake_model(messages, tools, timeout):
+            calls.append(messages[-1]["content"])
+            if len(calls) == 1:
+                content = json.dumps({
+                    "action_type": "tool_call",
+                    "tool_name": "rtk_read",
+                    "arguments": {
+                        "path": fixture_path,
+                        "start_line": 2,
+                        "end_line": 3,
+                    },
+                    "reason": "Read the exact relevant range.",
+                    "hypothesis": "The needed evidence is in a small line range.",
+                    "expected_information_gain": "Confirm the range.",
+                    "why_not_report_yet": "Need the evidence first.",
+                })
+                return {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": content
+                            }
+                        }
+                    ]
+                }
+            content = json.dumps({
+                "action_type": "final_report",
+                "report": {
+                    "oss_report_version": "1.0",
+                    "mission_id": "mission_runtime_test",
+                    "status": "COMPLETE",
+                    "confidence": "LOW",
+                    "files_inspected": [{"path": fixture_path, "complete": True}],
+                    "commands_run": [],
+                    "findings": [
+                        {
+                            "claim": "The selected range was read.",
+                            "evidence_refs": [f"file:{fixture_path}#extract:1"],
+                            "confidence": "LOW",
+                        }
+                    ],
+                    "uncertainties": [],
+                    "caveats": [],
+                    "escalation_recommendation": "No escalation required",
+                    "missing_fields": [],
+                },
+            })
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": content
+                        }
+                    }
+                ]
+            }
+
+        result = run_loop(m, ledger, fake_model, [], None, m.allowed_roots, m.allowed_paths, request_deadline=30)
+        assert result["status"] == "COMPLETE", result
+        entry = ledger.files_inspected[fixture_path]
+        assert entry.extracts[0]["text"] == "two\nthree\n", entry.extracts
+        assert ledger.action_trace[0].unsupported_arguments == [], ledger.action_trace[0]
+    finally:
+        try:
+            os.unlink(fixture_path)
+        except FileNotFoundError:
+            pass
+
+
+def assert_incidental_critical_terms_do_not_stop_low_risk_mission():
+    fixture_path = "runtime_schema_term_fixture.txt"
+    with open(fixture_path, "w", encoding="utf-8") as handle:
+        handle.write("This runtime fixture mentions schema as an ordinary contract word.\n")
+    try:
+        m = mission(
+            allowed_roots=[],
+            allowed_paths=[fixture_path],
+            allowed_tool_classes=["read"],
+            tool_budget=2,
+        )
+        ledger = EvidenceLedger(mission_id=m.mission_id, tool_budget_remaining=m.tool_budget)
+        calls = []
+
+        def fake_model(messages, tools, timeout):
+            calls.extend(item["content"] for item in messages)
+            if len(calls) == 1:
+                return {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": (
+                                    '{"action_type":"tool_call","tool_name":"rtk_read",'
+                                    f'"arguments":{{"path":"{fixture_path}"}},'
+                                    '"reason":"Read the allowed fixture."}'
+                                )
+                            }
+                        }
+                    ]
+                }
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": (
+                                '{"action_type":"final_report","report":'
+                                '{"oss_report_version":"1.0","mission_id":"mission_runtime_test",'
+                                '"status":"COMPLETE","confidence":"LOW",'
+                                f'"files_inspected":[{{"path":"{fixture_path}","complete":true}}],'
+                                '"commands_run":[],'
+                                '"findings":[{"claim":"The fixture was inspected.",'
+                                f'"evidence_refs":["file:{fixture_path}#extract:1"],'
+                                '"confidence":"LOW"}],'
+                                '"uncertainties":[],"caveats":["critical-domain word observed as incidental text"],'
+                                '"escalation_recommendation":"GPT-5.5 review required if using this as critical-path evidence",'
+                                '"missing_fields":[]}}'
+                            )
+                        }
+                    }
+                ]
+            }
+
+        result = run_loop(m, ledger, fake_model, [], None, m.allowed_roots, m.allowed_paths, request_deadline=30)
+        assert result["status"] == "COMPLETE", result
+        assert any("critical_terms_detected" in flag for flag in ledger.risk_flags), ledger.risk_flags
+        assert any("Risk note" in item for item in calls), calls
+    finally:
+        try:
+            os.unlink(fixture_path)
+        except FileNotFoundError:
+            pass
+
+
 def assert_health_exposes_source_identity():
     class State:
         path = "state.sqlite3"
@@ -279,12 +2526,53 @@ def assert_health_exposes_source_identity():
 
 def main():
     assert_run_loop_accepts_valid_final_report()
+    assert_model_text_extraction_handles_provider_variants()
     assert_mission_requires_scope_and_tool_contract()
     assert_path_policy_blocks_empty_scope_and_denied_symlink()
     assert_broad_roots_are_exactly_broad()
+    assert_critical_finality_uses_word_boundaries()
     assert_file_extract_refs_resolve()
+    assert_report_validation_rejects_non_object_findings_without_crashing()
     assert_managed_bridge_returns_terminal_report_on_runtime_error()
+    assert_runtime_model_alias_requires_mission_and_maps_reasoning_model()
+    assert_runtime_model_alias_uses_fallback_on_model_failure()
+    assert_runtime_mission_time_budget_extends_internal_deadline()
     assert_tool_classes_are_enforced_and_aliases_normalize()
+    assert_duplicate_searches_are_suppressed()
+    assert_near_deadline_requests_final_report_when_evidence_exists()
+    assert_runtime_forces_final_report_after_file_evidence_when_budget_is_low()
+    assert_runtime_traces_followup_search_after_file_evidence()
+    assert_duplicate_range_read_is_served_from_cached_evidence()
+    assert_duplicate_full_read_returns_cached_extracts_and_requests_report()
+    assert_unsupported_followup_after_file_evidence_redirects_to_report()
+    assert_model_failure_after_evidence_returns_finding_not_empty_partial()
+    assert_deterministic_finalizer_extracts_profile_limits_from_cached_evidence()
+    assert_deterministic_finalizer_mines_cached_text_beyond_default_extracts()
+    assert_deterministic_finalizer_does_not_treat_symbol_mentions_as_definitions()
+    assert_range_read_does_not_block_later_full_read_or_finalizer_claim()
+    assert_definition_claims_require_definition_shaped_evidence()
+    assert_definition_claims_can_be_supported_by_command_evidence()
+    assert_deterministic_finalizer_mines_command_profile_evidence()
+    assert_deterministic_finalizer_mines_alias_mapping_from_file_evidence()
+    assert_deterministic_finalizer_mines_validator_module_evidence()
+    assert_objective_specs_handle_generic_config_function_and_zero_match()
+    assert_config_value_extraction_uses_target_block_not_first_fields()
+    assert_mission_accepts_explicit_objective_spec_and_strict_mode()
+    assert_explicit_objective_spec_overrides_prose_classifier()
+    assert_complete_report_with_explicit_spec_requires_required_value()
+    assert_explicit_objective_satisfaction_switches_to_short_closure()
+    assert_deterministic_finalizer_can_complete_explicit_satisfied_objective()
+    assert_deterministic_finalizer_can_complete_explicit_rtk_grep_function_location()
+    assert_model_reports_are_annotated_with_runtime_provenance()
+    assert_concurrency_policy_serializes_with_small_queue()
+    assert_adaptive_autonomy_budget_redirects_excess_broad_searches()
+    assert_adaptive_autonomy_budget_allows_post_evidence_verification_with_rationale()
+    assert_complete_alias_report_must_name_mapped_model()
+    assert_grep_definition_result_provides_targeted_read_hint()
+    assert_unsupported_tool_args_are_reported_without_execution()
+    assert_advanced_grep_args_are_supported()
+    assert_read_line_ranges_are_supported()
+    assert_incidental_critical_terms_do_not_stop_low_risk_mission()
     assert_health_exposes_source_identity()
     print("PASS: runtime contract suite")
 

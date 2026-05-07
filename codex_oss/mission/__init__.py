@@ -90,6 +90,16 @@ class MissionV1:
     required_outputs: List[str] = field(default_factory=list)
     fallback_policy: str = "fallback_policy.v1"
     deadline_policy: str = "deadline_policy.v1"
+    objective_spec: Optional[dict] = None
+    allow_heuristic_objective: bool = True
+
+    # AdaptiveAutonomyBudgetV1
+    max_model_calls: int = 25
+    max_duplicate_actions: int = 2
+    max_broad_searches: int = 6
+    max_low_information_actions: int = 3
+    phase_policy_enabled: bool = True
+    progress_policy_enabled: bool = True
 
     # Budget clamping metadata
     tool_budget_requested: int = 0
@@ -149,10 +159,14 @@ def _build_mission(raw: dict) -> MissionV1:
     objective = str(raw.get("objective", ""))
     if not objective:
         raise InvalidHandoffError("objective is required")
+    objective_spec = _validate_objective_spec(raw.get("objective_spec"))
+    allow_heuristic_objective = bool(raw.get("allow_heuristic_objective", True))
 
     risk_tier = str(raw.get("risk_tier", "low")).lower()
     if risk_tier not in ("low", "medium", "critical"):
         risk_tier = "low"
+    if tier == TIER_A3 and not objective_spec and not allow_heuristic_objective:
+        raise InvalidHandoffError("A3 missions require objective_spec when allow_heuristic_objective=false")
 
     allowed_roots = _as_str_list(raw.get("allowed_roots", []))
     allowed_paths = _as_str_list(raw.get("allowed_paths", []))
@@ -215,6 +229,19 @@ def _build_mission(raw: dict) -> MissionV1:
     if effective_time < time_budget_seconds:
         budget_reduction_reason = "tier_cap" if not budget_reduction_reason else budget_reduction_reason + "+tier_cap"
 
+    max_model_calls = int(raw.get("max_model_calls", 25))
+    max_duplicate_actions = int(raw.get("max_duplicate_actions", 2))
+    max_broad_searches = int(raw.get("max_broad_searches", 3 if tier == TIER_A2 else 6))
+    max_low_information_actions = int(raw.get("max_low_information_actions", 2 if tier == TIER_A2 else 3))
+    for name, value in {
+        "max_model_calls": max_model_calls,
+        "max_duplicate_actions": max_duplicate_actions,
+        "max_broad_searches": max_broad_searches,
+        "max_low_information_actions": max_low_information_actions,
+    }.items():
+        if value < 0 or value > 100:
+            raise InvalidHandoffError(f"{name} must be between 0 and 100")
+
     return MissionV1(
         mission_id=mission_id,
         tier=tier,
@@ -237,6 +264,14 @@ def _build_mission(raw: dict) -> MissionV1:
         stop_conditions=stop_conditions,
         report_schema=str(raw.get("report_schema", "managed_investigation_report.v1")),
         required_outputs=required_outputs,
+        objective_spec=objective_spec,
+        allow_heuristic_objective=allow_heuristic_objective,
+        max_model_calls=max_model_calls,
+        max_duplicate_actions=max_duplicate_actions,
+        max_broad_searches=max_broad_searches,
+        max_low_information_actions=max_low_information_actions,
+        phase_policy_enabled=bool(raw.get("phase_policy_enabled", True)),
+        progress_policy_enabled=bool(raw.get("progress_policy_enabled", True)),
         tool_budget_requested=tool_budget,
         tool_budget_effective=effective_budget,
         budget_reduction_reason=budget_reduction_reason,
@@ -249,6 +284,39 @@ def _as_str_list(val: Any) -> List[str]:
     if isinstance(val, str):
         return [v.strip() for v in val.split(",") if v.strip()]
     return []
+
+
+def _validate_objective_spec(raw: Any) -> Optional[dict]:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise InvalidHandoffError("objective_spec must be an object")
+    schema_version = str(raw.get("schema_version", ""))
+    if schema_version != "objective_spec.v1":
+        raise InvalidHandoffError("objective_spec.schema_version must be objective_spec.v1")
+    objective_type = str(raw.get("objective_type", ""))
+    allowed_types = {
+        "mapping_lookup",
+        "config_value_extraction",
+        "function_location",
+        "zero_match_evidence",
+        "implementation_site_discovery",
+        "usage_location",
+        "control_flow_trace",
+        "policy_rule_location",
+        "test_coverage_location",
+    }
+    if objective_type not in allowed_types:
+        raise InvalidHandoffError(f"objective_spec.objective_type must be one of {sorted(allowed_types)}")
+    target = raw.get("target", {})
+    if target is not None and not isinstance(target, dict):
+        raise InvalidHandoffError("objective_spec.target must be an object")
+    for field_name in ("required_outputs", "required_evidence_shapes", "completion_criteria"):
+        if field_name in raw and not isinstance(raw.get(field_name), list):
+            raise InvalidHandoffError(f"objective_spec.{field_name} must be a list")
+    if "confidence_policy" in raw and not isinstance(raw.get("confidence_policy"), dict):
+        raise InvalidHandoffError("objective_spec.confidence_policy must be an object")
+    return dict(raw)
 
 
 class InvalidHandoffError(Exception):

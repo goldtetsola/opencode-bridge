@@ -1,5 +1,7 @@
 # Credentials (never commit your key!)
 .codex/agents/opencode-go.env
+.codex-oss/
+opencode-go.env
 
 *.sqlite3
 *.sqlite3-wal
@@ -8,5 +10,6 @@ __pycache__/
 *.pyc
 .DS_Store
 CONTEXT.md
+tmp/
 test-project/
 docs/

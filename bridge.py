@@ -25,7 +25,7 @@ Intended upstream:
   https://opencode.ai/zen/go/v1/chat/completions
 
 Required env:
-  OPENCODE_GO_API_KEY
+  UPSTREAM_API_KEY or OPENCODE_GO_API_KEY
 
 Recommended env:
   PROXY_API_KEY or LITELLM_MASTER_KEY   # key Codex sends to this local proxy
@@ -2049,7 +2049,7 @@ class ProxyApp:
         self.upstream_base = os.getenv("UPSTREAM_BASE", "https://opencode.ai/zen/go/v1").rstrip("/")
         self.upstream_chat_url = f"{self.upstream_base}/chat/completions"
         self.upstream_models_url = f"{self.upstream_base}/models"
-        self.upstream_key = os.getenv("OPENCODE_GO_API_KEY", "")
+        self.upstream_key = os.getenv("UPSTREAM_API_KEY") or os.getenv("OPENCODE_GO_API_KEY", "")
         self.proxy_key = os.getenv("PROXY_API_KEY") or os.getenv("LITELLM_MASTER_KEY") or ""
         self.gpt_model_strategy = os.getenv("GPT_MODEL_STRATEGY", "error").strip().lower()
         self.gpt_oss_fallback = os.getenv("GPT_MODEL_OSS_FALLBACK", "deepseek-v4-pro").strip()
@@ -2081,8 +2081,8 @@ class ProxyApp:
         # Fatal missing key in production mode
         if self.gpt_model_strategy == "error" and not self.upstream_key:
             if os.getenv("ALLOW_MISSING_OPENCODE_KEY", "0") != "1":
-                print("FATAL: OPENCODE_GO_API_KEY is not set and GPT_MODEL_STRATEGY=error.", file=sys.stderr)
-                print("Set OPENCODE_GO_API_KEY or start with ALLOW_MISSING_OPENCODE_KEY=1", file=sys.stderr)
+                print("FATAL: UPSTREAM_API_KEY/OPENCODE_GO_API_KEY is not set and GPT_MODEL_STRATEGY=error.", file=sys.stderr)
+                print("Set UPSTREAM_API_KEY, OPENCODE_GO_API_KEY, or start with ALLOW_MISSING_OPENCODE_KEY=1", file=sys.stderr)
                 sys.exit(1)
 
         # Concurrency semaphores — prevent rate-limit death spirals
@@ -2655,6 +2655,9 @@ class ProxyApp:
 
 APP = ProxyApp()
 START_TIME = time.time()
+ACTIVE_REQUESTS = 0
+ACTIVE_REQUESTS_COND = threading.Condition()
+SHUTDOWN_REQUESTED = threading.Event()
 
 from codex_oss.transport.chat_stream import ChatStreamAssembler
 from codex_oss.transport.emitter import ResponseEmitter
@@ -2662,6 +2665,17 @@ from codex_oss.transport.emitter import ResponseEmitter
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "ResponsesChatProxy/12.0"
+
+    def _track_request_start(self) -> None:
+        global ACTIVE_REQUESTS
+        with ACTIVE_REQUESTS_COND:
+            ACTIVE_REQUESTS += 1
+
+    def _track_request_end(self) -> None:
+        global ACTIVE_REQUESTS
+        with ACTIVE_REQUESTS_COND:
+            ACTIVE_REQUESTS = max(0, ACTIVE_REQUESTS - 1)
+            ACTIVE_REQUESTS_COND.notify_all()
 
     def _send_json(self, status: int, obj: Any) -> None:
         data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
@@ -2699,6 +2713,13 @@ class Handler(BaseHTTPRequestHandler):
         self._send_error_obj(404, f"Unknown path: {self.path}", "not_found")
 
     def do_POST(self) -> None:  # noqa: N802
+        self._track_request_start()
+        try:
+            self._do_POST_tracked()
+        finally:
+            self._track_request_end()
+
+    def _do_POST_tracked(self) -> None:
         if not APP.auth_ok(self.headers.get("Authorization", "")):
             self._send_error_obj(401, "Unauthorized", "unauthorized")
             return
@@ -2738,8 +2759,17 @@ class Handler(BaseHTTPRequestHandler):
             )
             if managed.handled:
                 emitter = ResponseEmitter(self, new_id("resp"), raw_model_alias, bool(body.get("stream")))
-                emitter.emit_text_message(managed.report_text)
-                emitter.complete()
+                try:
+                    emitter.emit_text_message(managed.report_text)
+                    emitter.complete()
+                except (BrokenPipeError, ConnectionResetError, OSError) as e:
+                    APP.log(
+                        "client_disconnected",
+                        phase="managed_runtime_emit",
+                        mission_status=managed.status,
+                        error=str(e),
+                    )
+                    self.close_connection = True
                 return
 
             # ── v8: Check for continuation BEFORE prepare_chat_payload ──
@@ -3741,6 +3771,7 @@ def main() -> None:
         print("warning: binding to a non-localhost host; do not expose this proxy publicly", file=sys.stderr)
 
     httpd = ThreadingHTTPServer((args.host, args.port), Handler)
+    httpd.daemon_threads = False
 
     shutdown_started = threading.Event()
 
@@ -3748,8 +3779,11 @@ def main() -> None:
         if shutdown_started.is_set():
             return
         shutdown_started.set()
+        SHUTDOWN_REQUESTED.set()
         try:
-            sys.stderr.write("shutting down\n")
+            with ACTIVE_REQUESTS_COND:
+                active = ACTIVE_REQUESTS
+            sys.stderr.write(f"shutting down signal={signum} active_requests={active}\n")
             sys.stderr.flush()
         except Exception:
             pass
@@ -3760,6 +3794,15 @@ def main() -> None:
 
     print(f"Responses->Chat proxy listening on http://{args.host}:{args.port}/v1", file=sys.stderr)
     httpd.serve_forever()
+    drain_deadline = time.time() + float(os.getenv("BRIDGE_SHUTDOWN_DRAIN_SECONDS", "180"))
+    with ACTIVE_REQUESTS_COND:
+        while ACTIVE_REQUESTS > 0 and time.time() < drain_deadline:
+            remaining = max(0.1, drain_deadline - time.time())
+            ACTIVE_REQUESTS_COND.wait(timeout=min(1.0, remaining))
+        active = ACTIVE_REQUESTS
+    if active:
+        print(f"shutdown drain expired active_requests={active}", file=sys.stderr)
+    httpd.server_close()
 
 
 if __name__ == "__main__":

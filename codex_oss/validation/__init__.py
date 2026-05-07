@@ -134,9 +134,12 @@ def validate_report(report: dict, ledger: Any = None) -> ValidationResult:
     # Evidence ref resolution against ledger
     if ledger:
         for finding in findings:
+            if not isinstance(finding, dict):
+                continue
             refs = finding.get("evidence_refs", [])
             for ref in refs:
                 _check_ref(ref, ledger, errors)
+            _check_semantic_claim_support(finding, ledger, errors)
         _check_report_matches_ledger(report, ledger, errors)
 
     is_valid = len(errors) == 0
@@ -210,6 +213,100 @@ def _check_report_matches_ledger(report: dict, ledger: Any, errors: List[str]):
                     errors.append(f"commands_run entry not present in ledger: {item.get('tool')} {item.get('args', {})}")
 
 
+def _check_semantic_claim_support(finding: dict, ledger: Any, errors: List[str]) -> None:
+    """Reject definition claims backed only by symbol mentions.
+
+    This is deliberately narrow: the runtime is allowed to report weak evidence
+    about inspected files, but if it claims that an upper-snake symbol is defined
+    in a file, the cited file evidence must include definition-shaped text for
+    that symbol. This catches false positives where extractor/validator code
+    merely mentions a target constant in strings or regexes.
+    """
+    claim = str(finding.get("claim", "") or "")
+    lower = claim.lower()
+    if "defined in" not in lower and "contains" not in lower and "dictionary" not in lower:
+        return
+
+    symbols = sorted(set(re.findall(r"\b[A-Z][A-Z0-9_]{4,}\b", claim)))
+    if not symbols:
+        return
+
+    refs = [str(ref) for ref in finding.get("evidence_refs", []) or []]
+    evidence_by_ref = _evidence_texts(refs, ledger)
+    for symbol in symbols:
+        if not _claim_requires_definition_support(claim, symbol):
+            continue
+        supported = False
+        for _ref_name, text in evidence_by_ref.items():
+            if _symbol_definition_supported(symbol, text):
+                supported = True
+                break
+        if not supported:
+            refs_summary = ", ".join(evidence_by_ref.keys()) or "(no evidence text)"
+            errors.append(
+                f"finding claim says {symbol} is defined/contained, but cited evidence "
+                f"does not show a definition assignment for that symbol: {refs_summary}"
+            )
+
+
+def _claim_requires_definition_support(claim: str, symbol: str) -> bool:
+    lower = claim.lower()
+    return symbol in claim and (
+        "defined in" in lower
+        or "definition" in lower
+        or "dictionary" in lower
+        or "contains" in lower
+    )
+
+
+def _evidence_texts(refs: list[str], ledger: Any) -> Dict[str, str]:
+    evidence: Dict[str, str] = {}
+    for ref in refs:
+        m = EVIDENCE_REF_RE.match(ref)
+        if not m:
+            continue
+        ref_type, target, sub_type, sub_id, _zero_match = m.groups()
+        if ref_type == "file":
+            if not hasattr(ledger, "files_inspected"):
+                continue
+            entry = ledger.files_inspected.get(target)
+            if not entry:
+                continue
+            chunks = []
+            if sub_type == "extract" and sub_id:
+                wanted = f"extract:{sub_id}"
+                for extract in getattr(entry, "extracts", []) or []:
+                    if extract.get("id") == wanted:
+                        chunks.append(str(extract.get("text", "") or ""))
+            else:
+                chunks.extend(str(extract.get("text", "") or "") for extract in getattr(entry, "extracts", []) or [])
+            if not chunks:
+                chunks.append(str(getattr(entry, "cached_text", "") or ""))
+            evidence[target] = "\n".join(chunk for chunk in chunks if chunk)
+        elif ref_type == "command":
+            if not hasattr(ledger, "commands_run"):
+                continue
+            try:
+                idx = int(target)
+            except ValueError:
+                continue
+            commands = getattr(ledger, "commands_run", []) or []
+            if idx < 0 or idx >= len(commands):
+                continue
+            command = commands[idx]
+            evidence[f"command:{idx}"] = str(getattr(command, "cached_text", "") or "")
+    return evidence
+
+
+def _symbol_definition_supported(symbol: str, text: str) -> bool:
+    if not text:
+        return False
+    assignment = rf"\b{re.escape(symbol)}\s*(?::[^=\n]+)?=\s*"
+    if re.search(assignment, text):
+        return True
+    return False
+
+
 def validate_text_report(text: str, ledger: Any = None) -> ValidationResult:
     """Validate a text report — rejects intent/status, parses, validates."""
     if is_intent_or_status(text):
@@ -226,6 +323,10 @@ def render_report(report: dict) -> str:
     """Render a ValidatedReportV1 as markdown."""
     status = report.get("status", "FAILED")
     confidence = report.get("confidence", "LOW")
+    report_source = report.get("report_source")
+    explorer_model = report.get("explorer_model")
+    finalizer_model = report.get("finalizer_model")
+    fallback_model_used = report.get("fallback_model_used")
     findings = report.get("findings", [])
     files = report.get("files_inspected", [])
     commands_data = report.get("commands_run", [])
@@ -239,6 +340,17 @@ def render_report(report: dict) -> str:
         f"Status: {status}",
         f"Confidence: {confidence}",
     ]
+    provenance = []
+    if report_source:
+        provenance.append(f"source={report_source}")
+    if explorer_model:
+        provenance.append(f"explorer={explorer_model}")
+    if finalizer_model:
+        provenance.append(f"finalizer={finalizer_model}")
+    if fallback_model_used:
+        provenance.append("fallback_model_used=true")
+    if provenance:
+        parts.append(f"Provenance: {', '.join(provenance)}")
 
     if findings:
         parts.append("Findings:")
