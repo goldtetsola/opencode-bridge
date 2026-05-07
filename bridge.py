@@ -3243,15 +3243,30 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
             # ── v1 spec: A2/A3 managed investigation via runtime loop ──
+            from codex_oss.runtime.policy import extract_single_handoff_block
             handoff = _extract_handoff_from_body(body)
-            if handoff and "oss_agent_mission.v1" in handoff:
+            mission_block = None
+            try:
+                mission_block = extract_single_handoff_block(handoff) if handoff else None
+            except ValueError as e:
+                APP.log("mission_entrypoint_invalid", error=str(e))
+                emitter = ResponseEmitter(self, new_id("resp"), raw_model_alias, bool(body.get("stream")))
+                emitter.emit_text_message(
+                    f"FAIL\nReason: {e}\n"
+                    f"Confidence: HIGH — bridge rejected handoff with multiple OSS_HANDOFF_JSON blocks.")
+                emitter.complete()
+                return
+
+            if mission_block and "oss_agent_mission.v1" in mission_block:
                 try:
-                    from codex_oss.mission import parse_mission_v1, InvalidHandoffError
+                    from codex_oss.mission import _build_mission, InvalidHandoffError
                     from codex_oss.runtime.loop import run_loop
                     from codex_oss.ledger import EvidenceLedger
                     from codex_oss.validation import validate_report, render_report
+                    import json as _json
 
-                    mission = parse_mission_v1(handoff)
+                    raw = _json.loads(mission_block)
+                    mission = _build_mission(raw)
                     APP.log("mission_dispatch", tier=mission.tier, mode=mission.mode,
                             mission_id=mission.mission_id)
 
