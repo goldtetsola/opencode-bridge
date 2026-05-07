@@ -2,6 +2,19 @@
 
 ## v12 — May 2026
 
+### Acceptance model
+Generic validation pipeline replaces per-task patches. Every output goes through:
+
+```
+handoff schema → scope gate → evidence gate → synthesis gate → deliverable gate → verification gate → acceptance status
+```
+
+- **Report contract validation**: Transport, evidence, synthesis, and task status tracked separately. Deterministic fallback returns `PARTIAL`, not fake `PASS`. Thin reports missing required fields rejected.
+- **Patch/docs write acceptance**: `bounded_write_exact` only for `exact_content`. Docs/patch tasks route to `bounded_write_patch`. Patch tasks require changed owned paths in git status. No-change or out-of-scope writes fail.
+- **Verification ledger**: Verification is observed evidence, not prose. Report claiming "verification passed" invalid unless bridge observed it. Verification failure produces `FAIL`.
+- **Evidence coverage gate**: Requested paths/search terms must be in evidence pack. No-match grep preserved as evidence. Confident `PASS` reports rejected if coverage incomplete.
+- **Protocol conformance suite**: `tests/test_protocol_conformance.py` covers malformed handoffs, exact-write routing, no-match evidence, incomplete coverage, patch acceptance, verification claims, and scope boundaries.
+
 ### OSS subagent runtime
 OSS agents are now bounded tool transactions with execution modes, not open-ended autonomous workers.
 
