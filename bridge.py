@@ -472,6 +472,12 @@ def normalize_tool_args(args, tool_name: str) -> tuple:
                 if p:
                     return (p, str(nested))
 
+    if any(token in tool_name.lower() for token in ("write", "edit", "patch", "apply_patch", "create")):
+        for key in ("path", "file_path", "filepath", "file", "filename", "target"):
+            val = args.get(key)
+            if isinstance(val, str) and val.strip():
+                return (val.strip(), val.strip())
+
     if tool_name in ("exec_command", "rtk_git", "git", "rtk_exec"):
         for key in ("command", "args", "cmd", "arguments"):
             val = args.get(key)
@@ -816,12 +822,12 @@ def build_context_pack(session: TaskSession, project_root: str) -> str:
                     out = subprocess.run(
                         ["rtk", "grep", term, path],
                         cwd=project_root, capture_output=True, text=True, timeout=20)
-                    if out.returncode == 0:
-                        _append_section(
-                            f"=== rtk grep {term} in {path} ===\n"
-                            f"exit_code: {out.returncode}\n"
-                            f"matched lines:\n{out.stdout[:5000]}\n")
-                        session.commands_run.append(["grep", term, path])
+                    _append_section(
+                        f"=== rtk grep {term} in {path} ===\n"
+                        f"exit_code: {out.returncode}\n"
+                        f"matched lines:\n{out.stdout[:5000]}\n"
+                        f"stderr:\n{out.stderr[:1000]}\n")
+                    session.commands_run.append(["grep", term, path])
 
             raw = open(full, encoding="utf-8", errors="replace").read()
             files_fully_read.add(path)
@@ -872,8 +878,96 @@ def validate_report(text: str, required_fields: list) -> tuple:
     return len(missing) == 0, missing
 
 
+def _field_label(field: str) -> str:
+    """Return a stable report label for a requested deliverable field."""
+    label = str(field or "").strip().strip("- ").strip()
+    if not label:
+        return "deliverable"
+    label = re.sub(r"\s+", "_", label.lower())
+    label = re.sub(r"[^a-z0-9_/-]", "", label)
+    return label.strip("_") or "deliverable"
+
+
+def _is_exact_deliverable_field(field: str) -> bool:
+    """Structured handoffs use short field tokens; prose deliverables do not."""
+    text = str(field or "").strip()
+    return bool(re.fullmatch(r"[A-Za-z][A-Za-z0-9_/-]{0,80}", text))
+
+
+def _format_requested_deliverable_sections(required_outputs: list) -> str:
+    exact_fields = [_field_label(field) for field in required_outputs if _is_exact_deliverable_field(field)]
+    if not exact_fields:
+        return (
+            "requested_deliverables:\n"
+            "- PARTIAL: deterministic fallback preserved the requested deliverable text, "
+            "but no model synthesis was available to complete the analysis."
+        )
+    sections = []
+    for field in exact_fields:
+        sections.append(
+            f"{field}:\n"
+            "- PARTIAL: deterministic source-pack fallback cannot certify this deliverable as complete. "
+            "Review the evidence table before accepting the task result."
+        )
+    return "\n".join(sections)
+
+
+def _requested_search_terms_from_envelope(envelope: dict) -> list:
+    terms = []
+    for step in envelope.get("verification_steps", []):
+        for term in extract_search_terms_from_step(str(step)):
+            if term not in terms:
+                terms.append(term)
+    return terms
+
+
+def evaluate_evidence_coverage(envelope: dict, pack: str) -> tuple:
+    """Check whether requested paths and search terms have evidence-pack coverage."""
+    source = pack or ""
+    missing = []
+    covered_paths = []
+    requested_paths = list(envelope.get("read_only_paths", []))
+    for path in requested_paths:
+        markers = (
+            f"=== {path}",
+            f" in {path} ===",
+            f"rtk find {path}",
+            f"path escapes project root: {path}",
+        )
+        if any(marker in source for marker in markers):
+            covered_paths.append(path)
+        else:
+            missing.append(f"path:{path}")
+
+    covered_terms = []
+    requested_terms = _requested_search_terms_from_envelope(envelope)
+    for term in requested_terms:
+        if f"grep {term} " in source or f"grep {term} in " in source:
+            covered_terms.append(term)
+        else:
+            missing.append(f"search:{term}")
+
+    return not missing, missing, covered_paths, covered_terms
+
+
+def format_evidence_coverage_section(envelope: dict, pack: str) -> str:
+    complete, missing, covered_paths, covered_terms = evaluate_evidence_coverage(envelope, pack)
+    requested_paths = list(envelope.get("read_only_paths", []))
+    requested_terms = _requested_search_terms_from_envelope(envelope)
+    status = "PASS" if complete else "PARTIAL"
+    return (
+        "evidence_coverage:\n"
+        f"- status: {status}\n"
+        f"- requested_paths: {', '.join(requested_paths) if requested_paths else 'none'}\n"
+        f"- covered_paths: {', '.join(covered_paths) if covered_paths else 'none'}\n"
+        f"- requested_search_terms: {', '.join(requested_terms) if requested_terms else 'none'}\n"
+        f"- covered_search_terms: {', '.join(covered_terms) if covered_terms else 'none'}\n"
+        f"- missing: {', '.join(missing) if missing else 'none'}"
+    )
+
+
 def build_context_pack_deterministic_report(session: TaskSession, pack: str, tool_output_text: str) -> str:
-    """Build a terminal read report when the lightweight finalizer returns intent text."""
+    """Build a terminal read report when the lightweight finalizer cannot synthesize."""
     source = pack or tool_output_text or ""
     source_lines = source.splitlines()
 
@@ -958,14 +1052,28 @@ def build_context_pack_deterministic_report(session: TaskSession, pack: str, too
     files = ", ".join(session.required_paths) if session.required_paths else "unknown"
     outputs = ", ".join(session.required_outputs) if session.required_outputs else "concise findings, confidence, caveats"
     summary = "\n".join(bullets[:3])
+    deliverable_sections = _format_requested_deliverable_sections(session.required_outputs)
+    parsed_envelope = parse_task_envelope(session.handoff_text) if session.handoff_text else {}
+    coverage_envelope = {
+        "read_only_paths": parsed_envelope.get("read_only_paths", session.required_paths),
+        "verification_steps": parsed_envelope.get("verification_steps", session.verification_steps),
+    }
+    evidence_coverage = format_evidence_coverage_section(coverage_envelope, source)
     return (
-        "PASS\n"
+        "PARTIAL\n"
+        "Transport status: PASS\n"
+        "Evidence-gathering status: PASS\n"
+        "Synthesis status: FALLBACK\n"
+        "Task status: PARTIAL\n"
         f"Command used: {command}\n"
         f"Files gathered: {files}\n"
         f"Summary:\n{summary}\n"
         f"Evidence snippets:\n{evidence}\n"
         f"Requested deliverable: {outputs}\n"
-        "Confidence/caveat: MEDIUM — deterministic bridge fallback produced this report from the gathered source pack because model synthesis was unavailable."
+        f"{evidence_coverage}\n"
+        f"{deliverable_sections}\n"
+        "Confidence: MEDIUM\n"
+        "Caveats: deterministic bridge fallback produced this report from the gathered source pack because model synthesis was unavailable; task completion is not certified."
     )
 
 
@@ -1186,10 +1294,12 @@ def select_mode(envelope: dict) -> str:
         return "invalid_handoff"
     if envelope.get("proof_critical"):
         return "escalate"
-    if envelope.get("write_allowed") and envelope.get("owned_paths"):
+    if envelope.get("write_allowed") and envelope.get("owned_paths") and envelope.get("exact_content"):
         return "bounded_write_exact"
-    if envelope.get("write_allowed"):
+    if envelope.get("write_allowed") and envelope.get("owned_paths"):
         return "bounded_write_patch"
+    if envelope.get("write_allowed"):
+        return "invalid_handoff"
     if envelope.get("read_only_paths") and envelope.get("deliverable_fields"):
         return "context_pack_report"
     if envelope.get("read_only_paths"):
@@ -1214,7 +1324,46 @@ def is_intent_or_status(text: str) -> bool:
     return False
 
 
-def validate_report_output(text: str, mode: str, envelope: dict) -> tuple:
+def verification_contract_requested(envelope: dict) -> bool:
+    """Return true when the handoff asks for verification proof, not just search evidence."""
+    fields = [_field_label(field) for field in envelope.get("deliverable_fields", [])]
+    if any("verification" in field or field in ("tests", "check", "checks") for field in fields):
+        return True
+    for step in envelope.get("verification_steps", []):
+        lowered = str(step).lower()
+        if any(word in lowered for word in ("run ", "test", "diff --check", "typecheck", "lint", "doctor", "verify")):
+            return True
+    return False
+
+
+def output_claims_verification(text: str) -> bool:
+    lowered = str(text or "").lower()
+    return any(
+        phrase in lowered
+        for phrase in (
+            "verification passed",
+            "verification: pass",
+            "verification result: pass",
+            "tests passed",
+            "checks passed",
+            "diff --check passed",
+            "doctor passed",
+        )
+    )
+
+
+def tool_output_indicates_failure(output_text: str) -> bool:
+    lowered = str(output_text or "").lower()
+    if re.search(r"(process exited with code|exit code|exit_code:)\s*[1-9]\d*", lowered):
+        return True
+    if any(token in lowered for token in ("traceback (most recent call last)", "assertionerror", "syntaxerror")):
+        return True
+    return False
+
+
+def validate_report_output(text: str, mode: str, envelope: dict,
+                           verification_observed: bool = False,
+                           evidence_coverage_complete: bool = True) -> tuple:
     is_valid = True
     missing = []
     t = text.lower()
@@ -1223,18 +1372,42 @@ def validate_report_output(text: str, mode: str, envelope: dict) -> tuple:
         return False, ["intent_or_status_detected"]
 
     required_by_mode = {
-        "context_pack_report": ["pass", "fail", "confidence", "caveat"],
+        "context_pack_report": ["confidence", "caveat"],
         "managed_autonomy": ["confidence", "caveat"],
-        "bounded_write_exact": ["pass", "fail", "file", "confidence"],
-        "bounded_write_patch": ["pass", "fail", "file", "confidence", "caveat"],
+        "bounded_write_exact": ["file", "confidence"],
+        "bounded_write_patch": ["file", "confidence", "caveat"],
         "no_tool_exact": [],
         "escalate": [],
     }
+
+    if mode in ("context_pack", "context_pack_report", "managed_autonomy", "bounded_write_exact", "bounded_write_patch"):
+        if not re.search(r"\b(pass|fail|partial)\b", t):
+            is_valid = False
+            missing.append("status")
 
     for field in required_by_mode.get(mode, []):
         if field not in t:
             is_valid = False
             missing.append(field)
+
+    exact_deliverables = [
+        _field_label(field)
+        for field in envelope.get("deliverable_fields", [])
+        if _is_exact_deliverable_field(field)
+    ]
+    for field in exact_deliverables:
+        if field.lower() not in t:
+            is_valid = False
+            missing.append(field)
+
+    if verification_contract_requested(envelope) and output_claims_verification(text) and not verification_observed:
+        is_valid = False
+        missing.append("verification_observed")
+
+    if mode in ("context_pack", "context_pack_report", "managed_autonomy"):
+        if not evidence_coverage_complete and re.search(r"\bpass\b", t) and not re.search(r"\bpartial\b", t):
+            is_valid = False
+            missing.append("evidence_coverage")
 
     return is_valid, missing
 
@@ -1749,6 +1922,108 @@ def build_deterministic_write_report(model: str, tool_name: str, path: str,
         "role": "assistant",
         "content": [{"type": "output_text", "text": text, "annotations": []}],
     }
+
+
+def _repo_relative_path(path: str, project_root: str) -> str:
+    p = os.path.normpath(os.path.expanduser(str(path or "")))
+    if not p:
+        return ""
+    if os.path.isabs(p):
+        try:
+            return os.path.relpath(p, project_root)
+        except ValueError:
+            return p
+    return p
+
+
+def _path_is_within_project(path: str, project_root: str) -> bool:
+    if not path:
+        return False
+    full = os.path.normpath(path if os.path.isabs(path) else os.path.join(project_root, path))
+    root = os.path.normpath(project_root)
+    return full == root or full.startswith(root + os.sep)
+
+
+def _path_is_within_owned_paths(path: str, owned_paths: list, project_root: str) -> bool:
+    if not path:
+        return True
+    if not _path_is_within_project(path, project_root):
+        return False
+    rel = _repo_relative_path(path, project_root)
+    for owned in owned_paths or []:
+        owned_rel = _repo_relative_path(owned, project_root).rstrip(os.sep)
+        if rel == owned_rel or rel.startswith(owned_rel + os.sep):
+            return True
+    return False
+
+
+def collect_owned_path_changes(owned_paths: list, project_root: str) -> list:
+    """Return changed/untracked paths under the owned path set."""
+    scoped = []
+    for path in owned_paths or []:
+        if _path_is_within_project(path, project_root):
+            scoped.append(_repo_relative_path(path, project_root))
+    if not scoped:
+        return []
+    try:
+        proc = subprocess.run(
+            ["git", "-C", project_root, "status", "--porcelain", "--"] + scoped,
+            capture_output=True, text=True, timeout=10,
+        )
+    except Exception:
+        return []
+    if proc.returncode != 0:
+        return []
+    changed = []
+    for line in proc.stdout.splitlines():
+        if not line.strip():
+            continue
+        path = line[3:].strip()
+        if " -> " in path:
+            path = path.split(" -> ", 1)[1].strip()
+        if path and path not in changed:
+            changed.append(path)
+    return changed
+
+
+def _find_tool_call_details(prev_state: Optional[StoredResponse], tool_call_id: str) -> tuple:
+    """Return (tool_name, tool_args, target_path) for the current tool call when known."""
+    if not prev_state:
+        return ("", "", "")
+    for msg in prev_state.messages:
+        for tc in msg.get("tool_calls") or []:
+            tc_func = tc.get("function", {})
+            if tc.get("id") == tool_call_id or tc.get("codex", {}).get("call_id") == tool_call_id:
+                tool_name = tc_func.get("name", "")
+                tool_args = tc_func.get("arguments", "")
+                target_path, _ = normalize_tool_args(tool_args, tool_name)
+                return (tool_name, tool_args, target_path or "")
+    return ("", "", "")
+
+
+def build_patch_contract_report(envelope: dict, changed_paths: list, status: str,
+                                reason: str, verification_seen: bool = False,
+                                verification_output: str = "") -> str:
+    owned = ", ".join(envelope.get("owned_paths", [])) or "unknown"
+    changed = ", ".join(changed_paths) if changed_paths else "none"
+    verification = "observed" if verification_seen else "not_observed"
+    output_line = ""
+    if verification_output:
+        clipped = verification_output.strip().replace("\n", " | ")[:500]
+        output_line = f"Verification evidence: {clipped}\n"
+    return (
+        f"{status}\n"
+        "Transport status: PASS\n"
+        f"Task status: {status}\n"
+        f"Owned paths: {owned}\n"
+        f"Changed owned paths: {changed}\n"
+        f"Verification status: {verification}\n"
+        f"{output_line}"
+        f"Reason: {reason}\n"
+        "Confidence: MEDIUM\n"
+        "Caveats: deterministic bridge patch report; GPT review must verify semantic correctness before acceptance."
+    )
+
 
 def build_deterministic_error_report(error_kind: str, details: str) -> JSON:
     """Build a deterministic error report when a tool fails."""
@@ -3253,6 +3528,87 @@ class Handler(BaseHTTPRequestHandler):
         if isinstance(tool_output_raw, dict) and tool_output_raw.get("error"):
             exit_code = 1
 
+        handoff_text = _extract_handoff_text(prev_state.messages) if prev_state else ""
+        envelope = parse_task_envelope(handoff_text)
+        mode = select_mode(envelope)
+        _, _, target_path = _find_tool_call_details(prev_state, tool_call_id)
+
+        if mode == "bounded_write_patch" and tool_kind == "shell":
+            project_root = os.getcwd()
+            changed_paths = collect_owned_path_changes(envelope.get("owned_paths", []), project_root)
+            failed = exit_code != 0 or tool_output_indicates_failure(tool_output_text)
+            if not changed_paths:
+                status = "FAIL" if failed else "PARTIAL"
+                reason = "verification tool was observed, but no changed owned path was visible in git status"
+            elif failed:
+                status = "FAIL"
+                reason = "verification tool output indicated failure"
+            else:
+                status = "PASS"
+                reason = "owned path changes and verification tool output were both observed"
+            text = build_patch_contract_report(
+                envelope, changed_paths, status, reason,
+                verification_seen=True, verification_output=compacted.compacted)
+            emitter = ResponseEmitter(self, new_id("resp"), model_alias, bool(body.get("stream")))
+            emitter.emit_text_message(text)
+            emitter.complete()
+            APP.log("bounded_patch_verification_complete", status=status, changed_paths=changed_paths)
+            return
+
+        if mode == "bounded_write_patch" and tool_kind == "write" and exit_code == 0:
+            project_root = os.getcwd()
+            owned_paths = envelope.get("owned_paths", [])
+            if target_path and not _path_is_within_owned_paths(target_path, owned_paths, project_root):
+                text = build_patch_contract_report(
+                    envelope, [], "FAIL",
+                    f"write target {target_path} is outside the declared owned paths")
+                emitter = ResponseEmitter(self, new_id("resp"), model_alias, bool(body.get("stream")))
+                emitter.emit_text_message(text)
+                emitter.complete()
+                APP.log("bounded_patch_scope_violation", target_path=target_path, owned_paths=owned_paths)
+                return
+            changed_paths = collect_owned_path_changes(owned_paths, project_root)
+            if not changed_paths:
+                text = build_patch_contract_report(
+                    envelope, [], "FAIL",
+                    "write tool returned success but no changed owned path was visible in git status")
+                emitter = ResponseEmitter(self, new_id("resp"), model_alias, bool(body.get("stream")))
+                emitter.emit_text_message(text)
+                emitter.complete()
+                APP.log("bounded_patch_no_owned_change", owned_paths=owned_paths)
+                return
+            if turn < max_exchanges and prev_state:
+                ledger_text = (
+                    "PATCH CONTRACT LEDGER\n"
+                    "Execution mode: bounded_write_patch\n"
+                    f"Owned paths: {', '.join(owned_paths)}\n"
+                    f"Changed owned paths observed: {', '.join(changed_paths)}\n"
+                    f"Required outputs: {', '.join(envelope.get('deliverable_fields', []))}\n"
+                    f"Verification steps: {', '.join(envelope.get('verification_steps', []))}\n"
+                    "Next: run the requested verification if possible, then return the final report. "
+                    "Do not edit outside the owned paths."
+                )
+                input_items = list(body.get("input", []))
+                input_items.insert(0, {"role": "system", "content": ledger_text})
+                body["input"] = input_items
+                APP.log("bounded_patch_continue_for_verification", changed_paths=changed_paths)
+                self._handle_fresh_turn(body)
+                if prev_id:
+                    refreshed = APP.state.get(str(prev_id))
+                    if refreshed:
+                        refreshed.tool_exchange_count = turn
+                        refreshed.task_max_exchanges = max_exchanges
+                        APP.state.put(refreshed)
+                return
+            text = build_patch_contract_report(
+                envelope, changed_paths, "PARTIAL",
+                "owned path changes were observed, but verification was not observed before the tool budget ended")
+            emitter = ResponseEmitter(self, new_id("resp"), model_alias, bool(body.get("stream")))
+            emitter.emit_text_message(text)
+            emitter.complete()
+            APP.log("bounded_patch_partial_no_verification", changed_paths=changed_paths)
+            return
+
         # Deterministic close for writes and errors (even under budget)
         # Writers always close deterministically after first write
         if exit_code != 0 or tool_kind == "write":
@@ -3272,9 +3628,10 @@ class Handler(BaseHTTPRequestHandler):
             APP.log("continuation_continue", turn=turn, max_exchanges=max_exchanges)
 
             # Determine execution mode from handoff
-            handoff_text = _extract_handoff_text(prev_state.messages)
-            envelope = parse_task_envelope(handoff_text)
-            mode = select_mode(envelope)
+            if not handoff_text:
+                handoff_text = _extract_handoff_text(prev_state.messages)
+                envelope = parse_task_envelope(handoff_text)
+                mode = select_mode(envelope)
             APP.log("execution_mode", mode=mode, paths=envelope.get("read_only_paths", []))
             read_paths = _extract_read_paths_from_history(prev_state.messages)
 
@@ -3325,6 +3682,20 @@ class Handler(BaseHTTPRequestHandler):
                     try:
                         full = os.path.normpath(os.path.join(os.getcwd(), path))
                         observed = open(full).read().strip()
+                        if observed != exact_content:
+                            report_text = (
+                                f"FAIL\n"
+                                f"File checked: {path}\n"
+                                f"Observed content: {observed}\n"
+                                f"Expected content: {exact_content}\n"
+                                f"Confidence: HIGH — deterministic read-back did not match declared exact_content; "
+                                f"Caveat: final OSS model report bypassed by bridge runtime (mode={mode})."
+                            )
+                            emitter = ResponseEmitter(self, new_id("resp"), model_alias, bool(body.get("stream")))
+                            emitter.emit_text_message(report_text)
+                            emitter.complete()
+                            APP.log("bounded_write_mismatch", path=path)
+                            return
                         report_text = (
                             f"PASS\n"
                             f"File changed: {path}\n"
@@ -3365,6 +3736,7 @@ class Handler(BaseHTTPRequestHandler):
                 session.read_paths = {p: {"complete": True} for p in read_paths}
                 # Build context pack with remaining files
                 pack = build_context_pack(session, os.getcwd())
+                evidence_coverage_complete, _, _, _ = evaluate_evidence_coverage(envelope, pack)
                 # Send as no-tools finalizer call
                 finalizer_payload = {
                     "model": map_model(APP.continuation_model, APP.model_map),
@@ -3382,30 +3754,39 @@ class Handler(BaseHTTPRequestHandler):
                     chat_resp = APP.call_continuation_with_deadline(
                         finalizer_payload, APP.continuation_deadline)
                     text = chat_resp.get("choices", [{}])[0].get("message", {}).get("content", "")
-                    # v12: Reject intent/status text — retry once if budget
+                    # v12: Reject intent/status text and reports that do not satisfy the task contract.
                     if is_intent_or_status(text):
                         APP.log("intent_rejected", text_len=len(text))
                         remaining = request_deadline - (time.time() - request_start)
                         if remaining > 20:
                             retry_payload = {
-                            "model": finalizer_payload["model"],
-                            "messages": finalizer_payload["messages"] + [
-                                {"role": "user", "content":
-                             "You returned status/intent text instead of a report. "
-                             "That is invalid. Return the final report now. Do not describe future actions. "
-                             "Include PASS or FAIL, confidence, and caveats."}],
-                            "stream": False, "tools": [],
-                        }
+                                "model": finalizer_payload["model"],
+                                "messages": finalizer_payload["messages"] + [
+                                    {"role": "user", "content":
+                                     "You returned status/intent text instead of a report. "
+                                     "That is invalid. Return the final report now. Do not describe future actions. "
+                                     "Include PASS, FAIL, or PARTIAL; confidence; caveats; and every required output field."}
+                                ],
+                                "stream": False,
+                                "tools": [],
+                            }
                             try:
                                 chat_resp = APP.call_continuation_with_deadline(retry_payload, APP.continuation_deadline * 0.7)
                                 text = chat_resp.get("choices", [{}])[0].get("message", {}).get("content", "")
                                 APP.log("intent_retry_ok", text_len=len(text))
                             except Exception:
-                                text = "PARTIAL\nConfidence: LOW\nCaveat: model returned intent/status text; retry failed."
+                                text = "PARTIAL\nConfidence: LOW\nCaveats: model returned intent/status text; retry failed."
                                 APP.log("intent_retry_failed")
                     if is_intent_or_status(text):
                         APP.log("context_pack_intent_fallback", text_len=len(text))
                         text = build_context_pack_deterministic_report(session, pack, tool_output_text)
+                    else:
+                        is_valid, missing = validate_report_output(
+                            text, mode, envelope,
+                            evidence_coverage_complete=evidence_coverage_complete)
+                        if not is_valid:
+                            APP.log("context_pack_report_contract_fallback", missing=missing, text_len=len(text))
+                            text = build_context_pack_deterministic_report(session, pack, tool_output_text)
                     emitter = ResponseEmitter(self, new_id("resp"), model_alias, bool(body.get("stream")))
                     emitter.emit_text_message(text)
                     emitter.complete()
@@ -3425,10 +3806,16 @@ class Handler(BaseHTTPRequestHandler):
                             chat_resp = APP.call_continuation_with_deadline(
                                 fallback_payload, min(APP.continuation_deadline, remaining - 2))
                             text = chat_resp.get("choices", [{}])[0].get("message", {}).get("content", "")
-                            if text and not is_intent_or_status(text):
+                            is_valid, missing = (
+                                validate_report_output(
+                                    text, mode, envelope,
+                                    evidence_coverage_complete=evidence_coverage_complete)
+                                if text else (False, ["empty_report"])
+                            )
+                            if text and is_valid:
                                 APP.log("context_pack_fallback_ok", fallback_model=fallback_payload["model"], text_len=len(text))
                                 break
-                            APP.log("context_pack_fallback_invalid", fallback_model=fallback_payload["model"], text_len=len(text))
+                            APP.log("context_pack_fallback_invalid", fallback_model=fallback_payload["model"], missing=missing, text_len=len(text))
                             text = ""
                         except Exception as fallback_error:
                             APP.log("context_pack_fallback_failed", fallback_model=fallback_payload["model"], error=str(fallback_error))

@@ -156,14 +156,18 @@ The bridge selects the right mode based on the task handoff:
 
 - **`invalid_handoff`** — malformed `OSS_HANDOFF_JSON` blocks fail closed before delegated work is trusted.
 - **`no_tool_exact`** — exact output tasks (guardrail tests, control probes). No model decisions needed.
-- **`context_pack_report`** — read tasks with explicit `READ-ONLY PATHS` + `DELIVERABLE`. Bridge gathers all files internally, sends one no-tools synthesis call. Command-aware: `grep X in Y` steps get grep output, not full files.
+- **`context_pack_report`** — read/report tasks with explicit `READ-ONLY PATHS` + `DELIVERABLE`. Bridge gathers all files internally, sends one no-tools synthesis call, and validates that the final text includes the requested structured deliverable fields. Command-aware: `grep X in Y` steps get grep output, not full files.
 - **`managed_autonomy`** — discovery tasks where the model chooses what to inspect. Budget-capped, duplicate-suppressed, evidence-ledger-injected.
-- **`bounded_write_exact`** — writes to explicit `OWNED PATHS` with exact content. Bridge writes the file directly, reads it back, returns deterministic PASS/FAIL. No model call needed.
+- **`bounded_write_exact`** — writes to explicit `OWNED PATHS` only when `exact_content` is present. Bridge writes the file directly, reads it back, and returns PASS only when observed content matches the declared exact content. No model call needed.
+- **`bounded_write_patch`** — model-assisted edits to explicit `OWNED PATHS` when no `exact_content` is present, including `docs_support` tasks. Permission fields define scope; they do not by themselves select exact-write mode.
 
 ### Guarantees
 
-- **Writes**: Deterministic — bridge writes file, reads back, reports result. No model self-report dependency.
-- **Reads**: Context-pack or managed autonomy with deadline control. Grep-directed searches include only grep output instead of full files.
+- **Exact writes**: Deterministic — bridge writes declared exact content, reads back, and reports PASS only on exact match. No model self-report dependency.
+- **Patch/docs writes**: Scope-bounded — owned paths constrain the edit lane. The bridge checks changed owned paths, rejects no-change or out-of-scope writes, and gives the agent a bounded verification turn before the orchestrator treats the patch as accepted.
+- **Reads/reports**: Context-pack or managed autonomy with deadline control. Grep-directed searches include only grep output instead of full files. Transport success and task success are separate: if synthesis is unavailable or required deliverable fields are missing, the bridge returns `PARTIAL` with evidence and caveats instead of pretending the delegated task passed.
+- **Evidence coverage**: Requested read paths and search terms must be represented in the evidence pack as read, searched, errored, or rejected. A confident report with incomplete evidence coverage is rejected or downgraded to `PARTIAL`.
+- **Verification ledger**: Verification is an observed tool/result, not a prose claim. Reports that request or claim verification are rejected or downgraded unless the bridge observed the verification turn.
 - **Intent rejection**: "I will", "Running...", "Starting..." rejected as non-terminal. Internal retry once, then deterministic report from gathered evidence.
 - **Timeout recovery**: Request-level deadline prevents serial timeout stacking. Deterministic PARTIAL report within deadline instead of client disconnect.
 - **Terminal guarantee**: Every path emits `response.completed` or `response.failed` before closing the SSE stream.
@@ -182,6 +186,16 @@ If the JSON is malformed or missing required fields, the bridge returns `FAIL` i
 ```bash
 python3 ~/bridge/bin/codex-oss validate-handoff /path/to/handoff.md
 ```
+
+### Protocol conformance
+
+Run the protocol conformance suite before trusting a bridge release:
+
+```bash
+python3 tests/test_protocol_conformance.py
+```
+
+It covers malformed structured handoffs, exact-write routing, no-match search evidence, incomplete evidence coverage, bounded patch acceptance, verification claims, verification output failure detection, and scope-boundary checks.
 
 ### Runtime environment variables
 

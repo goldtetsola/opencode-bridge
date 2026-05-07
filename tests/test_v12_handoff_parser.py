@@ -11,6 +11,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from bridge import extract_allowed_paths, extract_required_deliverables, parse_task_envelope, select_mode
 from bridge import build_context_pack, build_context_pack_deterministic_report, build_task_session
+from bridge import build_patch_contract_report, collect_owned_path_changes, validate_report_output
+from bridge import evaluate_evidence_coverage, tool_output_indicates_failure, verification_contract_requested
 from bridge import _extract_handoff_text, extract_search_terms_from_step
 from codex_oss.handoff import validate_handoff_text
 
@@ -142,6 +144,112 @@ DELIVERABLE: Return findings.
     structured_session = build_task_session({"input": []}, structured, "resp_structured")
     assert structured_session.required_paths == ["tests/fixtures"], structured_session
     assert structured_session.required_outputs == ["confidence", "evidence"], structured_session
+
+    generic_report_contract = """OSS_HANDOFF_JSON:
+{"schema_version":1,"role":"Generic report scout","goal":"Produce a contract-shaped report from known files","task_type":"scout","owned_paths":[],"read_only_paths":["tests/fixtures","README.md"],"forbidden_actions":["Do not edit files"],"verification_steps":["Search read-only paths for terminal_blocker_state, append_timeout_reason, missing_generic_contract_term"],"deliverable_fields":["summary","evidence_table","touchpoint_check","falsification_notes","pending_gaps","confidence","caveats"],"completion_rule":"stop after report","escalation_rule":"stop if source pack is partial"}
+"""
+    generic_envelope = parse_task_envelope(generic_report_contract)
+    assert select_mode(generic_envelope) == "context_pack_report", generic_envelope
+    generic_session = build_task_session({"input": []}, generic_report_contract, "resp_contract")
+    generic_pack = build_context_pack(generic_session, root)
+    assert "rtk grep missing_generic_contract_term in README.md" in generic_pack, generic_pack[:2000]
+    coverage_ok, missing_coverage, covered_paths, covered_terms = evaluate_evidence_coverage(generic_envelope, generic_pack)
+    assert coverage_ok, missing_coverage
+    assert "tests/fixtures" in covered_paths, covered_paths
+    assert "missing_generic_contract_term" in covered_terms, covered_terms
+    generic_report = build_context_pack_deterministic_report(generic_session, generic_pack, "")
+    assert generic_report.startswith("PARTIAL\n"), generic_report
+    assert "Transport status: PASS" in generic_report, generic_report
+    assert "Task status: PARTIAL" in generic_report, generic_report
+    assert "evidence_coverage:" in generic_report, generic_report
+    assert "- status: PASS" in generic_report, generic_report
+    generic_report_lower = generic_report.lower()
+    for field in generic_envelope["deliverable_fields"]:
+        assert f"{field.lower()}:" in generic_report_lower, generic_report
+    thin_report = (
+        "PASS\n"
+        "Summary: gathered the requested source files and produced a short note from available context.\n"
+        "Confidence: HIGH\n"
+        "Caveats: none listed."
+    )
+    is_valid, missing = validate_report_output(thin_report, "context_pack_report", generic_envelope)
+    assert not is_valid, missing
+    assert "evidence_table" in missing, missing
+    incomplete_pack = "=== README.md (10 chars) ===\nhello\n"
+    coverage_ok, missing_coverage, _, _ = evaluate_evidence_coverage(generic_envelope, incomplete_pack)
+    assert not coverage_ok, missing_coverage
+    confident_but_uncovered = (
+        "PASS\n"
+        "summary: complete\n"
+        "evidence_table: complete\n"
+        "touchpoint_check: complete\n"
+        "falsification_notes: complete\n"
+        "pending_gaps: none\n"
+        "confidence: high\n"
+        "caveats: none\n"
+    )
+    is_valid, missing = validate_report_output(
+        confident_but_uncovered, "context_pack_report", generic_envelope,
+        evidence_coverage_complete=coverage_ok)
+    assert not is_valid, missing
+    assert "evidence_coverage" in missing, missing
+
+    docs_support = """OSS_HANDOFF_JSON:
+{"schema_version":1,"role":"Docs support editor","goal":"Amend an existing spec without implementing code","task_type":"docs_support","owned_paths":["docs/specs/example.md"],"read_only_paths":["docs/specs/example.md"],"forbidden_actions":["Do not edit source code"],"verification_steps":["Run rtk git diff --check -- docs/specs/example.md"],"deliverable_fields":["changed_sections","verification","caveats"],"completion_rule":"stop after editing the spec and running diff check","escalation_rule":"stop if the spec structure is unclear"}
+"""
+    docs_envelope = parse_task_envelope(docs_support)
+    assert docs_envelope["write_allowed"], docs_envelope
+    assert not docs_envelope["exact_content"], docs_envelope
+    assert select_mode(docs_envelope) == "bounded_write_patch", docs_envelope
+    assert verification_contract_requested(docs_envelope), docs_envelope
+    claimed_verified_report = (
+        "PASS\n"
+        "changed_sections: intro\n"
+        "verification: passed\n"
+        "caveats: none\n"
+        "file: docs/specs/example.md\n"
+        "confidence: high\n"
+    )
+    is_valid, missing = validate_report_output(claimed_verified_report, "bounded_write_patch", docs_envelope)
+    assert not is_valid, missing
+    assert "verification_observed" in missing, missing
+    is_valid, missing = validate_report_output(
+        claimed_verified_report, "bounded_write_patch", docs_envelope, verification_observed=True)
+    assert is_valid, missing
+    assert tool_output_indicates_failure("Process exited with code 1\nAssertionError: nope")
+    assert not tool_output_indicates_failure("Process exited with code 0\nAll checks passed")
+    patch_probe = os.path.join(root, "tests", "fixtures", "generated_patch_contract.txt")
+    try:
+        with open(patch_probe, "w", encoding="utf-8") as f:
+            f.write("patch contract probe\n")
+        changed = collect_owned_path_changes(["tests/fixtures/generated_patch_contract.txt"], root)
+        assert "tests/fixtures/generated_patch_contract.txt" in changed, changed
+        patch_report = build_patch_contract_report(
+            docs_envelope, changed, "PARTIAL",
+            "owned path changes were observed, but verification was not observed before the tool budget ended")
+        assert patch_report.startswith("PARTIAL\n"), patch_report
+        assert "Transport status: PASS" in patch_report, patch_report
+        assert "Changed owned paths: tests/fixtures/generated_patch_contract.txt" in patch_report, patch_report
+        assert "Verification status: not_observed" in patch_report, patch_report
+        verified_patch_report = build_patch_contract_report(
+            docs_envelope, changed, "PASS",
+            "owned path changes and verification tool output were both observed",
+            verification_seen=True,
+            verification_output="rtk git diff --check\nProcess exited with code 0")
+        assert verified_patch_report.startswith("PASS\n"), verified_patch_report
+        assert "Verification status: observed" in verified_patch_report, verified_patch_report
+        assert "Verification evidence:" in verified_patch_report, verified_patch_report
+    finally:
+        try:
+            os.remove(patch_probe)
+        except FileNotFoundError:
+            pass
+
+    exact_write = """OSS_HANDOFF_JSON:
+{"schema_version":1,"role":"Exact write tester","goal":"Create one exact file","task_type":"bounded_write","owned_paths":["tmp/exact.txt"],"read_only_paths":[],"forbidden_actions":["Do not edit other files"],"verification_steps":["Read back the file"],"deliverable_fields":["pass","file","confidence"],"completion_rule":"stop after deterministic write","escalation_rule":"stop if outside owned path is needed","write_allowed":true,"exact_content":"hello exact"}
+"""
+    exact_envelope = parse_task_envelope(exact_write)
+    assert select_mode(exact_envelope) == "bounded_write_exact", exact_envelope
 
     generated_large = os.path.join(root, "tests", "fixtures", "generated_large_context_pack.txt")
     with open(generated_large, "w", encoding="utf-8") as f:
