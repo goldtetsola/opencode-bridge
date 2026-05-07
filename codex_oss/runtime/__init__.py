@@ -1,0 +1,262 @@
+"""RuntimeToolV1 execution layer. Bridge-owned tools, no Codex tool loop involvement."""
+
+from __future__ import annotations
+
+import os
+import subprocess
+import hashlib
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Any, Tuple
+
+JSON = Dict[str, Any]
+
+PROJECT_ROOT = os.getcwd()
+
+# Forbidden paths (always blocked, even under allowed roots)
+_DENY_PATTERNS = {
+    ".env", "*.env", "secrets", ".git", "node_modules",
+    ".codex-oss/env", ".codex-oss/state", ".codex-oss/logs",
+}
+
+# Secret patterns to redact
+_SECRET_PATTERNS = [
+    "sk-", "OPENCODE_GO_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY",
+    "DATABASE_URL", "AUTH_TOKEN", "-----BEGIN",
+]
+
+
+@dataclass
+class ToolResult:
+    tool: str
+    args: dict
+    exit_code: int
+    stdout: str
+    stderr: str
+    sha256: str = ""
+    complete: bool = True
+    chars_total: int = 0
+    redactions_applied: bool = False
+    risk_flags: List[str] = field(default_factory=list)
+
+
+def resolve_path(raw: str, allowed_roots: list, allowed_paths: list) -> Tuple[Optional[str], Optional[str]]:
+    """Resolve and validate a path. Returns (normalized_path, error)."""
+    path = raw.strip().strip("'\"")
+    if not path:
+        return None, "empty path"
+
+    # Block .. escapes
+    if ".." in path.split(os.sep):
+        return None, f"path escape blocked: {raw}"
+
+    # Resolve absolute paths
+    if path.startswith("/"):
+        real = os.path.realpath(path)
+        cwd = os.path.realpath(PROJECT_ROOT)
+        if not real.startswith(cwd + os.sep) and real != cwd:
+            return None, f"absolute path outside project root: {raw}"
+        path = os.path.relpath(real, PROJECT_ROOT)
+
+    # Block deny patterns
+    for deny in _DENY_PATTERNS:
+        if deny.startswith("*"):
+            if path.endswith(deny[1:]) or path.endswith(deny[1:] + "/"):
+                return None, f"deny pattern matched: {deny}"
+        elif path == deny or path.startswith(deny + os.sep) or path == deny.rstrip("/"):
+            return None, f"deny pattern matched: {deny}"
+
+    # Check symlinks
+    try:
+        full = os.path.join(PROJECT_ROOT, path)
+        real = os.path.realpath(full)
+        cwd = os.path.realpath(PROJECT_ROOT)
+        if not real.startswith(cwd + os.sep) and real != cwd:
+            return None, f"symlink resolves outside project root: {path}"
+    except OSError:
+        return None, f"path resolution failed: {path}"
+
+    # Check allowed paths
+    if not allowed_roots and not allowed_paths:
+        return path, None  # no restrictions
+
+    # Check exact paths first
+    for allowed in allowed_paths:
+        if path == allowed or path == allowed.rstrip("/"):
+            return path, None
+
+    # Check roots
+    for root in allowed_roots:
+        root_clean = root.rstrip("/") + "/"
+        path_check = path if path.endswith("/") else path + "/"
+        if path_check.startswith(root_clean) or path == root.rstrip("/"):
+            return path, None
+
+    return None, f"path not in allowed roots/paths: {path}"
+
+
+def exec_read(path: str, max_bytes: int = 200000, timeout: int = 20) -> ToolResult:
+    """Execute rtk read on an allowed path."""
+    try:
+        proc = subprocess.run(
+            ["rtk", "read", path],
+            cwd=PROJECT_ROOT, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return ToolResult(tool="rtk_read", args={"path": path},
+                          exit_code=-1, stdout="", stderr="timeout",
+                          complete=False)
+    except FileNotFoundError:
+        return ToolResult(tool="rtk_read", args={"path": path},
+                          exit_code=-1, stdout="", stderr="rtk not found",
+                          complete=False)
+
+    stdout = proc.stdout[:max_bytes] if proc.stdout else ""
+    stderr = proc.stderr[:20000] if proc.stderr else ""
+    sha = hashlib.sha256(stdout.encode()).hexdigest()[:12]
+
+    # Scan for secrets
+    redacted = False
+    for pattern in _SECRET_PATTERNS:
+        if pattern in stdout or pattern.lower() in stdout.lower():
+            stdout = _redact(stdout)
+            redacted = True
+            break
+
+    chars_total = len(proc.stdout or "")
+    complete = chars_total <= max_bytes
+
+    return ToolResult(tool="rtk_read", args={"path": path},
+                      exit_code=proc.returncode or 0, stdout=stdout, stderr=stderr,
+                      sha256=sha, complete=complete, chars_total=chars_total,
+                      redactions_applied=redacted)
+
+
+def exec_grep(pattern: str, path: str, timeout: int = 20) -> ToolResult:
+    """Execute rtk grep on an allowed path."""
+    try:
+        proc = subprocess.run(
+            ["rtk", "grep", pattern, path],
+            cwd=PROJECT_ROOT, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return ToolResult(tool="rtk_grep", args={"pattern": pattern, "path": path},
+                          exit_code=-1, stdout="", stderr="timeout", complete=False)
+    except FileNotFoundError:
+        return ToolResult(tool="rtk_grep", args={"pattern": pattern, "path": path},
+                          exit_code=-1, stdout="", stderr="rtk not found", complete=False)
+
+    stdout = proc.stdout[:100000] if proc.stdout else ""
+    sha = hashlib.sha256(stdout.encode()).hexdigest()[:12]
+    matches = stdout.count("\n") if stdout else 0
+
+    return ToolResult(tool="rtk_grep", args={"pattern": pattern, "path": path},
+                      exit_code=proc.returncode or 0, stdout=stdout,
+                      stderr=proc.stderr[:5000] if proc.stderr else "",
+                      sha256=sha, complete=True,
+                      chars_total=len(proc.stdout or ""),
+                      risk_flags=[] if proc.returncode in (0, 1) else ["grep_tool_error"])
+
+
+def exec_ls(path: str, timeout: int = 10) -> ToolResult:
+    """Execute rtk ls on an allowed path."""
+    try:
+        proc = subprocess.run(
+            ["rtk", "ls", path],
+            cwd=PROJECT_ROOT, capture_output=True, text=True, timeout=timeout)
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return ToolResult(tool="rtk_ls", args={"path": path},
+                          exit_code=-1, stdout="", stderr="ls failed", complete=False)
+
+    return ToolResult(tool="rtk_ls", args={"path": path},
+                      exit_code=proc.returncode or 0,
+                      stdout=proc.stdout[:50000] if proc.stdout else "",
+                      stderr=proc.stderr[:5000] if proc.stderr else "",
+                      complete=True)
+
+
+def exec_git_status(timeout: int = 10) -> ToolResult:
+    """Execute rtk git status --short."""
+    try:
+        proc = subprocess.run(
+            ["rtk", "git", "status", "--short"],
+            cwd=PROJECT_ROOT, capture_output=True, text=True, timeout=timeout)
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return ToolResult(tool="rtk_git_status", args={},
+                          exit_code=-1, stdout="", stderr="git failed", complete=False)
+
+    return ToolResult(tool="rtk_git_status", args={},
+                      exit_code=proc.returncode or 0,
+                      stdout=proc.stdout[:20000] if proc.stdout else "",
+                      complete=True)
+
+
+def exec_git_log(limit: int = 5, timeout: int = 10) -> ToolResult:
+    """Execute rtk git log --oneline -n <limit>."""
+    limit = min(max(1, limit), 20)
+    try:
+        proc = subprocess.run(
+            ["rtk", "git", "log", "--oneline", f"-n{limit}"],
+            cwd=PROJECT_ROOT, capture_output=True, text=True, timeout=timeout)
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return ToolResult(tool="rtk_git_log", args={"limit": limit},
+                          exit_code=-1, stdout="", stderr="git failed", complete=False)
+
+    return ToolResult(tool="rtk_git_log", args={"limit": limit},
+                      exit_code=proc.returncode or 0,
+                      stdout=proc.stdout[:20000] if proc.stdout else "",
+                      complete=True)
+
+
+def exec_git_show_stat(rev: str = "HEAD", timeout: int = 10) -> ToolResult:
+    """Execute rtk git show --stat <rev>."""
+    try:
+        proc = subprocess.run(
+            ["rtk", "git", "show", "--stat", rev],
+            cwd=PROJECT_ROOT, capture_output=True, text=True, timeout=timeout)
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return ToolResult(tool="rtk_git_show_stat", args={"rev": rev},
+                          exit_code=-1, stdout="", stderr="git failed", complete=False)
+
+    return ToolResult(tool="rtk_git_show_stat", args={"rev": rev},
+                      exit_code=proc.returncode or 0,
+                      stdout=proc.stdout[:20000] if proc.stdout else "",
+                      complete=True)
+
+
+def exec_git_diff_stat(path: str = "", timeout: int = 10) -> ToolResult:
+    """Execute rtk git diff --stat [path]."""
+    cmd = ["rtk", "git", "diff", "--stat"]
+    if path:
+        cmd.append(path)
+    try:
+        proc = subprocess.run(cmd, cwd=PROJECT_ROOT, capture_output=True, text=True, timeout=timeout)
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return ToolResult(tool="rtk_git_diff_stat", args={"path": path},
+                          exit_code=-1, stdout="", stderr="git failed", complete=False)
+
+    return ToolResult(tool="rtk_git_diff_stat", args={"path": path},
+                      exit_code=proc.returncode or 0,
+                      stdout=proc.stdout[:20000] if proc.stdout else "",
+                      complete=True)
+
+
+TOOL_EXECUTORS = {
+    "rtk_read": exec_read,
+    "rtk_grep": exec_grep,
+    "rtk_ls": exec_ls,
+    "rtk_git_status": exec_git_status,
+    "rtk_git_log": exec_git_log,
+    "rtk_git_show_stat": exec_git_show_stat,
+    "rtk_git_diff_stat": exec_git_diff_stat,
+}
+
+
+def _redact(text: str) -> str:
+    lines = text.split("\n")
+    out = []
+    for line in lines:
+        for pattern in _SECRET_PATTERNS:
+            if pattern in line:
+                out.append(f"[REDACTED: {pattern[:20]}...]")
+                break
+        else:
+            out.append(line)
+    return "\n".join(out)
