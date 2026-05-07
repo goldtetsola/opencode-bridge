@@ -38,18 +38,56 @@ class ModelAction:
         return self.action_type == "final_report" and self.report is not None
 
 
-def parse_action(text: str) -> Optional[ModelAction]:
-    """Parse a model response into exactly one action. Returns None on failure."""
-    # Try raw JSON first
+def parse_action(text: str, strict: bool = True) -> Optional[ModelAction]:
+    """Parse a model response into EXACTLY ONE action.
+
+    Spec: ActionProtocolEnforcementV1.
+    - Only raw JSON or a single JSON-fenced block is valid.
+    - Markdown fences surrounding non-JSON, prose only, multiple JSON objects,
+      arrays, or multiple actions are INVALID.
+    - In strict mode, returns None immediately on any violation.
+    - In non-strict mode, tries best-effort extraction (compatibility only).
+    """
     text = text.strip()
+
+    # ── Strict mode: enforce spec ──
+    if strict:
+        # Reject if text contains markdown fence but NOT exactly one JSON block
+        fence_count = text.count("```json") + text.count("```")
+        if fence_count > 0:
+            m = re.match(r'^```json\s*\n(.*?)\n```\s*$', text, re.DOTALL)
+            if not m:
+                return None  # Has fences but not wrapping exactly one JSON block
+            text = m.group(1).strip()
+
+        # Try parsing as exactly one JSON object
+        try:
+            d = json.loads(text)
+            if isinstance(d, list):
+                return None  # Arrays are invalid
+            if isinstance(d, dict) and "action_type" in d:
+                # Check for multiple action markers
+                if "tool_name" in d and "report" in d:
+                    return None  # Can't be both tool_call and final_report
+                return ModelAction(d)
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+        # Check for multiple JSON objects
+        obj_count = len(re.findall(r'\{"action_type"\s*:', text))
+        if obj_count == 0:
+            return None  # Prose only — no action JSON found
+        if obj_count > 1:
+            return None  # Multiple actions in one response
+        return None  # Found action_type but couldn't parse as clean JSON
+
+    # ── Non-strict mode: best-effort (legacy compatibility) ──
     try:
         d = json.loads(text)
         if isinstance(d, dict) and "action_type" in d:
             return ModelAction(d)
     except (json.JSONDecodeError, ValueError):
         pass
-
-    # Try JSON block
     m = re.search(r'```json\s*\n(.*?)\n```', text, re.DOTALL)
     if m:
         try:
@@ -58,17 +96,14 @@ def parse_action(text: str) -> Optional[ModelAction]:
                 return ModelAction(d)
         except (json.JSONDecodeError, ValueError):
             pass
-
-    # Try to find any JSON object with action_type
     matches = ACTION_RE.findall(text)
-    for match in matches:
+    if len(matches) == 1:
         try:
-            d = json.loads(match)
+            d = json.loads(matches[0])
             if isinstance(d, dict) and "action_type" in d:
                 return ModelAction(d)
         except (json.JSONDecodeError, ValueError):
             pass
-
     return None
 
 

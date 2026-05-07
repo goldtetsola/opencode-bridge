@@ -374,3 +374,11 @@ def build_deterministic_partial_report(mission, ledger: Any, reason: str) -> dic
 def response_status_from_mission(status: str) -> str:
     """Map mission outcome to transport status per ResponseStatusMappingV1."""
     return "completed"  # Always prefer response.completed for recoverable outcomes
+
+
+RESPONSE_STATUS_TABLE = {
+    "COMPLETE": ("completed", "response.completed with ValidatedReportV1 status COMPLETE"),
+    "PARTIAL": ("completed", "response.completed with ValidatedReportV1 status PARTIAL"),
+    "ESCALATE": ("completed", "response.completed with ValidatedReportV1 status ESCALATE"),
+    "FAILED": ("completed", "response.completed with ValidatedReportV1 status FAILED"),
+}

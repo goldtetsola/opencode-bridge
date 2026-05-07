@@ -144,20 +144,49 @@ def validate_report(report: dict, ledger: Any = None) -> ValidationResult:
 
 
 def _check_ref(ref: str, ledger: Any, errors: List[str]):
+    """Resolve a canonical evidence ref against the ledger. EvidenceRefResolutionPolicyV1."""
     m = EVIDENCE_REF_RE.match(str(ref))
     if not m:
+        errors.append(f"evidence ref '{ref}' has invalid canonical format (expected file:<path>#extract:<id> or command:<turn>)")
         return
     ref_type, target, sub_type, sub_id = m.groups()
+
     if ref_type == "file":
-        entry = ledger.files_inspected.get(target) if hasattr(ledger, 'files_inspected') else None
+        if not hasattr(ledger, 'files_inspected'):
+            errors.append(f"evidence ref '{ref}': no files_inspected in ledger")
+            return
+        entry = ledger.files_inspected.get(target)
         if not entry:
             errors.append(f"evidence ref '{ref}' points to uninspected file: {target}")
+            return
+        if sub_type == "extract" and sub_id:
+            # Check that the extract ID exists
+            extracts = getattr(entry, 'extracts', []) or []
+            found = any(e.get('id') == f"extract:{sub_id}" for e in extracts)
+            if not found:
+                errors.append(f"evidence ref '{ref}' extract '{sub_id}' not found in file {target}")
+
     elif ref_type == "command":
+        if not hasattr(ledger, 'commands_run'):
+            errors.append(f"evidence ref '{ref}': no commands_run in ledger")
+            return
         try:
             idx = int(target)
-            cmds = ledger.commands_run if hasattr(ledger, 'commands_run') else []
+            cmds = ledger.commands_run
             if idx < 0 or idx >= len(cmds):
-                errors.append(f"evidence ref '{ref}' points to nonexistent command: {target}")
+                errors.append(f"evidence ref '{ref}' command index {idx} out of range (0-{len(cmds)-1})")
+                return
+            cmd = cmds[idx]
+            if sub_type == "match" and sub_id:
+                try:
+                    match_n = int(sub_id)
+                    if match_n >= getattr(cmd, 'matches_count', 0):
+                        errors.append(f"evidence ref '{ref}' match {match_n} exceeds matches_count ({cmd.matches_count})")
+                except ValueError:
+                    errors.append(f"evidence ref '{ref}' has non-numeric match index: {sub_id}")
+            elif sub_type == "zero_match":
+                if cmd.exit_code != 1 or getattr(cmd, 'matches_count', -1) != 0:
+                    errors.append(f"evidence ref '{ref}' claims zero_match but command has exit_code={cmd.exit_code}, matches={cmd.matches_count}")
         except ValueError:
             errors.append(f"evidence ref '{ref}' has non-numeric command index: {target}")
 
