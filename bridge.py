@@ -3129,6 +3129,22 @@ class ChatStreamAssembler:
 from codex_oss.transport.emitter import ResponseEmitter
 
 
+def _extract_handoff_from_body(body: JSON) -> str:
+    """Extract the full handoff text from body input items (system + user messages)."""
+    text = ""
+    for item in body.get("input", []):
+        role = item.get("role", "")
+        content = item.get("content", "")
+        if role in ("system", "developer", "user") and content:
+            if isinstance(content, str):
+                text += content + "\n"
+            elif isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict):
+                        text += part.get("text", "") + "\n"
+    return text
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "ResponsesChatProxy/12.0"
 
@@ -3225,6 +3241,55 @@ class Handler(BaseHTTPRequestHandler):
                     status, data, ctype = APP.call_openai_responses(body)
                     self._send_raw(status, data, ctype)
                 return
+
+            # ── v1 spec: A2/A3 managed investigation via runtime loop ──
+            handoff = _extract_handoff_from_body(body)
+            if handoff and "oss_agent_mission.v1" in handoff:
+                try:
+                    from codex_oss.mission import parse_mission_v1, InvalidHandoffError
+                    from codex_oss.runtime.loop import run_loop
+                    from codex_oss.ledger import EvidenceLedger
+                    from codex_oss.validation import validate_report, render_report
+
+                    mission = parse_mission_v1(handoff)
+                    APP.log("mission_dispatch", tier=mission.tier, mode=mission.mode,
+                            mission_id=mission.mission_id)
+
+                    if mission.tier in ("A2", "A3"):
+                        ledger = EvidenceLedger(mission_id=mission.mission_id,
+                                                tool_budget_remaining=mission.tool_budget)
+                        deadline = float(os.getenv("REQUEST_DEADLINE_SECONDS", "90"))
+
+                        def _call_model(messages, tools, timeout):
+                            payload = {
+                                "model": map_model(raw_model_alias or "ocg-kimi-k2.6", APP.model_map),
+                                "messages": messages,
+                                "stream": False,
+                            }
+                            return APP.call_continuation_with_deadline(payload, timeout)
+
+                        result = run_loop(mission, ledger, _call_model, [],
+                                         None, mission.allowed_roots, mission.allowed_paths,
+                                         request_deadline=deadline)
+
+                        report = result.get("report", {})
+                        status = result.get("status", "PARTIAL")
+                        report_text = render_report(report) if isinstance(report, dict) else str(report)
+
+                        emitter = ResponseEmitter(self, new_id("resp"), raw_model_alias, bool(body.get("stream")))
+                        emitter.emit_text_message(report_text)
+                        emitter.complete()
+                        return
+                except InvalidHandoffError as e:
+                    APP.log("mission_invalid", error=str(e))
+                    emitter = ResponseEmitter(self, new_id("resp"), raw_model_alias, bool(body.get("stream")))
+                    emitter.emit_text_message(
+                        f"FAIL\nReason: invalid OSS handoff schema.\nSchema error: {e}\n"
+                        f"Confidence: HIGH — bridge rejected a malformed structured handoff before executing delegated work.")
+                    emitter.complete()
+                    return
+                except Exception as e:
+                    APP.log("mission_crash", error=str(e))
 
             # ── v8: Check for continuation BEFORE prepare_chat_payload ──
             request_kind = classify_request_kind(body)
