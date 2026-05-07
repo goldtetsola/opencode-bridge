@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import hashlib
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
@@ -77,6 +78,8 @@ class DoctorReport:
 def find_project_root() -> Path:
     cwd = Path.cwd()
     for parent in [cwd] + list(cwd.parents):
+        if (parent / "bridge.py").exists() and (parent / "codex_oss").is_dir():
+            return parent
         if (parent / ".codex").is_dir() or (parent / "AGENTS.md").exists():
             return parent
     return cwd
@@ -108,7 +111,14 @@ def _read_toml(path: Path) -> dict:
     return result
 
 
-def run_doctor(project_root: Optional[Path] = None, fix: bool = False) -> DoctorReport:
+def run_doctor(
+    project_root: Optional[Path] = None,
+    fix: bool = False,
+    offline: bool = False,
+    network: bool = False,
+    live_model: bool = False,
+    dev: bool = False,
+) -> DoctorReport:
     report = DoctorReport()
     root = project_root or find_project_root()
 
@@ -117,8 +127,9 @@ def run_doctor(project_root: Optional[Path] = None, fix: bool = False) -> Doctor
     _check_agreements(root, report)
     _check_rules(root, report)
 
-    bridge_url = os.getenv("BRIDGE_URL", "http://127.0.0.1:4000")
-    _check_bridge(bridge_url, report)
+    if not offline:
+        bridge_url = os.getenv("BRIDGE_URL", "http://127.0.0.1:4000")
+        _check_bridge(bridge_url, report, root, live_model=live_model, dev=dev)
 
     report.metadata = {"project_root": str(root)}
     return report
@@ -258,7 +269,7 @@ def _check_rules(root: Path, report: DoctorReport):
         "Run `codex-oss install` to generate no-recursive-codex.rules")
 
 
-def _check_bridge(url: str, report: DoctorReport):
+def _check_bridge(url: str, report: DoctorReport, root: Path, live_model: bool = False, dev: bool = False):
     health_url = f"{url}/health"
     auth = os.getenv("LITELLM_MASTER_KEY", "sk-local-codex-bridge")
 
@@ -277,13 +288,32 @@ def _check_bridge(url: str, report: DoctorReport):
         report.add("bridge.running", "PASS", f"Bridge at {health_url}")
 
     supervisor = health.get("supervisor") or {}
-    if supervisor.get("mode") == "daemon-supervisor" and health.get("ppid") not in (None, 1):
+    mode = supervisor.get("mode", "unknown")
+    if mode in ("daemon-supervisor", "service", "container", "external_verified") and supervisor.get("durable"):
         report.add("bridge.supervisor", "PASS",
-            f"Bridge child is supervised (ppid={health.get('ppid')})")
-    else:
+            f"Bridge child is supervised (mode={mode}, ppid={health.get('ppid')})")
+    elif mode == "foreground" and dev:
         report.add("bridge.supervisor", "WARN",
-            f"Bridge is not running under daemon-supervisor mode ({supervisor})",
+            "Foreground supervisor is acceptable for development only",
+            "Use `codex-oss up --daemon` or a service/container backend for normal OSS agent use")
+    else:
+        report.add("bridge.supervisor", "FAIL",
+            f"Bridge is not running under a durable supported supervisor ({supervisor})",
             "Run `codex-oss stop && codex-oss up --daemon`")
+
+    running_hash = str(health.get("source_sha256", ""))
+    bridge_path = root / "bridge.py"
+    disk_hash = _sha256_path(bridge_path) if bridge_path.exists() else ""
+    if running_hash and disk_hash and running_hash == disk_hash:
+        report.add("bridge.source_hash", "PASS", "Running bridge source matches bridge.py on disk")
+    elif running_hash and disk_hash:
+        report.add("bridge.source_hash", "FAIL",
+            "Running bridge source hash differs from bridge.py on disk",
+            "Restart the bridge through the supervisor")
+    else:
+        report.add("bridge.source_hash", "FAIL",
+            "Bridge health does not expose source_sha256",
+            "Restart a bridge version that reports running source identity")
 
     # GPT rejection test
     api_url = f"{url}/v1/responses"
@@ -312,7 +342,29 @@ def _check_bridge(url: str, report: DoctorReport):
         report.add("bridge.gpt_rejection", "WARN",
             f"Could not test GPT rejection: {e}")
 
-    # OSS inference test
+    # OSS inference test is live-model only. Default doctor must not burn model usage.
+    if not live_model:
+        report.add("bridge.oss_inference", "WARN",
+            "Skipped live OSS inference smoke",
+            "Run `codex-oss doctor --live-model` when you intentionally want to spend a model call")
+    else:
+        _check_live_model(api_url, auth, report)
+
+    # State DB persistence — read from health endpoint
+    state_db = health.get("state_db", "")
+    if not state_db or state_db == "unknown":
+        report.add("bridge.state_db", "WARN",
+            "State DB path unknown",
+            "Set PROXY_STATE_DB to a persistent path")
+    elif "/tmp/" in state_db:
+        report.add("bridge.state_db", "WARN",
+            f"State DB in /tmp ({state_db}) — may be cleaned",
+            "Set PROXY_STATE_DB to a persistent path")
+    elif state_db:
+        report.add("bridge.state_db", "PASS", f"State DB: {state_db}")
+
+
+def _check_live_model(api_url: str, auth: str, report: DoctorReport):
     try:
         data = json.dumps({
             "model": "ocg-kimi-k2.6",
@@ -335,15 +387,9 @@ def _check_bridge(url: str, report: DoctorReport):
             f"OSS inference failed: {e}",
             "Check OPENCODE_GO_API_KEY is set")
 
-    # State DB persistence — read from health endpoint
-    state_db = health.get("state_db", "")
-    if not state_db or state_db == "unknown":
-        report.add("bridge.state_db", "WARN",
-            "State DB path unknown",
-            "Set PROXY_STATE_DB to a persistent path")
-    elif "/tmp/" in state_db:
-        report.add("bridge.state_db", "WARN",
-            f"State DB in /tmp ({state_db}) — may be cleaned",
-            "Set PROXY_STATE_DB to a persistent path")
-    elif state_db:
-        report.add("bridge.state_db", "PASS", f"State DB: {state_db}")
+
+def _sha256_path(path: Path) -> str:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return ""

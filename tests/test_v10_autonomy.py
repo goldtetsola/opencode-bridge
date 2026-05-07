@@ -1,12 +1,69 @@
 #!/usr/bin/env python3
 """v10 runtime tests — proper tool execution, Rorschach task, managed autonomy."""
 
-import json, os, time, urllib.request, subprocess, sys, re
+import json, os, time, urllib.request, subprocess, sys, re, threading, socketserver, http.server
 
 BRIDGE_PORT = 4005
+FAKE_UPSTREAM_PORT = 9005
 RORSCHACH = "/Users/goldtetsola/Desktop/Coding Projects/Rorschach"
 AUTH = "sk-local-codex-bridge"
 URL = f"http://127.0.0.1:{BRIDGE_PORT}/v1/responses"
+LIVE_MODE = os.getenv("V10_LIVE_MODE", "0") == "1"
+
+
+def fake_chat_response(content, tool_calls=None):
+    message = {"role": "assistant", "content": content}
+    if tool_calls:
+        message["content"] = None
+        message["tool_calls"] = tool_calls
+    return json.dumps({
+        "id": "chatcmpl-v10-fake",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": "kimi-k2.6",
+        "choices": [{
+            "index": 0,
+            "message": message,
+            "finish_reason": "tool_calls" if tool_calls else "stop",
+        }],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20},
+    }).encode()
+
+
+class FakeUpstream(http.server.BaseHTTPRequestHandler):
+    calls = 0
+
+    def do_POST(self):
+        FakeUpstream.calls += 1
+        if FakeUpstream.calls == 1:
+            data = fake_chat_response("", tool_calls=[{
+                "id": "call_fake",
+                "type": "function",
+                "function": {"name": "rtk_read", "arguments": "{\"path\":\"package.json\"}"},
+            }])
+        else:
+            content = "PARTIAL\nsummary: fixture finalizer completed\nconfidence: low\ncaveats: fake upstream"
+            data = fake_chat_response(content)
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def log_message(self, *args):
+        pass
+
+
+class ReusableTCPServer(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+
+def start_fake_upstream():
+    server = ReusableTCPServer(("127.0.0.1", FAKE_UPSTREAM_PORT), FakeUpstream)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server
 
 
 def extract_path(args):
@@ -239,23 +296,48 @@ def main():
         "FORCE_SINGLE_TOOL_INSTRUCTIONS": "0",
         "EXPOSE_EMPTY_REASONING_ITEM": "0",
     })
+    os.environ["UPSTREAM_BASE"] = f"http://127.0.0.1:{FAKE_UPSTREAM_PORT}/v1"
 
-    # Bridge must be started externally (we connect to existing)
-    # Check if bridge is running
+    upstream = None
+    bridge_proc = None
+    if not LIVE_MODE:
+        os.environ["OPENCODE_GO_API_KEY"] = "sk-test"
+        os.environ["GPT_MODEL_STRATEGY"] = "oss"
+        upstream = start_fake_upstream()
+        bridge_proc = subprocess.Popen(
+            [sys.executable, os.path.join(os.path.dirname(__file__), "..", "bridge.py")],
+            env={**os.environ},
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
     try:
-        req = urllib.request.Request(f"http://127.0.0.1:{BRIDGE_PORT}/health")
-        req.add_header("Authorization", f"Bearer {AUTH}")
-        urllib.request.urlopen(req, timeout=2)
-    except:
-        print("ERROR: Bridge not running on port", BRIDGE_PORT)
-        print("Start with:")
-        print(f"  cd /Users/goldtetsola/Desktop/Coding Projects/opencode-bridge")
-        print(f"  OPENCODE_GO_API_KEY=... python3 bridge.py")
-        sys.exit(1)
+        for _ in range(20):
+            try:
+                req = urllib.request.Request(f"http://127.0.0.1:{BRIDGE_PORT}/health")
+                req.add_header("Authorization", f"Bearer {AUTH}")
+                urllib.request.urlopen(req, timeout=2)
+                break
+            except Exception:
+                time.sleep(0.5)
+        else:
+            print("ERROR: Bridge not running on port", BRIDGE_PORT)
+            sys.exit(1)
 
-    test_multi_turn_with_evidence_ledger()
-    test_rorschach_prep_task()
-    print("\nAll v10 runtime tests passed")
+        test_multi_turn_with_evidence_ledger()
+        if LIVE_MODE:
+            test_rorschach_prep_task()
+        else:
+            print("\n=== Test 2: Rorschach prep task ===")
+            print("  SKIP: set V10_LIVE_MODE=1 to run against live Rorschach/OpenCode setup")
+        print("\nAll v10 runtime tests passed")
+    finally:
+        if bridge_proc:
+            bridge_proc.terminate()
+            bridge_proc.wait()
+        if upstream:
+            upstream.shutdown()
+            upstream.server_close()
 
 
 if __name__ == "__main__":

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import threading
 import re
 import time
 from dataclasses import dataclass, field
@@ -102,12 +103,12 @@ def risk_tier_confidence_ceiling(risk_tier: str) -> str:
 # BroadScopePolicyV1
 # ═════════════════════════════════════════════
 
-BROAD_ROOTS = {".", "src/", "scripts/", "docs/", "/"}
+BROAD_ROOTS = {".", "src", "scripts", "docs", "/"}
 
 
 def is_broad_root(root: str, max_files: int = 20) -> bool:
     """Check if a root is too broad for safe allocation."""
-    r = root.strip().rstrip("/")
+    r = root.strip().rstrip("/") or "."
     if r in BROAD_ROOTS or r == "." or r == "":
         return True
     try:
@@ -129,6 +130,29 @@ def validate_broad_scope(mission) -> Optional[str]:
             if mission.critical_path_read_allowed:
                 return f"Broad root '{root}' does not count as explicit critical permission"
     return None
+
+
+def critical_read_allowed_for_path(path: str, mission) -> Tuple[bool, str]:
+    """Critical reads require explicit critical permission plus narrow scope."""
+    if not getattr(mission, "critical_path_read_allowed", False):
+        return False, "critical_path_read_allowed=false"
+    if not getattr(mission, "critical_path_reason", None):
+        return False, "critical_path_reason is required"
+
+    normalized = path.strip().rstrip("/")
+    for allowed in getattr(mission, "allowed_paths", []) or []:
+        if normalized == allowed.strip().rstrip("/"):
+            return True, ""
+
+    for root in getattr(mission, "allowed_roots", []) or []:
+        root_norm = root.strip().rstrip("/")
+        if is_broad_root(root_norm):
+            continue
+        root_check = root_norm + "/"
+        if normalized == root_norm or (normalized + "/").startswith(root_check):
+            return True, ""
+
+    return False, "critical path reads require exact allowed_paths or narrow allowed_roots"
 
 
 # ═════════════════════════════════════════════
@@ -272,24 +296,27 @@ A3_QUEUE_MAX = 2
 A3_QUEUE_TIMEOUT_SECONDS = 5
 
 _active_missions: Dict[str, float] = {}
+_active_missions_lock = threading.Lock()
 
 
 def acquire_mission_slot(mission_id: str) -> Tuple[bool, str]:
     """Try to acquire a concurrency slot. Returns (acquired, reason)."""
     global _active_missions
-    # Clean stale slots
-    now = time.time()
-    _active_missions = {k: v for k, v in _active_missions.items() if now - v < 300}
+    with _active_missions_lock:
+        # Clean stale slots
+        now = time.time()
+        _active_missions = {k: v for k, v in _active_missions.items() if now - v < 300}
 
-    if len(_active_missions) >= GLOBAL_MAX_ACTIVE_A3_MISSIONS:
-        return False, f"global A3 concurrency limit reached ({GLOBAL_MAX_ACTIVE_A3_MISSIONS})"
+        if len(_active_missions) >= GLOBAL_MAX_ACTIVE_A3_MISSIONS:
+            return False, f"global A3 concurrency limit reached ({GLOBAL_MAX_ACTIVE_A3_MISSIONS})"
 
-    _active_missions[mission_id] = now
-    return True, ""
+        _active_missions[mission_id] = now
+        return True, ""
 
 
 def release_mission_slot(mission_id: str):
-    _active_missions.pop(mission_id, None)
+    with _active_missions_lock:
+        _active_missions.pop(mission_id, None)
 
 
 # ═════════════════════════════════════════════

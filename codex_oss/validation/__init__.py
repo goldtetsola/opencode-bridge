@@ -24,7 +24,7 @@ INTENT_PATTERN = re.compile(
 )
 
 EVIDENCE_REF_RE = re.compile(
-    r"(file|command):([^\s#]+)(?:#(extract|match|zero_match)[:=](\S+))?"
+    r"(file|command):([^\s#]+)(?:#(extract|match)[:=](\S+)|#(zero_match))?"
 )
 
 
@@ -137,6 +137,7 @@ def validate_report(report: dict, ledger: Any = None) -> ValidationResult:
             refs = finding.get("evidence_refs", [])
             for ref in refs:
                 _check_ref(ref, ledger, errors)
+        _check_report_matches_ledger(report, ledger, errors)
 
     is_valid = len(errors) == 0
     result_status = status if is_valid else "FAILED"
@@ -149,7 +150,9 @@ def _check_ref(ref: str, ledger: Any, errors: List[str]):
     if not m:
         errors.append(f"evidence ref '{ref}' has invalid canonical format (expected file:<path>#extract:<id> or command:<turn>)")
         return
-    ref_type, target, sub_type, sub_id = m.groups()
+    ref_type, target, sub_type, sub_id, zero_match = m.groups()
+    if zero_match:
+        sub_type = "zero_match"
 
     if ref_type == "file":
         if not hasattr(ledger, 'files_inspected'):
@@ -189,6 +192,22 @@ def _check_ref(ref: str, ledger: Any, errors: List[str]):
                     errors.append(f"evidence ref '{ref}' claims zero_match but command has exit_code={cmd.exit_code}, matches={cmd.matches_count}")
         except ValueError:
             errors.append(f"evidence ref '{ref}' has non-numeric command index: {target}")
+
+
+def _check_report_matches_ledger(report: dict, ledger: Any, errors: List[str]):
+    if hasattr(ledger, "files_inspected"):
+        for item in report.get("files_inspected", []) or []:
+            if isinstance(item, dict):
+                path = item.get("path")
+                if path and path not in ledger.files_inspected:
+                    errors.append(f"files_inspected entry not present in ledger: {path}")
+    if hasattr(ledger, "commands_run"):
+        ledger_commands = {(c.tool, json.dumps(c.args, sort_keys=True)) for c in ledger.commands_run}
+        for item in report.get("commands_run", []) or []:
+            if isinstance(item, dict):
+                key = (item.get("tool"), json.dumps(item.get("args", {}), sort_keys=True))
+                if key not in ledger_commands:
+                    errors.append(f"commands_run entry not present in ledger: {item.get('tool')} {item.get('args', {})}")
 
 
 def validate_text_report(text: str, ledger: Any = None) -> ValidationResult:

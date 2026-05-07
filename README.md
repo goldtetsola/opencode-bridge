@@ -32,22 +32,22 @@ echo 'OPENCODE_GO_API_KEY=sk-...' > ~/bridge/.codex-oss/env/opencode-go.env
 cd ~/your-codex-project
 python3 ~/bridge/bin/codex-oss install
 
-# 4. Start the bridge
-OPENCODE_GO_API_KEY=sk-... python3 ~/bridge/bin/codex-oss start --mode production
+# 4. Start the bridge under a supervisor
+OPENCODE_GO_API_KEY=sk-... python3 ~/bridge/bin/codex-oss up --daemon
 
 # 5. Verify everything
 python3 ~/bridge/bin/codex-oss doctor
-# Expected: 24 passed, 0 warnings, 0 failed
+# Add --live-model only when you intentionally want to spend one OSS model call
 ```
 
-That's it. `codex-oss install` generates all config — `.codex/config.toml`, agent TOMLs, `AGENTS.md` routing rules, and recursive-codex-exec blocking. `codex-oss doctor` checks 23 invariants and tells you exactly what to fix.
+That's it. `codex-oss install` generates all config — `.codex/config.toml`, agent TOMLs, `AGENTS.md` routing rules, and recursive-codex-exec blocking. `codex-oss doctor` checks setup, bridge health, supervision, source identity, and state persistence, then tells you exactly what to fix.
 
 ## What `codex-oss` does
 
 | Command | What it does |
 |---|---|
 | `install` | Generates provider config, 3 agent TOMLs, AGENTS.md delegation contract, recursive-codex blocking rules, runtime directories, and gitignore entries. |
-| `doctor` | Checks 24 invariants: config correctness, agent configuration, AGENTS.md compliance, structured handoff contract, recursive-codex exec blocking, bridge health, daemon supervision, GPT leakage, OSS inference, state DB persistence. PASS/WARN/FAIL with fix instructions. Supports `--json` for automation. |
+| `doctor` | Checks config correctness, agent configuration, AGENTS.md compliance, structured handoff contract, recursive-codex exec blocking, bridge health, durable supervision, source hash identity, GPT leakage, and state DB persistence. PASS/WARN/FAIL with fix instructions. Supports `--offline`, `--json`, and `--live-model` for optional inference smoke. |
 | `start` | Launches the bridge with mode selection (`production`/`compat-test`/`openai`). Refuses to start in production mode without a valid key. Sets project-local state paths. |
 | `stop` | Graceful shutdown via PID file or port. |
 | `status` | Queries the bridge health endpoint — shows version, mode, model health, and concurrency config. |
@@ -158,6 +158,7 @@ The bridge selects the right mode based on the task handoff:
 - **`no_tool_exact`** — exact output tasks (guardrail tests, control probes). No model decisions needed.
 - **`context_pack_report`** — read/report tasks with explicit `READ-ONLY PATHS` + `DELIVERABLE`. Bridge gathers all files internally, sends one no-tools synthesis call, and validates that the final text includes the requested structured deliverable fields. Command-aware: `grep X in Y` steps get grep output, not full files.
 - **`managed_autonomy`** — discovery tasks where the model chooses what to inspect. Budget-capped, duplicate-suppressed, evidence-ledger-injected.
+- **`A2/A3 MissionV1`** — schema-first managed investigation using `<OSS_HANDOFF_JSON>` with `schema_version: "oss_agent_mission.v1"`. The loop runs inside the bridge runtime with JSON actions, `tools=[]` upstream, runtime-owned RTK tools, explicit path scope, evidence refs, and terminal structured reports.
 - **`bounded_write_exact`** — writes to explicit `OWNED PATHS` only when `exact_content` is present. Bridge writes the file directly, reads it back, and returns PASS only when observed content matches the declared exact content. No model call needed.
 - **`bounded_write_patch`** — model-assisted edits to explicit `OWNED PATHS` when no `exact_content` is present, including `docs_support` tasks. Permission fields define scope; they do not by themselves select exact-write mode.
 
@@ -182,6 +183,32 @@ OSS_HANDOFF_JSON:
 ```
 
 If the JSON is malformed or missing required fields, the bridge returns `FAIL` instead of guessing a mode from prose. You can validate a handoff before spawning an OSS subagent:
+
+For managed A2/A3 investigation, use the stricter v1 mission schema:
+
+```text
+<OSS_HANDOFF_JSON>
+{
+  "schema_version": "oss_agent_mission.v1",
+  "mission_id": "mission_example",
+  "tier": "A3",
+  "mode": "managed_investigation",
+  "objective": "Find evidence for a read-only repo question.",
+  "risk_tier": "low",
+  "write_allowed": false,
+  "allowed_roots": ["docs/"],
+  "allowed_paths": [],
+  "tool_budget": 10,
+  "time_budget_seconds": 90,
+  "allowed_tool_classes": ["read", "search", "list"],
+  "stop_conditions": ["valid_report", "budget_exhausted", "deadline_reached"],
+  "report_schema": "managed_investigation_report.v1",
+  "required_outputs": ["files_inspected", "commands_run", "findings", "uncertainties", "confidence", "caveats", "escalation_recommendation"]
+}
+</OSS_HANDOFF_JSON>
+```
+
+A2/A3 missions fail closed without explicit `allowed_roots` or `allowed_paths`, `allowed_tool_classes`, and `required_outputs`. Critical-path reads require `critical_path_read_allowed: true`, a `critical_path_reason`, and exact paths or narrow roots.
 
 ```bash
 python3 ~/bridge/bin/codex-oss validate-handoff /path/to/handoff.md
@@ -403,7 +430,7 @@ self-test passed
 
 ## Troubleshooting
 
-**First step for any issue:** run `codex-oss doctor`. It checks 24 invariants and tells you exactly what to fix.
+**First step for any issue:** run `codex-oss doctor`. It checks setup, bridge health, durable supervision, source identity, and state persistence without spending a model call. Use `codex-oss doctor --offline` for local config only and `codex-oss doctor --live-model` when you intentionally want an OSS inference smoke.
 
 Common issues the doctor catches:
 

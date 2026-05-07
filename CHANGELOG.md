@@ -38,11 +38,14 @@ Cross-platform `codex-oss up --daemon` starts bridge as supervised daemon. Termi
 ```bash
 codex-oss up --daemon    # start and detach
 codex-oss run -- codex   # start bridge, run Codex CLI, cleanup
-codex-oss doctor         # 24 checks including supervisor invariant
+codex-oss doctor         # default health/supervisor/source checks
 ```
 
+### OSS Agent Runtime contract hardening
+A2/A3 managed investigations now enter a dedicated runtime adapter instead of living inside the HTTP handler. Structured `oss_agent_mission.v1` handoffs run inside the bridge with JSON-only actions, `tools=[]` upstream, explicit runtime-owned RTK tools, evidence-ledger validation, critical-path read checks, source-hash health identity, and terminal structured reports on runtime failures.
+
 ### Doctor
-`codex-oss doctor` checks 24 invariants across config, agents, agreements, rules, bridge health, GPT leakage, OSS inference, state persistence, supervisor lifecycle, and structured handoff validation.
+`codex-oss doctor` now separates offline/default/live-model checks. Default doctor checks bridge health and source identity without burning an OSS model call; `--offline` checks local files/config only; `--live-model` runs the optional inference smoke.
 
 ---
 

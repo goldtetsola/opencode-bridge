@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import uuid
 from dataclasses import dataclass, field
@@ -155,6 +156,8 @@ def _build_mission(raw: dict) -> MissionV1:
 
     allowed_roots = _as_str_list(raw.get("allowed_roots", []))
     allowed_paths = _as_str_list(raw.get("allowed_paths", []))
+    if tier in TOOL_AUTONOMY_TIERS and not (allowed_roots or allowed_paths):
+        raise InvalidHandoffError("A2/A3 missions require allowed_roots or allowed_paths")
     forbidden_roots = _as_str_list(raw.get("forbidden_roots", []))
     forbidden_topics = _as_str_list(raw.get("forbidden_topics", []))
 
@@ -163,7 +166,11 @@ def _build_mission(raw: dict) -> MissionV1:
 
     tool_budget = int(raw.get("tool_budget", 20))
     time_budget_seconds = int(raw.get("time_budget_seconds", 180))
+    if tier in TOOL_AUTONOMY_TIERS and "allowed_tool_classes" not in raw:
+        raise InvalidHandoffError("A2/A3 missions require allowed_tool_classes")
     allowed_tool_classes = _as_str_list(raw.get("allowed_tool_classes", []))
+    if tier in TOOL_AUTONOMY_TIERS and not allowed_tool_classes:
+        raise InvalidHandoffError("A2/A3 missions require non-empty allowed_tool_classes")
 
     # Validate tool classes
     for tc in allowed_tool_classes:
@@ -173,7 +180,11 @@ def _build_mission(raw: dict) -> MissionV1:
     # Budget clamping
     tier_max_budget = 10 if tier == TIER_A2 else 20
     tier_max_time = 90 if tier == TIER_A2 else 180
-    effective_budget = min(tool_budget, tier_max_budget)
+    request_deadline = float(os.getenv("REQUEST_DEADLINE_SECONDS", "90"))
+    reserve = float(os.getenv("DETERMINISTIC_PARTIAL_RESERVE_SECONDS", "5"))
+    estimated_turn = float(os.getenv("ESTIMATED_A3_TURN_SECONDS", "8"))
+    deadline_budget = max(1, math.floor(max(0, request_deadline - reserve) / max(1, estimated_turn)))
+    effective_budget = min(tool_budget, tier_max_budget, deadline_budget)
     effective_time = min(time_budget_seconds, tier_max_time)
 
     # Abusive values fail closed
@@ -184,14 +195,23 @@ def _build_mission(raw: dict) -> MissionV1:
     if not stop_conditions:
         stop_conditions = ["valid_report", "budget_exhausted", "deadline_reached"]
 
+    if tier in TOOL_AUTONOMY_TIERS and "required_outputs" not in raw:
+        raise InvalidHandoffError("A2/A3 missions require required_outputs")
     required_outputs = _as_str_list(raw.get("required_outputs", []))
+    if tier in TOOL_AUTONOMY_TIERS and not required_outputs:
+        raise InvalidHandoffError("A2/A3 missions require non-empty required_outputs")
     if not required_outputs:
         required_outputs = ["files_inspected", "commands_run", "findings", "uncertainties",
                            "confidence", "caveats", "escalation_recommendation"]
 
     budget_reduction_reason = ""
     if effective_budget < tool_budget:
-        budget_reduction_reason = "tier_cap"
+        reasons = []
+        if tier_max_budget < tool_budget:
+            reasons.append("tier_cap")
+        if deadline_budget < min(tool_budget, tier_max_budget):
+            reasons.append("request_deadline")
+        budget_reduction_reason = "+".join(reasons) or "budget_cap"
     if effective_time < time_budget_seconds:
         budget_reduction_reason = "tier_cap" if not budget_reduction_reason else budget_reduction_reason + "+tier_cap"
 

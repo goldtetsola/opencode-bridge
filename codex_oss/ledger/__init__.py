@@ -24,6 +24,7 @@ class FileEntry:
     tool: str = ""
     turn: int = 0
     risk_flags: List[str] = field(default_factory=list)
+    extracts: List[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -59,6 +60,7 @@ class EvidenceLedger:
             tool=result.tool,
             turn=turn,
             risk_flags=list(result.risk_flags),
+            extracts=_build_extracts(result.stdout),
         )
         self.files_inspected[path] = entry
         self.total_bytes_read += result.chars_total
@@ -106,3 +108,14 @@ class EvidenceLedger:
             lines.append(f"Duplicates blocked: {self.duplicate_actions_blocked}")
         result = "\n".join(lines)
         return result[:max_chars]
+
+
+def _build_extracts(stdout: str, max_extracts: int = 3, max_chars: int = 1200) -> List[dict]:
+    if not stdout:
+        return []
+    chunks = []
+    text = stdout[:max_chars]
+    chunks.append({"id": "extract:1", "text": text})
+    if len(stdout) > max_chars and max_extracts > 1:
+        chunks.append({"id": "extract:2", "text": stdout[-max_chars:]})
+    return chunks[:max_extracts]

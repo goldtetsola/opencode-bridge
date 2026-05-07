@@ -44,6 +44,8 @@ def resolve_path(raw: str, allowed_roots: list, allowed_paths: list) -> Tuple[Op
     path = raw.strip().strip("'\"")
     if not path:
         return None, "empty path"
+    if not allowed_roots and not allowed_paths:
+        return None, "no allowed roots or paths supplied"
 
     # Block .. escapes
     if ".." in path.split(os.sep):
@@ -57,13 +59,10 @@ def resolve_path(raw: str, allowed_roots: list, allowed_paths: list) -> Tuple[Op
             return None, f"absolute path outside project root: {raw}"
         path = os.path.relpath(real, PROJECT_ROOT)
 
-    # Block deny patterns
-    for deny in _DENY_PATTERNS:
-        if deny.startswith("*"):
-            if path.endswith(deny[1:]) or path.endswith(deny[1:] + "/"):
-                return None, f"deny pattern matched: {deny}"
-        elif path == deny or path.startswith(deny + os.sep) or path == deny.rstrip("/"):
-            return None, f"deny pattern matched: {deny}"
+    # Block deny patterns on the requested path.
+    deny_error = _deny_match(path)
+    if deny_error:
+        return None, deny_error
 
     # Check symlinks
     try:
@@ -72,12 +71,12 @@ def resolve_path(raw: str, allowed_roots: list, allowed_paths: list) -> Tuple[Op
         cwd = os.path.realpath(PROJECT_ROOT)
         if not real.startswith(cwd + os.sep) and real != cwd:
             return None, f"symlink resolves outside project root: {path}"
+        real_rel = os.path.relpath(real, PROJECT_ROOT)
+        deny_error = _deny_match(real_rel)
+        if deny_error:
+            return None, deny_error
     except OSError:
         return None, f"path resolution failed: {path}"
-
-    # Check allowed paths
-    if not allowed_roots and not allowed_paths:
-        return path, None  # no restrictions
 
     # Check exact paths first
     for allowed in allowed_paths:
@@ -94,12 +93,29 @@ def resolve_path(raw: str, allowed_roots: list, allowed_paths: list) -> Tuple[Op
     return None, f"path not in allowed roots/paths: {path}"
 
 
+def _deny_match(path: str) -> Optional[str]:
+    normalized = path.strip().strip("'\"").strip(os.sep)
+    for deny in _DENY_PATTERNS:
+        deny_norm = deny.rstrip("/")
+        if deny.startswith("*"):
+            if normalized.endswith(deny[1:]) or normalized.endswith(deny[1:].rstrip("/") + os.sep):
+                return f"deny pattern matched: {deny}"
+        elif normalized == deny_norm or normalized.startswith(deny_norm + os.sep):
+            return f"deny pattern matched: {deny}"
+    return None
+
+
+def _minimal_env() -> dict:
+    allowed = ("PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TERM")
+    return {key: value for key, value in os.environ.items() if key in allowed}
+
+
 def exec_read(path: str, max_bytes: int = 200000, timeout: int = 20) -> ToolResult:
     """Execute rtk read on an allowed path."""
     try:
         proc = subprocess.run(
             ["rtk", "read", path],
-            cwd=PROJECT_ROOT, capture_output=True, text=True, timeout=timeout)
+            cwd=PROJECT_ROOT, env=_minimal_env(), capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
         return ToolResult(tool="rtk_read", args={"path": path},
                           exit_code=-1, stdout="", stderr="timeout",
@@ -135,7 +151,7 @@ def exec_grep(pattern: str, path: str, timeout: int = 20) -> ToolResult:
     try:
         proc = subprocess.run(
             ["rtk", "grep", pattern, path],
-            cwd=PROJECT_ROOT, capture_output=True, text=True, timeout=timeout)
+            cwd=PROJECT_ROOT, env=_minimal_env(), capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
         return ToolResult(tool="rtk_grep", args={"pattern": pattern, "path": path},
                           exit_code=-1, stdout="", stderr="timeout", complete=False)
@@ -160,7 +176,7 @@ def exec_ls(path: str, timeout: int = 10) -> ToolResult:
     try:
         proc = subprocess.run(
             ["rtk", "ls", path],
-            cwd=PROJECT_ROOT, capture_output=True, text=True, timeout=timeout)
+            cwd=PROJECT_ROOT, env=_minimal_env(), capture_output=True, text=True, timeout=timeout)
     except (subprocess.TimeoutExpired, FileNotFoundError):
         return ToolResult(tool="rtk_ls", args={"path": path},
                           exit_code=-1, stdout="", stderr="ls failed", complete=False)
@@ -177,7 +193,7 @@ def exec_git_status(timeout: int = 10) -> ToolResult:
     try:
         proc = subprocess.run(
             ["rtk", "git", "status", "--short"],
-            cwd=PROJECT_ROOT, capture_output=True, text=True, timeout=timeout)
+            cwd=PROJECT_ROOT, env=_minimal_env(), capture_output=True, text=True, timeout=timeout)
     except (subprocess.TimeoutExpired, FileNotFoundError):
         return ToolResult(tool="rtk_git_status", args={},
                           exit_code=-1, stdout="", stderr="git failed", complete=False)
@@ -194,7 +210,7 @@ def exec_git_log(limit: int = 5, timeout: int = 10) -> ToolResult:
     try:
         proc = subprocess.run(
             ["rtk", "git", "log", "--oneline", f"-n{limit}"],
-            cwd=PROJECT_ROOT, capture_output=True, text=True, timeout=timeout)
+            cwd=PROJECT_ROOT, env=_minimal_env(), capture_output=True, text=True, timeout=timeout)
     except (subprocess.TimeoutExpired, FileNotFoundError):
         return ToolResult(tool="rtk_git_log", args={"limit": limit},
                           exit_code=-1, stdout="", stderr="git failed", complete=False)
@@ -210,7 +226,7 @@ def exec_git_show_stat(rev: str = "HEAD", timeout: int = 10) -> ToolResult:
     try:
         proc = subprocess.run(
             ["rtk", "git", "show", "--stat", rev],
-            cwd=PROJECT_ROOT, capture_output=True, text=True, timeout=timeout)
+            cwd=PROJECT_ROOT, env=_minimal_env(), capture_output=True, text=True, timeout=timeout)
     except (subprocess.TimeoutExpired, FileNotFoundError):
         return ToolResult(tool="rtk_git_show_stat", args={"rev": rev},
                           exit_code=-1, stdout="", stderr="git failed", complete=False)
@@ -227,7 +243,7 @@ def exec_git_diff_stat(path: str = "", timeout: int = 10) -> ToolResult:
     if path:
         cmd.append(path)
     try:
-        proc = subprocess.run(cmd, cwd=PROJECT_ROOT, capture_output=True, text=True, timeout=timeout)
+        proc = subprocess.run(cmd, cwd=PROJECT_ROOT, env=_minimal_env(), capture_output=True, text=True, timeout=timeout)
     except (subprocess.TimeoutExpired, FileNotFoundError):
         return ToolResult(tool="rtk_git_diff_stat", args={"path": path},
                           exit_code=-1, stdout="", stderr="git failed", complete=False)

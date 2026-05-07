@@ -224,7 +224,7 @@ def install(project_root: Optional[Path] = None, force: bool = False) -> int:
     print()
     print("Running doctor checks...")
     print()
-    report = run_doctor(root)
+    report = run_doctor(root, offline=True)
     report.print()
 
     if errors:

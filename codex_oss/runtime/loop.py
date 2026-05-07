@@ -124,7 +124,7 @@ def run_loop(mission: Any, ledger: Any, call_model_fn, tools, emitter,
         acquire_mission_slot, release_mission_slot, scan_secrets,
         validate_broad_scope, risk_tier_allows_autonomy,
         risk_tier_confidence_ceiling, model_call_uses_internal_tools_only,
-        check_allowed_paths,
+        critical_read_allowed_for_path,
     )
 
     start = _time.time()
@@ -155,7 +155,8 @@ def run_loop(mission: Any, ledger: Any, call_model_fn, tools, emitter,
         # Build initial context — no native tools for A2/A3
         if model_call_uses_internal_tools_only(mission.tier):
             tools = []
-        context = _build_context(mission, ledger)
+        allowed_tool_names = _allowed_tool_names(mission)
+        context = _build_context(mission, ledger, allowed_tool_names)
 
         while True:
             elapsed = _time.time() - start
@@ -227,12 +228,14 @@ def run_loop(mission: Any, ledger: Any, call_model_fn, tools, emitter,
                         context.append({"role": "user", "content":
                             REPAIR_PROMPT.format(reason=f"report validation: {result.errors}")})
                         continue
-                    return {"status": "PARTIAL", "report": report, "missing_fields": result.missing_fields}
+                    return _partial(mission, ledger, f"report_validation_failed:{','.join(result.errors[:3])}", deadline)
                 return _partial(mission, ledger, "report_not_dict", deadline)
 
             if action.is_tool_call:
                 repair_count = 0
                 tool_name = action.tool_name
+                if isinstance(action.arguments, dict):
+                    action.arguments = _normalize_arguments(action.arguments)
 
                 # Block writes
                 if tool_name in ("apply_patch", "write_file", "edit", "create", "rtk_write"):
@@ -258,9 +261,10 @@ def run_loop(mission: Any, ledger: Any, call_model_fn, tools, emitter,
 
                 # Check critical paths
                 if path and is_critical_path(path):
-                    if not mission.critical_path_read_allowed:
+                    allowed_critical, critical_reason = critical_read_allowed_for_path(path, mission)
+                    if not allowed_critical:
                         ledger.add_risk_flag("critical_path_blocked")
-                        return _partial(mission, ledger, "critical_path_detected", deadline)
+                        return _partial(mission, ledger, f"critical_path_detected:{critical_reason}", deadline)
                     ledger.add_risk_flag("critical_path_read_allowed")
 
                 # Duplicate suppression
@@ -273,8 +277,8 @@ def run_loop(mission: Any, ledger: Any, call_model_fn, tools, emitter,
                 # Execute tool
                 from codex_oss.runtime import TOOL_EXECUTORS
                 executor = TOOL_EXECUTORS.get(tool_name)
-                if not executor:
-                    context.append({"role": "user", "content": f"Unknown tool: {tool_name}"})
+                if not executor or tool_name not in allowed_tool_names:
+                    context.append({"role": "user", "content": f"Tool not allowed for this mission: {tool_name}"})
                     continue
 
                 ledger.spend_budget()
@@ -282,7 +286,10 @@ def run_loop(mission: Any, ledger: Any, call_model_fn, tools, emitter,
 
                 # Scan for secrets in result
                 if result and result.stdout:
-                    result.stdout, _ = scan_secrets(result.stdout)
+                    result.stdout, found_secret = scan_secrets(result.stdout)
+                    if found_secret:
+                        result.redactions_applied = True
+                        ledger.redactions_applied = True
 
                 # Check critical terms in observation
                 if result and result.stdout:
@@ -342,15 +349,39 @@ def _partial(mission, ledger, reason: str, deadline) -> dict:
     return _partial_dict(mission, ledger, reason)
 
 
-def _build_context(mission: Any, ledger: Any, tool_count: int) -> list:
-    tools_list = "\n".join(f"- {t}" for t in ["rtk_read", "rtk_grep", "rtk_ls", 
-        "rtk_git_status", "rtk_git_log", "rtk_git_show_stat", "rtk_git_diff_stat"])
+def _build_context(mission: Any, ledger: Any, allowed_tool_names: Optional[set] = None) -> list:
+    allowed_tool_names = allowed_tool_names or _allowed_tool_names(mission)
+    tools_list = "\n".join(f"- {t}" for t in sorted(allowed_tool_names))
     return [{"role": "system", "content": 
         f"You are an OSS managed investigation agent. Mission: {mission.objective}\n"
         f"Allowed tools:\n{tools_list}\n"
         f"Required outputs: {', '.join(mission.required_outputs)}\n"
         f"Budget: {ledger.tool_budget_remaining} tool calls remaining.\n"
         f"Return exactly one JSON action per turn. No markdown, no status text."}]
+
+
+def _allowed_tool_names(mission: Any) -> set:
+    classes = set(getattr(mission, "allowed_tool_classes", []) or [])
+    tool_map = {
+        "read": {"rtk_read"},
+        "search": {"rtk_grep"},
+        "list": {"rtk_ls"},
+        "safe_git": {"rtk_git_status", "rtk_git_log", "rtk_git_show_stat", "rtk_git_diff_stat"},
+    }
+    names = set()
+    for cls in classes:
+        names.update(tool_map.get(cls, set()))
+    return names
+
+
+def _normalize_arguments(arguments: dict) -> dict:
+    normalized = dict(arguments)
+    if "path" not in normalized:
+        for alias in ("file_path", "file", "filename"):
+            if alias in normalized:
+                normalized["path"] = normalized[alias]
+                break
+    return normalized
 
 
 def _deterministic_partial(mission: Any, ledger: Any, reason: str) -> dict:

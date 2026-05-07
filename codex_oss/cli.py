@@ -22,6 +22,10 @@ def main():
     d.add_argument("--fix", action="store_true", help="Auto-repair issues")
     d.add_argument("--json", action="store_true", help="Machine-readable output")
     d.add_argument("--project", type=str, help="Project root path", default=None)
+    d.add_argument("--offline", action="store_true", help="Only check local files/config")
+    d.add_argument("--network", action="store_true", help="Include bridge health and network checks")
+    d.add_argument("--live-model", action="store_true", help="Run a tiny live OSS model inference smoke")
+    d.add_argument("--dev", action="store_true", help="Allow foreground supervisor warnings for development use")
 
     # install
     i = sub.add_parser("install", help="Install OSS bridge config into current project")
@@ -63,7 +67,14 @@ def main():
     if args.command == "doctor":
         from pathlib import Path
         root = Path(args.project) if args.project else None
-        report = run_doctor(root, fix=args.fix)
+        report = run_doctor(
+            root,
+            fix=args.fix,
+            offline=args.offline,
+            network=args.network or args.live_model,
+            live_model=args.live_model,
+            dev=args.dev,
+        )
         report.print(json_output=args.json)
         sys.exit(0 if report.healthy else 1)
 
