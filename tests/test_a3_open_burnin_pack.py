@@ -366,7 +366,14 @@ def build_burnin_cases() -> list[BurninCase]:
 
 def call_bridge(payload: dict) -> dict:
     """Submit a payload to the bridge and return the response JSON."""
-    body = json.dumps(payload).encode("utf-8")
+    body = {
+        "model": MODEL,
+        "stream": False,
+        "input": [
+            {"role": "user", "content": "<OSS_HANDOFF_JSON>\n" + json.dumps(payload) + "\n</OSS_HANDOFF_JSON>"},
+        ],
+    }
+    data = json.dumps(body).encode("utf-8")
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {AUTH}",
@@ -374,17 +381,38 @@ def call_bridge(payload: dict) -> dict:
     for attempt in range(3):
         try:
             req = urllib.request.Request(
-                f"{BASE_URL.rstrip('/')}/chat/completions",
-                data=body, headers=headers, method="POST",
+                f"{BASE_URL.rstrip('/')}/responses",
+                data=data, headers=headers, method="POST",
             )
             with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
-                return json.loads(resp.read().decode("utf-8"))
-        except (urllib.error.HTTPError, urllib.error.URLError, http.client.HTTPException, OSError) as e:
+                raw = resp.read().decode("utf-8")
+                return json.loads(raw)
+        except urllib.error.HTTPError as e:
+            err_body = ""
+            try:
+                err_body = e.read().decode("utf-8")[:200]
+            except Exception:
+                pass
             if attempt < 2:
                 time.sleep(5 * (attempt + 1))
                 continue
-            return {"error": str(e), "bridge_unreachable": True}
+            return {"error": f"HTTP {e.code}: {err_body}", "bridge_unreachable": True}
+        except (urllib.error.URLError, http.client.HTTPException, OSError, TimeoutError) as e:
+            if attempt < 2:
+                time.sleep(5 * (attempt + 1))
+                continue
+            return {"error": str(e)[:200], "bridge_unreachable": True}
     return {"error": "all attempts failed", "bridge_unreachable": True}
+
+
+def extract_text(payload: dict) -> str:
+    parts = []
+    for output in payload.get("output", []) or []:
+        if isinstance(output, dict):
+            for msg in output.get("content", []) or []:
+                if isinstance(msg, dict) and msg.get("type") == "output_text":
+                    parts.append(str(msg.get("text", "") or ""))
+    return "\n".join(parts)
 
 
 def extract_metrics(mission: dict, response: dict) -> BurninResult:
@@ -392,13 +420,17 @@ def extract_metrics(mission: dict, response: dict) -> BurninResult:
     result = BurninResult(case=str(mission.get("mission_id", "")))
     result.category = mission.get("mission_id", "")
 
-    choices = response.get("choices", [])
-    if not choices:
+    if response.get("bridge_unreachable"):
+        result.passed = False
+        return result
+    if response.get("error"):
         result.passed = False
         return result
 
-    message = choices[0].get("message", {}) if isinstance(choices[0], dict) else {}
-    content = str(message.get("content", "") or "")
+    content = extract_text(response) if isinstance(response, dict) else str(response)
+    if not content:
+        result.passed = False
+        return result
 
     if "OSS_REPORT_BEGIN" in content and "OSS_REPORT_END" in content:
         report_section = content.split("OSS_REPORT_BEGIN", 1)[1].split("OSS_REPORT_END", 1)[0]
@@ -424,7 +456,7 @@ def extract_metrics(mission: dict, response: dict) -> BurninResult:
         if m:
             result.optional_exploration = int(m.group(1))
 
-    result.contradiction_search = '"contradiction_search_done":\s*true' in content.lower()
+    result.contradiction_search = '"contradiction_search_done": true' in content.lower() or '"contradiction_search_done":true' in content.lower()
 
     try:
         report_json_start = content.index("OSS_REPORT_JSON:")
@@ -469,30 +501,19 @@ def run_burnin(cases: list[BurninCase], limit: int = 25, start: int = 1):
     for idx, case in enumerate(cases[start - 1 : start - 1 + total], start=start):
         mission = dict(case.mission)
         mission["mission_id"] = f"{mission['mission_id']}_{idx}"
-        payload = {
-            "model": MODEL,
-            "messages": [
-                {"role": "system", "content": "You are an OSS runtime investigator. Follow the mission protocol."},
-                {"role": "user", "content": (
-                    f"<OSS_HANDOFF_JSON>\n{json.dumps({'handoff_version': '1.0', 'mission': mission})}\n</OSS_HANDOFF_JSON>\n\n"
-                    f"Mission {idx}: {case.mission.get('objective', '')}"
-                )},
-            ],
-            "temperature": 0.0,
-            "max_tokens": 4096,
-        }
 
         print(f"\n[{idx}/{total}] {case.name} ({case.category})")
         start_time = time.time()
-        response = call_bridge(payload)
+        response = call_bridge(mission)
         elapsed = time.time() - start_time
 
         if response.get("bridge_unreachable"):
-            print(f"  SKIP: Bridge unreachable ({response.get('error', '')})")
+            print(f"  SKIP: Bridge unreachable ({str(response.get('error', ''))[:80]})")
             continue
 
-        if "error" in response:
-            print(f"  ERROR: {response['error'][:120]}")
+        if response.get("error"):
+            err = str(response.get("error", "") or "")[:120]
+            print(f"  ERROR: {err}")
             results.append(BurninResult(case=case.name, category=case.category, passed=False))
             continue
 
