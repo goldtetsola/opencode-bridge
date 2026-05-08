@@ -86,6 +86,8 @@ class EvidenceLedger:
     answer_graph: dict = field(default_factory=dict)
     coverage_graph: dict = field(default_factory=dict)
     evidence_agenda: dict = field(default_factory=dict)
+    optional_exploration_actions: int = 0
+    contradiction_search_done: bool = False
 
     def add_file(self, path: str, result: "ToolResult", turn: int):
         args = getattr(result, "args", {}) or {}

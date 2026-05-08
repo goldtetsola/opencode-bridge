@@ -3129,6 +3129,444 @@ def assert_open_investigation_escalates_on_blocked_source():
         assert "q1" in result["report"]["blocked_obligations"], result
 
 
+def assert_agenda_guided_redirects_then_prefetches_after_model_ignores_required_source():
+    with tempfile.TemporaryDirectory(dir=ROOT) as td:
+        from pathlib import Path
+
+        required = Path(td) / "required_source.py"
+        required.write_text("def find_target():\n    return 'found'\n", encoding="utf-8")
+        required_rel = os.path.relpath(required, ROOT)
+        unrelated = Path(td) / "unrelated_helper.py"
+        unrelated.write_text("# utility module\nHELPER = 42\n", encoding="utf-8")
+        unrelated_rel = os.path.relpath(unrelated, ROOT)
+        m = mission(
+            mission_id="mission_agenda_guided_redirect_prefetch",
+            objective="Investigate whether the target function exists.",
+            objective_style="open_investigation",
+            evidence_collection_mode="agenda_guided",
+            allowed_roots=[],
+            allowed_paths=[required_rel, unrelated_rel],
+            allowed_tool_classes=["read"],
+            tool_budget=6,
+            answer_obligations=[
+                {
+                    "id": "q1",
+                    "question": "Does the target file contain find_target()?",
+                    "required": True,
+                    "source_hints": [required_rel],
+                    "source_requirements": [{"path": required_rel, "evidence_kind": "function_presence", "required": True, "required_shapes": ["function_definition"]}],
+                }
+            ],
+            must_inspect=[required_rel],
+        )
+        ledger = EvidenceLedger(mission_id=m.mission_id, tool_budget_remaining=m.tool_budget)
+        calls = {"n": 0}
+
+        def fake_model(messages, tools, timeout):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return {
+                    "choices": [{
+                        "message": {
+                            "content": (
+                                '{"action_type":"tool_call","phase":"EXPLORE","tool_name":"rtk_read",'
+                                f'"arguments":{{"path":"{unrelated_rel}"}},'
+                                '"reason":"Check the unrelated helper first.","hypothesis":"Maybe HELPER relates to the target.",'
+                                '"target_question":"What does the helper define?",'
+                                '"expected_information_gain":"Understand the utility module.",'
+                                '"why_not_report_yet":"Need to investigate before reporting."}'
+                            )
+                        }
+                    }]
+                }
+            if calls["n"] == 2:
+                return {
+                    "choices": [{
+                        "message": {
+                            "content": (
+                                '{"action_type":"tool_call","phase":"NARROW","tool_name":"rtk_read",'
+                                f'"arguments":{{"path":"{unrelated_rel}"}},'
+                                '"reason":"Recheck the helper for more context.","hypothesis":"Maybe a hidden detail exists.",'
+                                '"target_question":"Is there more in the helper?",'
+                                '"expected_information_gain":"Confirm helper details.",'
+                                '"why_not_report_yet":"Still need more context."}'
+                            )
+                        }
+                    }]
+                }
+            if calls["n"] == 3:
+                return {
+                    "choices": [{
+                        "message": {
+                            "content": json.dumps({
+                                "action_type": "final_report",
+                                "report": {
+                                    "status": "COMPLETE",
+                                    "files_inspected": [{"path": unrelated_rel, "complete": True}, {"path": required_rel, "complete": True}],
+                                    "commands_run": [{"tool": "rtk_read", "args": {"path": unrelated_rel}}, {"tool": "rtk_read", "args": {"path": required_rel}}],
+                                    "findings": [{"claim": "The target file contains find_target.", "evidence_refs": ["file:" + required_rel, "command:1"]}],
+                                    "uncertainties": [],
+                                    "confidence": "HIGH",
+                                    "caveats": ["agenda_guided coverage test"],
+                                    "escalation_recommendation": "GPT-5.5 review",
+                                    "missing_fields": [],
+                                },
+                            })
+                        }
+                    }]
+                }
+            raise TimeoutError("simulated close timeout")
+
+        result = run_loop(m, ledger, fake_model, [], None, m.allowed_roots, m.allowed_paths, request_deadline=90)
+        redirected = [
+            entry
+            for entry in (getattr(ledger, "action_trace", []) or [])
+            if getattr(entry, "runtime_decision", "") == "redirected"
+            and "required source still pending" in str(getattr(entry, "decision_reason", "") or "")
+        ]
+        assert len(redirected) >= 1, f"Expected at least 1 redirect, got {len(redirected)} in {ledger.action_trace}"
+        assert result["status"] == "COMPLETE", result
+        prefetched = [
+            entry
+            for entry in (getattr(ledger, "action_trace", []) or [])
+            if getattr(entry, "runtime_decision", "") == "runtime_prefetch"
+        ]
+        assert len(prefetched) >= 1, f"Expected at least 1 runtime prefetch after redirect threshold, got {len(prefetched)} in {ledger.action_trace}"
+        assert required_rel in str(ledger.files_inspected), ledger.files_inspected
+
+
+def assert_agenda_guided_does_not_prefetch_upfront_lets_model_cooperate():
+    with tempfile.TemporaryDirectory(dir=ROOT) as td:
+        from pathlib import Path
+
+        sample = Path(td) / "agenda_guided_cooperate.py"
+        sample.write_text("def find_target():\n    return 'found'\n", encoding="utf-8")
+        sample_rel = os.path.relpath(sample, ROOT)
+        m = mission(
+            mission_id="mission_agenda_guided_cooperate",
+            objective="Investigate whether the target function exists.",
+            objective_style="open_investigation",
+            evidence_collection_mode="agenda_guided",
+            allowed_roots=[],
+            allowed_paths=[sample_rel],
+            allowed_tool_classes=["read"],
+            tool_budget=5,
+            answer_obligations=[
+                {
+                    "id": "q1",
+                    "question": "Does the target file contain find_target()?",
+                    "required": True,
+                    "source_hints": [sample_rel],
+                    "source_requirements": [{"path": sample_rel, "evidence_kind": "function_presence", "required": True, "required_shapes": ["function_definition"]}],
+                }
+            ],
+            must_inspect=[sample_rel],
+        )
+        ledger = EvidenceLedger(mission_id=m.mission_id, tool_budget_remaining=m.tool_budget)
+        calls = {"n": 0}
+
+        def fake_model(messages, tools, timeout):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return {
+                    "choices": [{
+                        "message": {
+                            "content": (
+                                '{"action_type":"tool_call","phase":"NARROW","tool_name":"rtk_read",'
+                                f'"arguments":{{"path":"{sample_rel}"}},'
+                                '"reason":"Inspect the target file.","hypothesis":"The file may define find_target.",'
+                                '"target_question":"Does the file contain find_target?",'
+                                '"expected_information_gain":"Find the function definition.",'
+                                '"why_not_report_yet":"Need to inspect the file first."}'
+                            )
+                        }
+                    }]
+                }
+            if calls["n"] == 2:
+                return {
+                    "choices": [{
+                        "message": {
+                            "content": json.dumps({
+                                "action_type": "final_report",
+                                "report": {
+                                    "status": "COMPLETE",
+                                    "files_inspected": [{"path": sample_rel, "complete": True}],
+                                    "commands_run": [{"tool": "rtk_read", "args": {"path": sample_rel}}],
+                                    "findings": [{"claim": "The target file contains find_target.", "evidence_refs": ["file:" + sample_rel, "command:0"]}],
+                                    "uncertainties": [],
+                                    "confidence": "HIGH",
+                                    "caveats": ["agenda_guided cooperative test"],
+                                    "escalation_recommendation": "GPT-5.5 review",
+                                    "missing_fields": [],
+                                },
+                            })
+                        }
+                    }]
+                }
+            raise TimeoutError("simulated close timeout")
+
+        result = run_loop(m, ledger, fake_model, [], None, m.allowed_roots, m.allowed_paths, request_deadline=90)
+        redirects = [
+            entry
+            for entry in (getattr(ledger, "action_trace", []) or [])
+            if getattr(entry, "runtime_decision", "") == "redirected"
+        ]
+        prefetches = [
+            entry
+            for entry in (getattr(ledger, "action_trace", []) or [])
+            if getattr(entry, "runtime_decision", "") == "runtime_prefetch"
+        ]
+        assert len(redirects) == 0, f"Expected 0 redirects in cooperative mode, got {redirects}"
+        assert len(prefetches) == 0, f"Expected 0 prefetches in cooperative mode, got {prefetches}"
+        assert result["status"] == "COMPLETE", result
+
+
+def assert_exploration_policy_close_immediately_blocks_further_tool_calls():
+    with tempfile.TemporaryDirectory(dir=ROOT) as td:
+        from pathlib import Path
+
+        required = Path(td) / "close_immediate_target.py"
+        required.write_text("def find_target():\n    return 'found'\n", encoding="utf-8")
+        required_rel = os.path.relpath(required, ROOT)
+        m = mission(
+            mission_id="mission_exploration_close_immediately",
+            objective="Investigate the target function.",
+            objective_style="open_investigation",
+            evidence_collection_mode="agenda_guided",
+            exploration_policy={"after_required_floor": "close_immediately"},
+            allowed_roots=[],
+            allowed_paths=[required_rel],
+            allowed_tool_classes=["read"],
+            tool_budget=5,
+            answer_obligations=[
+                {
+                    "id": "q1",
+                    "question": "Does the target file contain find_target()?",
+                    "required": True,
+                    "source_hints": [required_rel],
+                    "source_requirements": [{"path": required_rel, "evidence_kind": "function_presence", "required": True}],
+                }
+            ],
+            must_inspect=[required_rel],
+        )
+        ledger = EvidenceLedger(mission_id=m.mission_id, tool_budget_remaining=m.tool_budget)
+        calls = {"n": 0}
+
+        def fake_model(messages, tools, timeout):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return {
+                    "choices": [{
+                        "message": {
+                            "content": (
+                                '{"action_type":"tool_call","phase":"NARROW","tool_name":"rtk_read",'
+                                f'"arguments":{{"path":"{required_rel}"}},'
+                                '"reason":"Inspect the target.","hypothesis":"The file may contain find_target.",'
+                                '"target_question":"Does the file contain find_target?",'
+                                '"expected_information_gain":"Confirm the function exists.",'
+                                '"why_not_report_yet":"Need to inspect first."}'
+                            )
+                        }
+                    }]
+                }
+            if calls["n"] == 2:
+                return {
+                    "choices": [{
+                        "message": {
+                            "content": json.dumps({
+                                "action_type": "final_report",
+                                "report": {
+                                    "status": "COMPLETE",
+                                    "files_inspected": [{"path": required_rel, "complete": True}],
+                                    "commands_run": [{"tool": "rtk_read", "args": {"path": required_rel}}],
+                                    "findings": [{"claim": "The target file contains find_target.", "evidence_refs": ["file:" + required_rel, "command:0"]}],
+                                    "uncertainties": [],
+                                    "confidence": "HIGH",
+                                    "caveats": ["close_immediately test"],
+                                    "escalation_recommendation": "GPT-5.5 review",
+                                    "missing_fields": [],
+                                },
+                            })
+                        }
+                    }]
+                }
+            raise TimeoutError("simulated close timeout")
+
+        result = run_loop(m, ledger, fake_model, [], None, m.allowed_roots, m.allowed_paths, request_deadline=90)
+        assert result["status"] == "COMPLETE", f"close_immediately should allow COMPLETE after required read, got {result['status']}"
+        assert required_rel in str(ledger.files_inspected), ledger.files_inspected
+
+
+def assert_exploration_policy_min_optional_redirects_early_complete():
+    with tempfile.TemporaryDirectory(dir=ROOT) as td:
+        from pathlib import Path
+
+        required = Path(td) / "min_optional_target.py"
+        required.write_text("def find_target():\n    return 'found'\n", encoding="utf-8")
+        required_rel = os.path.relpath(required, ROOT)
+        extra = Path(td) / "extra_check.py"
+        extra.write_text("# extra context\nEXTRA = True\n", encoding="utf-8")
+        extra_rel = os.path.relpath(extra, ROOT)
+        m = mission(
+            mission_id="mission_exploration_min_optional",
+            objective="Investigate the target function.",
+            objective_style="open_investigation",
+            evidence_collection_mode="agenda_guided",
+            exploration_policy={"after_required_floor": "allow_model_exploration", "min_optional_actions_after_floor": 1, "max_optional_actions_after_floor": 3, "require_contradiction_search": False},
+            allowed_roots=[],
+            allowed_paths=[required_rel, extra_rel],
+            allowed_tool_classes=["read"],
+            tool_budget=6,
+            answer_obligations=[
+                {
+                    "id": "q1",
+                    "question": "Does the target file contain find_target()?",
+                    "required": True,
+                    "source_hints": [required_rel],
+                    "source_requirements": [{"path": required_rel, "evidence_kind": "function_presence", "required": True}],
+                }
+            ],
+            must_inspect=[required_rel],
+        )
+        ledger = EvidenceLedger(mission_id=m.mission_id, tool_budget_remaining=m.tool_budget)
+        calls = {"n": 0}
+
+        def fake_model(messages, tools, timeout):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return {
+                    "choices": [{
+                        "message": {
+                            "content": (
+                                '{"action_type":"tool_call","phase":"NARROW","tool_name":"rtk_read",'
+                                f'"arguments":{{"path":"{required_rel}"}},'
+                                '"reason":"Inspect the target.","hypothesis":"The file may contain find_target.",'
+                                '"target_question":"Does the file contain find_target?",'
+                                '"expected_information_gain":"Confirm the function exists.",'
+                                '"why_not_report_yet":"Need to inspect first."}'
+                            )
+                        }
+                    }]
+                }
+            if calls["n"] == 2:
+                return {
+                    "choices": [{
+                        "message": {
+                            "content": (
+                                '{"action_type":"tool_call","phase":"VERIFY","tool_name":"rtk_read",'
+                                f'"arguments":{{"path":"{extra_rel}"}},'
+                                '"reason":"Check extra file for confirmation.","hypothesis":"The extra file may provide supporting context.",'
+                                '"target_question":"Does the extra file support the finding?",'
+                                '"expected_information_gain":"Find corroborating evidence.",'
+                                '"why_not_report_yet":"Doing the optional check."}'
+                            )
+                        }
+                    }]
+                }
+            if calls["n"] == 3:
+                return {
+                    "choices": [{
+                        "message": {
+                            "content": json.dumps({
+                                "action_type": "final_report",
+                                "report": {
+                                    "status": "COMPLETE",
+                                    "files_inspected": [{"path": required_rel, "complete": True}, {"path": extra_rel, "complete": True}],
+                                    "commands_run": [{"tool": "rtk_read", "args": {"path": required_rel}}, {"tool": "rtk_read", "args": {"path": extra_rel}}],
+                                    "findings": [{"claim": "The target file contains find_target.", "evidence_refs": ["file:" + required_rel, "command:0"]}],
+                                    "uncertainties": [],
+                                    "confidence": "HIGH",
+                                    "caveats": ["min_optional satisfied via exploration"],
+                                    "escalation_recommendation": "GPT-5.5 review",
+                                    "missing_fields": [],
+                                },
+                            })
+                        }
+                    }]
+                }
+            raise TimeoutError("simulated close timeout")
+
+        result = run_loop(m, ledger, fake_model, [], None, m.allowed_roots, m.allowed_paths, request_deadline=90)
+        assert getattr(ledger, "optional_exploration_actions", 0) >= 1, f"Expected at least 1 optional exploration action, got {getattr(ledger, 'optional_exploration_actions', 0)}"
+        assert result["status"] == "COMPLETE", result
+
+
+def assert_exploration_policy_contradiction_blocks_closure():
+    with tempfile.TemporaryDirectory(dir=ROOT) as td:
+        from pathlib import Path
+
+        required = Path(td) / "contradiction_closure_target.py"
+        required.write_text("def find_target():\n    return 'found'\n", encoding="utf-8")
+        required_rel = os.path.relpath(required, ROOT)
+        m = mission(
+            mission_id="mission_exploration_contradiction",
+            objective="Investigate the target function.",
+            objective_style="open_investigation",
+            evidence_collection_mode="agenda_guided",
+            exploration_policy={"after_required_floor": "allow_model_exploration", "min_optional_actions_after_floor": 0, "max_optional_actions_after_floor": 3, "require_contradiction_search": True},
+            allowed_roots=[],
+            allowed_paths=[required_rel],
+            allowed_tool_classes=["read"],
+            tool_budget=6,
+            answer_obligations=[
+                {
+                    "id": "q1",
+                    "question": "Does the target file contain find_target()?",
+                    "required": True,
+                    "source_hints": [required_rel],
+                    "source_requirements": [{"path": required_rel, "evidence_kind": "function_presence", "required": True}],
+                }
+            ],
+            must_inspect=[required_rel],
+        )
+        ledger = EvidenceLedger(mission_id=m.mission_id, tool_budget_remaining=m.tool_budget)
+        calls = {"n": 0}
+
+        def fake_model(messages, tools, timeout):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return {
+                    "choices": [{
+                        "message": {
+                            "content": (
+                                '{"action_type":"tool_call","phase":"NARROW","tool_name":"rtk_read",'
+                                f'"arguments":{{"path":"{required_rel}"}},'
+                                '"reason":"Search for contradictions in the target.","hypothesis":"The file might have hidden contradictory logic.",'
+                                '"target_question":"Is there any contradiction in the file?",'
+                                '"expected_information_gain":"Check for contradictions.",'
+                                '"why_not_report_yet":"Need to verify no contradictions."}'
+                            )
+                        }
+                    }]
+                }
+            if calls["n"] == 2:
+                return {
+                    "choices": [{
+                        "message": {
+                            "content": json.dumps({
+                                "action_type": "final_report",
+                                "report": {
+                                    "status": "COMPLETE",
+                                    "files_inspected": [{"path": required_rel, "complete": True}],
+                                    "commands_run": [{"tool": "rtk_read", "args": {"path": required_rel}}],
+                                    "findings": [{"claim": "The target file contains find_target. No contradictions found.", "evidence_refs": ["file:" + required_rel, "command:0"]}],
+                                    "uncertainties": [],
+                                    "confidence": "HIGH",
+                                    "caveats": ["contradiction search done"],
+                                    "escalation_recommendation": "GPT-5.5 review",
+                                    "missing_fields": [],
+                                },
+                            })
+                        }
+                    }]
+                }
+            raise TimeoutError("simulated close timeout")
+
+        result = run_loop(m, ledger, fake_model, [], None, m.allowed_roots, m.allowed_paths, request_deadline=90)
+        assert getattr(ledger, "contradiction_search_done", False), "Expected contradiction_search_done to be True"
+        assert result["status"] == "COMPLETE", result
+
+
 def main():
     assert_run_loop_accepts_valid_final_report()
     assert_model_text_extraction_handles_provider_variants()
@@ -3190,6 +3628,11 @@ def main():
     assert_open_investigation_reports_insufficient_evidence_when_shape_missing()
     assert_open_investigation_escalates_on_contradiction_marker()
     assert_open_investigation_escalates_on_blocked_source()
+    assert_agenda_guided_redirects_then_prefetches_after_model_ignores_required_source()
+    assert_agenda_guided_does_not_prefetch_upfront_lets_model_cooperate()
+    assert_exploration_policy_close_immediately_blocks_further_tool_calls()
+    assert_exploration_policy_min_optional_redirects_early_complete()
+    assert_exploration_policy_contradiction_blocks_closure()
     print("PASS: runtime contract suite")
 
 

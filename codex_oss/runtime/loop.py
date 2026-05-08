@@ -304,7 +304,9 @@ def run_loop(mission: Any, ledger: Any, call_model_fn, tools, emitter,
                 report = action.report
                 if isinstance(report, dict):
                     if str(getattr(mission, "objective_style", "") or "") == "open_investigation":
-                        current_answer_graph = getattr(ledger, "answer_graph", {}) or {}
+                        from codex_oss.answer_graph import refresh_answer_graph as _refresh_answer_graph
+                        current_answer_graph = _refresh_answer_graph(mission, ledger, reason="report_check", persist=False)
+                        ledger.answer_graph = current_answer_graph
                         pending_required = pending_required_agenda_items(current_answer_graph)
                         if pending_required and str(report.get("status", "") or "").upper() == "COMPLETE":
                             if repair_count < max_repair:
@@ -316,6 +318,40 @@ def run_loop(mission: Any, ledger: Any, call_model_fn, tools, emitter,
                                 )})
                                 continue
                             return _partial(mission, ledger, "complete_report_before_required_sources", deadline)
+                        if not pending_required:
+                            exploration_policy = _exploration_policy(mission)
+                            after_floor = str(exploration_policy.get("after_required_floor", "") or "")
+                            if str(report.get("status", "") or "").upper() == "COMPLETE" and after_floor == "allow_model_exploration":
+                                optional_count = getattr(ledger, "optional_exploration_actions", 0)
+                                min_optional = int(exploration_policy.get("min_optional_actions_after_floor", 1) or 0)
+                                require_contradiction = bool(exploration_policy.get("require_contradiction_search", True))
+                                contradiction_done = bool(getattr(ledger, "contradiction_search_done", False))
+                                if optional_count < min_optional:
+                                    if repair_count < max_repair:
+                                        repair_count += 1
+                                        context.append({"role": "user", "content": (
+                                            f"Required evidence floor is covered, but exploration policy expects "
+                                            f"at least {min_optional} optional check(s) after the floor (currently {optional_count}). "
+                                            "Perform one more investigation action or return PARTIAL with the skipped-exploration reason."
+                                        )})
+                                        continue
+                                    report["status"] = "PARTIAL"
+                                    report.setdefault("caveats", []).append(
+                                        f"Skipped optional exploration: floor covered but only {optional_count}/{min_optional} optional actions performed."
+                                    )
+                                elif require_contradiction and not contradiction_done:
+                                    if repair_count < max_repair:
+                                        repair_count += 1
+                                        context.append({"role": "user", "content": (
+                                            "Exploration policy requires a contradiction search before closure. "
+                                            "Search for evidence that contradicts your current findings, "
+                                            "or return PARTIAL with a caveat that no contradiction search was performed."
+                                        )})
+                                        continue
+                                    report.setdefault("caveats", []).append(
+                                        "No contradiction search was performed before closure."
+                                    )
+                                    report["status"] = "PARTIAL"
                     # Check critical finality claims
                     rendered = ""
                     from codex_oss.validation import render_report
@@ -479,8 +515,12 @@ def run_loop(mission: Any, ledger: Any, call_model_fn, tools, emitter,
                     ledger.add_risk_flag("critical_path_read_allowed")
 
                 if str(getattr(mission, "objective_style", "") or "") == "open_investigation":
-                    current_answer_graph = getattr(ledger, "answer_graph", {}) or {}
+                    from codex_oss.answer_graph import refresh_answer_graph as _refresh_answer_graph, pending_required_agenda_items as _pending_required_agenda_items
+                    current_answer_graph = _refresh_answer_graph(mission, ledger, reason="action_redirect", persist=False)
+                    ledger.answer_graph = current_answer_graph
                     current_sufficiency = current_answer_graph.get("sufficiency", {}) if isinstance(current_answer_graph, dict) else {}
+                    if not getattr(ledger, "contradiction_search_done", False) and _action_looks_like_contradiction_search(action):
+                        ledger.contradiction_search_done = True
                     required_answered = int(current_sufficiency.get("required_answered", 0) or 0)
                     required_total = int(current_sufficiency.get("required_total", 0) or 0)
                     pending_required = pending_required_agenda_items(current_answer_graph)
@@ -558,6 +598,38 @@ def run_loop(mission: Any, ledger: Any, call_model_fn, tools, emitter,
                             "Inspect the pending source first or return a PARTIAL final_report that names it explicitly."
                         )})
                         continue
+                    if not pending_required:
+                        exploration_policy = _exploration_policy(mission)
+                        after_floor = str(exploration_policy.get("after_required_floor", "") or "")
+                        if after_floor == "close_immediately" and not _action_looks_like_contradiction_search(action):
+                            _record_action_trace(
+                                mission, ledger, action, _mission_phase(ledger), "redirected",
+                                "exploration policy requires closure after required evidence floor",
+                                deadline, raw_arguments, action.arguments, [],
+                            )
+                            context.append({"role": "user", "content": (
+                                "Required evidence floor is covered. Exploration policy requires closure. "
+                                "Return a final_report now with your best findings."
+                            )})
+                            continue
+                        if after_floor == "allow_model_exploration":
+                            optional_count = getattr(ledger, "optional_exploration_actions", 0)
+                            max_optional = int(exploration_policy.get("max_optional_actions_after_floor", 4) or 0)
+                            if optional_count >= max_optional:
+                                _record_action_trace(
+                                    mission, ledger, action, _mission_phase(ledger), "redirected",
+                                    "optional exploration budget exhausted",
+                                    deadline, raw_arguments, action.arguments, [],
+                                )
+                                context.append({"role": "user", "content": (
+                                    f"Optional exploration budget exhausted ({optional_count}/{max_optional}). "
+                                    "Return a final_report now."
+                                )})
+                                continue
+                        if after_floor:
+                            ledger.optional_exploration_actions = getattr(ledger, "optional_exploration_actions", 0) + 1
+                            if not getattr(ledger, "contradiction_search_done", False) and _action_looks_like_contradiction_search(action):
+                                ledger.contradiction_search_done = True
 
                 progress = assess_action_progress(mission, ledger, action, deadline)
                 if progress.decision == "finalize":
@@ -720,11 +792,20 @@ def run_loop(mission: Any, ledger: Any, call_model_fn, tools, emitter,
                         "Return final_report now; do not call another tool.\n"
                     )
                 elif answer_sufficiency is not None and bool(answer_sufficiency.get("can_close", False)):
-                    forced_final_requested = True
-                    objective_text = (
-                        "\nRuntime answer-graph check: required answer obligations are satisfied. "
-                        "Return final_report now; do not call another tool.\n"
-                    )
+                    exploration_policy = _exploration_policy(mission)
+                    after_floor = str(exploration_policy.get("after_required_floor", "") or "")
+                    if after_floor == "allow_model_exploration":
+                        optional_count = getattr(ledger, "optional_exploration_actions", 0)
+                        max_optional = int(exploration_policy.get("max_optional_actions_after_floor", 4) or 0)
+                        require_contradiction = bool(exploration_policy.get("require_contradiction_search", True))
+                        contradiction_done = bool(getattr(ledger, "contradiction_search_done", False))
+                        if optional_count >= max_optional:
+                            forced_final_requested = True
+                        elif require_contradiction and not contradiction_done and optional_count >= int(exploration_policy.get("min_optional_actions_after_floor", 1) or 0):
+                            forced_final_requested = True
+                        # Do NOT increment counter here — let the next deliberate action count
+                    else:
+                        forced_final_requested = True
                 elif bool(sufficiency.get("enough_evidence_to_report", False)):
                     forced_final_requested = True
                     objective_text = (
@@ -924,6 +1005,25 @@ def _should_prefetch_pending_sources(mission: Any, ledger: Any, deadline: Any | 
         except Exception:
             return False
     return False
+
+
+def _exploration_policy(mission: Any) -> dict[str, Any]:
+    policy = getattr(mission, "exploration_policy", {}) or {}
+    if not isinstance(policy, dict):
+        return {}
+    return dict(policy)
+
+
+def _action_looks_like_contradiction_search(action: Any) -> bool:
+    if not action or not getattr(action, "is_tool_call", False):
+        return False
+    searchable = " ".join([
+        str(getattr(action, "reason", "") or ""),
+        str(getattr(action, "hypothesis", "") or ""),
+        str(getattr(action, "target_question", "") or ""),
+        str(getattr(action, "phase", "") or ""),
+    ]).lower()
+    return "contradict" in searchable
 
 
 def min_confidence(a: str, b: str) -> str:
