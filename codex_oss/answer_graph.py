@@ -152,6 +152,9 @@ def evaluate_answer_sufficiency(
     required = [item for item in obligations if item.get("required", True)]
     answered = [item for item in required if item.get("status") == "answered"]
     partial = [item for item in required if item.get("status") in {"partially_answered", "blocked_on_evidence"}]
+    contradicted = [item for item in required if item.get("status") == "contradicted"]
+    blocked = [item for item in required if item.get("status") == "blocked_source"]
+    insufficient = [item for item in required if item.get("status") == "insufficient_evidence"]
     open_required = [item for item in required if item.get("status") not in {"answered", "blocked", "out_of_scope"}]
     agenda_items = list(agenda_items or [])
     pending_required_sources = [
@@ -169,12 +172,17 @@ def evaluate_answer_sufficiency(
     has_useful_evidence = bool(
         answered
         or partial
+        or contradicted
+        or blocked
+        or insufficient
         or getattr(ledger, "claims", [])
         or getattr(ledger, "files_inspected", {})
         or getattr(ledger, "commands_run", [])
     )
-    can_close = not open_required and not pending_required_sources and has_useful_evidence
-    if can_close:
+    can_close = not open_required and not pending_required_sources and not contradicted and not blocked and not insufficient and has_useful_evidence
+    if contradicted or blocked:
+        recommended_status = "ESCALATE"
+    elif can_close:
         recommended_status = "COMPLETE"
     elif has_useful_evidence:
         recommended_status = "PARTIAL"
@@ -182,6 +190,9 @@ def evaluate_answer_sufficiency(
         recommended_status = "FAILED"
     open_questions = [item.get("question", "") for item in open_required if item.get("question")]
     reason = "All required obligations and required sources are satisfied." if can_close else (
+        "Required evidence contradicts itself." if contradicted else
+        "A required evidence source is blocked or unreadable." if blocked else
+        "Required evidence was read but the required evidence shape was not found." if insufficient else
         "Required evidence sources remain uninspected."
         if pending_required_sources
         else "Required answer obligations remain unanswered."
@@ -197,6 +208,9 @@ def evaluate_answer_sufficiency(
         "partially_answered": len(partial),
         "missing_must_inspect": list(dict.fromkeys(pending_required_sources)),
         "missing_required_sources": list(dict.fromkeys(pending_required_sources)),
+        "contradicted_obligations": [str(item.get("id", "") or "") for item in contradicted],
+        "blocked_obligations": [str(item.get("id", "") or "") for item in blocked],
+        "insufficient_evidence_obligations": [str(item.get("id", "") or "") for item in insufficient],
         "open_high_priority_questions": open_questions,
         "confidence_cap": confidence_cap,
         "partial_extracts": partial_extracts,
@@ -231,11 +245,20 @@ def build_runtime_report_from_answer_graph(
         if item.get("status") == "answered"
     ]
     missing_sources = list(sufficiency.get("missing_required_sources", []) or [])
+    contradicted = list(sufficiency.get("contradicted_obligations", []) or [])
+    blocked = list(sufficiency.get("blocked_obligations", []) or [])
+    insufficient = list(sufficiency.get("insufficient_evidence_obligations", []) or [])
     caveats = [str(reason)]
     if unanswered:
         caveats.append("Some answer obligations remain unresolved.")
     if missing_sources:
         caveats.append("Some required evidence sources were not inspected.")
+    if contradicted:
+        caveats.append("At least one required obligation has contradictory evidence.")
+    if blocked:
+        caveats.append("At least one required evidence source was blocked or unreadable.")
+    if insufficient:
+        caveats.append("At least one required evidence source was read but did not satisfy the required evidence shape.")
     if str(getattr(mission, "objective_style", "") or "") == "open_investigation":
         caveats.append("Report rendered from runtime answer graph.")
     report = {
@@ -249,6 +272,9 @@ def build_runtime_report_from_answer_graph(
         "uncertainties": unanswered,
         "answered_obligations": answered_obligations,
         "missing_required_sources": missing_sources,
+        "contradicted_obligations": contradicted,
+        "blocked_obligations": blocked,
+        "insufficient_evidence_obligations": insufficient,
         "next_required_actions": list(sufficiency.get("next_required_actions", []) or []),
         "caveats": list(dict.fromkeys(caveats)),
         "escalation_recommendation": "GPT-5.5 review required",
@@ -320,6 +346,8 @@ def _normalize_obligation(raw: dict[str, Any]) -> dict[str, Any]:
                 "evidence_kind": str(item.get("evidence_kind", "source_read") or "source_read"),
                 "required": bool(item.get("required", True)),
                 "prefetch": bool(item.get("prefetch", True)),
+                "required_shapes": [str(shape) for shape in (item.get("required_shapes", []) or []) if str(shape)],
+                "contradiction_markers": [str(marker) for marker in (item.get("contradiction_markers", []) or []) if str(marker)],
             })
     return {
         "id": str(raw.get("id", "q")),
@@ -356,19 +384,44 @@ def _fallback_obligations(mission: Any) -> list[dict[str, Any]]:
 def _source_requirement_view(requirement: dict[str, Any], inspected_paths: set[str], command_refs: list[dict[str, Any]]) -> dict[str, Any]:
     path = str(requirement.get("path", "") or "")
     evidence_refs = []
-    if path in inspected_paths:
-        evidence_refs.append(f"file:{path}#extract:1")
+    failed_reads = []
+    successful_read = False
     for item in command_refs:
         if path and path == item.get("path"):
-            evidence_refs.append(str(item.get("ref")))
-    status = "satisfied" if evidence_refs else "missing"
+            if int(item.get("exit_code", 0) or 0) == 0:
+                successful_read = True
+                evidence_refs.append(str(item.get("ref")))
+            else:
+                failed_reads.append(str(item.get("ref")))
+    if successful_read and path in inspected_paths:
+        evidence_refs.append(f"file:{path}#extract:1")
+    required_shapes = [str(shape) for shape in (requirement.get("required_shapes", []) or []) if str(shape)]
+    detected_shapes = _detected_shapes_for_path(path)
+    contradiction_markers = [str(marker) for marker in (requirement.get("contradiction_markers", []) or []) if str(marker)]
+    matched_contradictions = _matched_contradiction_markers(path, contradiction_markers)
+    missing_shapes = [shape for shape in required_shapes if shape not in detected_shapes]
+    if matched_contradictions:
+        status = "contradicted"
+    elif failed_reads and not evidence_refs:
+        status = "blocked_source"
+    elif not evidence_refs:
+        status = "missing"
+    elif missing_shapes:
+        status = "insufficient_evidence"
+    else:
+        status = "satisfied"
     return {
         "path": path,
         "evidence_kind": str(requirement.get("evidence_kind", "source_read") or "source_read"),
         "required": bool(requirement.get("required", True)),
         "prefetch": bool(requirement.get("prefetch", True)),
+        "required_shapes": required_shapes,
+        "detected_shapes": detected_shapes,
+        "missing_shapes": missing_shapes,
+        "contradiction_markers": contradiction_markers,
+        "matched_contradictions": matched_contradictions,
         "status": status,
-        "evidence_refs": list(dict.fromkeys(evidence_refs)),
+        "evidence_refs": list(dict.fromkeys(evidence_refs + failed_reads)),
     }
 
 
@@ -436,6 +489,12 @@ def _obligation_status(
     summary_question = "conclusion" in question_lower or "justified" in question_lower
     uncertainty_question = any(term in question_lower for term in ("unknown", "unproven", "uncertain", "remains"))
     required_requirements = [item for item in requirement_views if bool(item.get("required", True))]
+    if any(item.get("status") == "contradicted" for item in required_requirements):
+        return "contradicted"
+    if any(item.get("status") == "blocked_source" for item in required_requirements):
+        return "blocked_source"
+    if any(item.get("status") == "insufficient_evidence" for item in required_requirements):
+        return "insufficient_evidence"
     all_required_sources_satisfied = all(item.get("status") == "satisfied" for item in required_requirements)
     has_any_evidence = bool(linked_claims or evidence_refs or getattr(ledger, "files_inspected", {}))
     if uncertainty_question and (linked_claims or (missing_evidence and has_any_evidence)):
@@ -454,6 +513,8 @@ def _obligation_status(
 
 
 def _obligation_confidence(status: str, evidence_refs: list[str]) -> str:
+    if status in {"contradicted", "blocked_source", "insufficient_evidence"}:
+        return "LOW"
     if status == "answered" and len(evidence_refs) >= 2:
         return "MEDIUM"
     if status in {"answered", "partially_answered"}:
@@ -476,6 +537,7 @@ def _agenda_items_for_obligation(obligation: dict[str, Any]) -> list[dict[str, A
             "status": "done" if requirement.get("status") == "satisfied" else "pending",
             "reason": f"Required source for obligation {obligation.get('id', '')}.",
             "prefetch": bool(requirement.get("prefetch", True)),
+            "required_shapes": list(requirement.get("required_shapes", []) or []),
         })
     return items
 
@@ -495,18 +557,32 @@ def _dedupe_agenda(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def _coverage_status(obligations: list[dict[str, Any]], agenda_items: list[dict[str, Any]]) -> dict[str, Any]:
     required = [item for item in obligations if item.get("required", True)]
     answered = [item for item in required if item.get("status") == "answered"]
+    contradicted = [item.get("id", "") for item in required if item.get("status") == "contradicted"]
+    blocked = [item.get("id", "") for item in required if item.get("status") == "blocked_source"]
+    insufficient = [item.get("id", "") for item in required if item.get("status") == "insufficient_evidence"]
     missing_sources = [
         str(item.get("path", "") or "")
         for item in agenda_items
         if item.get("kind") == "required_read" and item.get("status") != "done"
     ]
-    can_complete = len(answered) == len(required) and not missing_sources
+    can_complete = len(answered) == len(required) and not missing_sources and not contradicted and not blocked and not insufficient
+    if contradicted or blocked:
+        recommended_status = "ESCALATE"
+    elif can_complete:
+        recommended_status = "COMPLETE"
+    elif answered or missing_sources or insufficient:
+        recommended_status = "PARTIAL"
+    else:
+        recommended_status = "FAILED"
     return {
         "required_obligations": len(required),
         "answered_obligations": len(answered),
         "missing_required_sources": list(dict.fromkeys(missing_sources)),
+        "contradicted_obligations": contradicted,
+        "blocked_obligations": blocked,
+        "insufficient_evidence_obligations": insufficient,
         "can_complete": can_complete,
-        "recommended_status": "COMPLETE" if can_complete else ("PARTIAL" if answered or missing_sources else "FAILED"),
+        "recommended_status": recommended_status,
     }
 
 
@@ -596,8 +672,54 @@ def _command_refs(ledger: Any) -> list[dict[str, Any]]:
             "ref": f"command:{idx}",
             "path": str(args.get("path", "") or ""),
             "pattern": str(args.get("pattern", "") or ""),
+            "exit_code": int(getattr(command, "exit_code", 0) or 0),
         })
     return refs
+
+
+def _detected_shapes_for_path(path: str) -> list[str]:
+    if not path:
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            text = handle.read()
+    except OSError:
+        return []
+    return _detect_shapes(text)
+
+
+def _matched_contradiction_markers(path: str, markers: list[str]) -> list[str]:
+    if not path or not markers:
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            text = handle.read().lower()
+    except OSError:
+        return []
+    return [marker for marker in markers if marker.lower() in text]
+
+
+def _detect_shapes(text: str) -> list[str]:
+    content = str(text or "")
+    lowered = content.lower()
+    shapes: list[str] = []
+    patterns = {
+        "function_definition": r"^\s*def\s+[A-Za-z_][A-Za-z0-9_]*\s*\(",
+        "class_definition": r"^\s*class\s+[A-Za-z_][A-Za-z0-9_]*\s*[\(:]",
+        "mapping_assignment": r"[A-Za-z_][A-Za-z0-9_]*\s*=\s*\{",
+        "config_value": r"[\"'][A-Za-z0-9_.-]+[\"']\s*:\s*[^,\n]+",
+        "flag_parameter": r"\b(flag|allow|require)_[A-Za-z0-9_]+\b",
+        "flag_read": r"\.(get|pop)\(\s*[\"'](?:flag|allow|require)_[A-Za-z0-9_]+[\"']",
+        "behavior_derivation": r"\b(derive|derived|observed behavior|behavior provenance)\b",
+        "zero_match": r"\b0 matches\b",
+        "test_assertion": r"\bassert\b|\bself\.assert",
+        "verification_command": r"\b(pytest|unittest|verify|verification)\b",
+    }
+    for shape, pattern in patterns.items():
+        flags = re.MULTILINE if shape in {"function_definition", "class_definition"} else 0
+        if re.search(pattern, content if flags else lowered, flags):
+            shapes.append(shape)
+    return shapes
 
 
 def _default_source_requirements(paths: list[str], evidence_kind: str) -> list[dict[str, Any]]:

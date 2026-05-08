@@ -31,6 +31,8 @@ def compile_mission_v1(
     sufficiency_policy: dict[str, Any] | None = None,
     answer_obligations: list[dict[str, Any]] | None = None,
     must_inspect: list[str] | None = None,
+    evidence_collection_mode: str = "",
+    exploration_policy: dict[str, Any] | None = None,
     allow_broad_read_scope: bool = False,
     critical_path_read_allowed: bool = False,
     critical_path_reason: str | None = None,
@@ -76,6 +78,19 @@ def compile_mission_v1(
         mission["sufficiency_policy"] = dict(sufficiency_policy)
     if must_inspect:
         mission["must_inspect"] = list(must_inspect)
+    if evidence_collection_mode:
+        mission["evidence_collection_mode"] = str(evidence_collection_mode)
+    elif mission.get("objective_style") == "open_investigation":
+        mission["evidence_collection_mode"] = "agenda_guided"
+    if exploration_policy:
+        mission["exploration_policy"] = dict(exploration_policy)
+    elif mission.get("objective_style") == "open_investigation":
+        mission["exploration_policy"] = {
+            "after_required_floor": "allow_model_exploration",
+            "min_optional_actions_after_floor": 1,
+            "max_optional_actions_after_floor": 4,
+            "require_contradiction_search": True,
+        }
 
     if tier in {"A2", "A3"}:
         mission["report_schema"] = "managed_investigation_report.v1"

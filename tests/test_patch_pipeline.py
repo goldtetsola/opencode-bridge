@@ -851,6 +851,8 @@ def assert_patch_validator_enforces_broad_implementation_objective_spec():
         assert valid["checks"]["objective_satisfied"] is True, valid
         assert valid["checks"]["semantic_review_ok"] is True, valid
         assert valid["checks"]["verification_plan_ok"] is True, valid
+        assert valid["implementation_readiness_graph"]["coverage_status"]["recommended_status"] == "VALID", valid
+        assert valid["implementation_readiness_graph"]["coverage_status"]["can_apply"] is True, valid
 
         no_test = broad_source_and_test_diff().split("diff --git a/tests/test_config.py", 1)[0]
         invalid = validate_patch_proposal(
@@ -860,6 +862,8 @@ def assert_patch_validator_enforces_broad_implementation_objective_spec():
         )
         assert invalid["status"] == "INVALID", invalid
         assert any("required changed file missing" in reason for reason in invalid["reasons"]), invalid
+        assert invalid["implementation_readiness_graph"]["coverage_status"]["recommended_status"] == "INVALID", invalid
+        assert "required_changed_file:tests/test_config.py" in invalid["implementation_readiness_graph"]["coverage_status"]["missing_obligation_ids"], invalid
 
         removed_test = broad_source_and_test_diff().replace(
             " def test_existing():\n     assert True\n",
@@ -872,6 +876,29 @@ def assert_patch_validator_enforces_broad_implementation_objective_spec():
         )
         assert invalid["status"] == "INVALID", invalid
         assert any("forbidden removal pattern" in reason for reason in invalid["reasons"]), invalid
+        assert invalid["implementation_readiness_graph"]["coverage_status"]["contradicted_total"] >= 1, invalid
+        assert "forbidden_removed_pattern:def test_existing" in invalid["implementation_readiness_graph"]["coverage_status"]["contradicted_obligation_ids"], invalid
+    finally:
+        shutil.rmtree(root)
+
+
+def assert_patch_validator_requires_evidence_shapes_for_broad_implementation():
+    root, original = make_project()
+    try:
+        source_original = "def parse_config(value):\n    return value\n"
+        mission = implementation_mission(
+            owned_paths=["src/config.py", "tests/test_config.py"],
+            max_files_changed=2,
+            objective_spec=implementation_patch_objective_spec(required_evidence_shapes=["source_change", "flag_parameter"]),
+        )
+        patch = broad_proposal(broad_source_and_test_diff(), sha256_text(original), sha256_text(source_original))
+        invalid = validate_patch_proposal(patch, mission, root)
+        assert invalid["status"] == "INVALID", invalid
+        assert invalid["implementation_readiness_graph"]["coverage_status"]["insufficient_evidence_total"] >= 1, invalid
+        assert any(
+            item.get("status") == "insufficient_evidence" and item.get("shape") == "flag_parameter"
+            for item in invalid["implementation_readiness_graph"]["obligations"]
+        ), invalid
     finally:
         shutil.rmtree(root)
 
@@ -894,11 +921,14 @@ def assert_a5_isolated_apply_verifies_without_mutating_main_workspace():
         assert report["model_repair_count"] == 0, report
         assert report["semantic_review_ok"] is True, report
         assert report["verification_plan_ok"] is True, report
+        assert report["implementation_readiness"]["recommended_status"] == "VALID", report
         assert report["changed_files"] == ["tests/test_config.py"], report
         assert report["verification"][0]["exit_code"] == 0, report
         with open(os.path.join(root, "tests/test_config.py"), encoding="utf-8") as handle:
             assert handle.read() == original
         assert os.path.exists(os.path.join(root, report["patch_artifact"])), report
+        artifact_dir = os.path.join(root, ".codex-oss", "missions", mission.mission_id)
+        assert os.path.exists(os.path.join(artifact_dir, "implementation_readiness_graph.json")), artifact_dir
     finally:
         shutil.rmtree(root)
 
@@ -1493,6 +1523,7 @@ def main():
     assert_patch_validator_rejects_stale_base_and_oversized_patch()
     assert_patch_validator_enforces_test_only_objective_spec()
     assert_patch_validator_enforces_broad_implementation_objective_spec()
+    assert_patch_validator_requires_evidence_shapes_for_broad_implementation()
     assert_a5_isolated_apply_verifies_without_mutating_main_workspace()
     assert_a5_temp_project_apply_verifies_without_mutating_main_workspace()
     assert_a5_workspace_apply_is_policy_gated_and_reversible()

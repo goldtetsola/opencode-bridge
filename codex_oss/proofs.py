@@ -128,22 +128,25 @@ def _generate_a3_proof(project_root: str) -> str:
 
 def _generate_a3_open_proof(project_root: str) -> str:
     mission_id = "proof_a3_open"
-    with tempfile.TemporaryDirectory(prefix="oss_proof_a3_open_") as root:
-        src_dir = os.path.join(root, "src")
-        tests_dir = os.path.join(root, "tests")
-        os.makedirs(src_dir, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=project_root, prefix="oss_proof_a3_open_workspace_") as fixture_root:
+        runtime_dir = os.path.join(fixture_root, "src")
+        tests_dir = os.path.join(fixture_root, "tests")
+        os.makedirs(runtime_dir, exist_ok=True)
         os.makedirs(tests_dir, exist_ok=True)
-        with open(os.path.join(src_dir, "runtime.py"), "w", encoding="utf-8") as handle:
+        runtime_path = os.path.join(runtime_dir, "runtime.py")
+        tests_path = os.path.join(tests_dir, "test_runtime.py")
+        with open(runtime_path, "w", encoding="utf-8") as handle:
             handle.write(
                 "def persist_readonly_artifacts():\n"
                 "    return ['mission.json', 'report.json', 'trace.jsonl']\n"
             )
-        with open(os.path.join(tests_dir, "test_runtime.py"), "w", encoding="utf-8") as handle:
+        with open(tests_path, "w", encoding="utf-8") as handle:
             handle.write(
                 "def test_runtime_artifact_contract():\n"
                 "    assert 'trace.jsonl' in ['mission.json', 'report.json', 'trace.jsonl']\n"
             )
-
+        runtime_rel = os.path.relpath(runtime_path, project_root)
+        tests_rel = os.path.relpath(tests_path, project_root)
         call_count = {"n": 0}
 
         def call_payload(payload, timeout):
@@ -154,7 +157,7 @@ def _generate_a3_open_proof(project_root: str) -> str:
                         "message": {
                             "content": (
                                 '{"action_type":"tool_call","phase":"EXPLORE","tool_name":"rtk_grep",'
-                                '"arguments":{"pattern":"trace.jsonl","path":"src/runtime.py"},'
+                                f'"arguments":{{"pattern":"trace.jsonl","path":"{runtime_rel}"}},'
                                 '"reason":"Start with a search to discover where the artifact contract appears.",'
                                 '"hypothesis":"The readonly artifact contract should surface in both implementation and tests.",'
                                 '"target_question":"Which files mention trace.jsonl as part of the readonly contract?",'
@@ -170,8 +173,7 @@ def _generate_a3_open_proof(project_root: str) -> str:
                         "message": {
                             "content": (
                                 '{"action_type":"tool_call","phase":"NARROW","tool_name":"rtk_read",'
-                                '"arguments":{"path":"src/runtime.py"},'
-                                '"reason":"Inspect the implementation after the search identified the artifact string.",'
+                                f'"arguments":{{"path":"{runtime_rel}"}},"reason":"Inspect the implementation after the search identified the artifact string.",'
                                 '"hypothesis":"The runtime file shows which readonly artifacts are persisted.",'
                                 '"target_question":"Which artifacts does the runtime persist?",'
                                 '"expected_information_gain":"Find implementation evidence for persisted artifact names.",'
@@ -186,8 +188,7 @@ def _generate_a3_open_proof(project_root: str) -> str:
                         "message": {
                             "content": (
                                 '{"action_type":"tool_call","phase":"VERIFY","tool_name":"rtk_read",'
-                                '"arguments":{"path":"tests/test_runtime.py"},'
-                                '"reason":"Check whether tests reinforce the artifact contract.",'
+                                f'"arguments":{{"path":"{tests_rel}"}},"reason":"Check whether tests reinforce the artifact contract.",'
                                 '"hypothesis":"The tests should confirm trace.jsonl is expected.",'
                                 '"target_question":"Is there a test that reinforces the artifact contract?",'
                                 '"expected_information_gain":"Corroborate the implementation claim with test evidence.",'
@@ -203,8 +204,8 @@ def _generate_a3_open_proof(project_root: str) -> str:
                             '{"action_type":"final_report","report":'
                             '{"oss_report_version":"1.0","mission_id":"proof_a3_open",'
                             '"status":"COMPLETE","confidence":"LOW",'
-                            '"files_inspected":[{"path":"src/runtime.py","complete":true},{"path":"tests/test_runtime.py","complete":true}],'
-                            '"commands_run":[{"tool":"rtk_grep","args":{"pattern":"trace.jsonl","path":"src/runtime.py"}},{"tool":"rtk_read","args":{"path":"src/runtime.py"}},{"tool":"rtk_read","args":{"path":"tests/test_runtime.py"}}],'
+                            f'"files_inspected":[{{"path":"{runtime_rel}","complete":true}},{{"path":"{tests_rel}","complete":true}}],'
+                            f'"commands_run":[{{"tool":"rtk_grep","args":{{"pattern":"trace.jsonl","path":"{runtime_rel}"}}}},{{"tool":"rtk_read","args":{{"path":"{runtime_rel}"}}}},{{"tool":"rtk_read","args":{{"path":"{tests_rel}"}}}}],'
                             '"findings":[{"claim":"The runtime persists read-only artifacts and the test fixture reinforces that trace.jsonl is part of the contract.","evidence_refs":["command:0","command:1","command:2"],"confidence":"LOW"}],'
                             '"uncertainties":["Only two fixture files were inspected."],'
                             '"caveats":["open investigation proof"],'
@@ -224,9 +225,9 @@ def _generate_a3_open_proof(project_root: str) -> str:
                     '"tier":"A3","mode":"managed_investigation","objective":"Investigate how readonly artifacts are persisted and reinforced.",'
                     '"objective_style":"open_investigation",'
                     '"sufficiency_policy":{"min_main_claims":1,"min_evidence_refs_per_claim":1,"must_list_uninspected_areas":true,"confidence_cap_if_partial_extracts":"MEDIUM"},'
-                    '"answer_obligations":[{"id":"q1","question":"Which implementation file persists readonly artifacts?","required":true,"source_hints":["src/runtime.py"],"source_requirements":[{"path":"src/runtime.py","evidence_kind":"implementation_logic","required":true,"prefetch":true}]},{"id":"q2","question":"Which test file reinforces the readonly artifact contract?","required":true,"source_hints":["tests/test_runtime.py"],"source_requirements":[{"path":"tests/test_runtime.py","evidence_kind":"test_enforcement","required":true,"prefetch":true}]},{"id":"q3","question":"What conclusion is justified from the inspected evidence?","required":true,"source_hints":["src/runtime.py","tests/test_runtime.py"]},{"id":"q4","question":"What remains unproven?","required":true,"source_hints":["src/runtime.py","tests/test_runtime.py"]}],'
-                    '"must_inspect":["src/runtime.py","tests/test_runtime.py"],'
-                    '"risk_tier":"low","write_allowed":false,"allowed_roots":[],"allowed_paths":["src/runtime.py","tests/test_runtime.py"],'
+                    f'"answer_obligations":[{{"id":"q1","question":"Which implementation file persists readonly artifacts?","required":true,"source_hints":["{runtime_rel}"]}},{{"id":"q2","question":"Which test file reinforces the readonly artifact contract?","required":true,"source_hints":["{tests_rel}"]}},{{"id":"q3","question":"What conclusion is justified from the inspected evidence?","required":true,"source_hints":["{runtime_rel}","{tests_rel}"]}},{{"id":"q4","question":"What remains unproven?","required":true,"source_hints":["{runtime_rel}","{tests_rel}"]}}],'
+                    f'"must_inspect":["{runtime_rel}","{tests_rel}"],'
+                    f'"risk_tier":"low","write_allowed":false,"allowed_roots":[],"allowed_paths":["{runtime_rel}","{tests_rel}"],'
                     '"tool_budget":5,"time_budget_seconds":45,"allowed_tool_classes":["read","search"],'
                     '"stop_conditions":["valid_report"],"report_schema":"managed_investigation_report.v1",'
                     '"required_outputs":["files_inspected","commands_run","findings","uncertainties","confidence","caveats","escalation_recommendation"]}'
@@ -234,7 +235,7 @@ def _generate_a3_open_proof(project_root: str) -> str:
                 ),
             }]
         }
-        with _cwd(root):
+        with _cwd(project_root):
             result = run_managed_mission_from_body(
                 body,
                 "mission-a3-kimi",
@@ -245,7 +246,7 @@ def _generate_a3_open_proof(project_root: str) -> str:
             )
             if not result.handled or result.status != "COMPLETE":
                 raise RuntimeError(f"A3 open proof generation failed: {result}")
-        _copy_proof_artifacts(root, project_root, mission_id, proof_kind="A3_OPEN")
+        _tag_existing_mission_artifacts(project_root, mission_id, proof_kind="A3_OPEN", evidence_set="proof")
     return mission_id
 
 
@@ -516,8 +517,9 @@ def _generate_a6_certified_proof(project_root: str) -> str:
 
 def _generate_operational_a3_readme(project_root: str) -> str:
     mission_id = "operational_a3_readme"
-    with tempfile.TemporaryDirectory(prefix="oss_operational_a3_") as root:
-        _copy_repo_file(project_root, root, "README.md")
+    with tempfile.TemporaryDirectory(dir=project_root, prefix="oss_operational_a3_workspace_") as fixture_root:
+        _copy_repo_file(project_root, fixture_root, "README.md")
+        readme_rel = os.path.relpath(os.path.join(fixture_root, "README.md"), project_root)
         call_count = {"n": 0}
 
         def call_payload(payload, timeout):
@@ -528,7 +530,7 @@ def _generate_operational_a3_readme(project_root: str) -> str:
                         "message": {
                             "content": (
                                 '{"action_type":"tool_call","tool_name":"rtk_read",'
-                                '"arguments":{"path":"README.md"},'
+                                f'"arguments":{{"path":"{readme_rel}"}},'
                                 '"reason":"Inspect the real repo README.","hypothesis":"README contains the project overview.",'
                                 '"expected_information_gain":"Gather real repo evidence.",'
                                 '"why_not_report_yet":"Need direct file evidence first."}'
@@ -543,8 +545,8 @@ def _generate_operational_a3_readme(project_root: str) -> str:
                             '{"action_type":"final_report","report":'
                             '{"oss_report_version":"1.0","mission_id":"operational_a3_readme",'
                             '"status":"COMPLETE","confidence":"LOW",'
-                            '"files_inspected":[{"path":"README.md","complete":true}],'
-                            '"commands_run":[{"tool":"rtk_read","args":{"path":"README.md"}}],'
+                            f'"files_inspected":[{{"path":"{readme_rel}","complete":true}}],'
+                            f'"commands_run":[{{"tool":"rtk_read","args":{{"path":"{readme_rel}"}}}}],'
                             '"findings":[{"claim":"The repository README was inspected as operational evidence.","evidence_refs":["command:0"],"confidence":"LOW"}],'
                             '"uncertainties":[],"caveats":["operational burnin"],'
                             '"escalation_recommendation":"GPT-5.5 review required",'
@@ -561,7 +563,7 @@ def _generate_operational_a3_readme(project_root: str) -> str:
                     "<OSS_HANDOFF_JSON>\n"
                     '{"schema_version":"oss_agent_mission.v1","mission_id":"operational_a3_readme",'
                     '"tier":"A3","mode":"managed_investigation","objective":"Inspect the real repo README and report.",'
-                    '"risk_tier":"low","write_allowed":false,"allowed_roots":[],"allowed_paths":["README.md"],'
+                    f'"risk_tier":"low","write_allowed":false,"allowed_roots":[],"allowed_paths":["{readme_rel}"],'
                     '"tool_budget":2,"time_budget_seconds":30,"allowed_tool_classes":["read"],'
                     '"stop_conditions":["valid_report"],"report_schema":"managed_investigation_report.v1",'
                     '"required_outputs":["files_inspected","commands_run","findings","uncertainties","confidence","caveats","escalation_recommendation"]}'
@@ -569,7 +571,7 @@ def _generate_operational_a3_readme(project_root: str) -> str:
                 ),
             }]
         }
-        with _cwd(root):
+        with _cwd(project_root):
             result = run_managed_mission_from_body(
                 body,
                 "mission-a3-kimi",
@@ -580,14 +582,15 @@ def _generate_operational_a3_readme(project_root: str) -> str:
             )
             if not result.handled or result.status != "COMPLETE":
                 raise RuntimeError(f"Operational A3 burn-in failed: {result}")
-        _copy_proof_artifacts(root, project_root, mission_id, proof_kind="A3", evidence_set="operational")
+        _tag_existing_mission_artifacts(project_root, mission_id, proof_kind="A3", evidence_set="operational")
     return mission_id
 
 
 def _generate_operational_a3_impl_site(project_root: str) -> str:
     mission_id = "operational_a3_impl_site"
-    with tempfile.TemporaryDirectory(prefix="oss_operational_a3_impl_") as root:
-        _copy_repo_file(project_root, root, "codex_oss/managed_bridge.py")
+    with tempfile.TemporaryDirectory(dir=project_root, prefix="oss_operational_a3_impl_workspace_") as fixture_root:
+        _copy_repo_file(project_root, fixture_root, "codex_oss/managed_bridge.py")
+        bridge_rel = os.path.relpath(os.path.join(fixture_root, "codex_oss", "managed_bridge.py"), project_root)
         call_count = {"n": 0}
 
         def call_payload(payload, timeout):
@@ -598,8 +601,7 @@ def _generate_operational_a3_impl_site(project_root: str) -> str:
                         "message": {
                             "content": (
                                 '{"action_type":"tool_call","tool_name":"rtk_read",'
-                                '"arguments":{"path":"codex_oss/managed_bridge.py"},'
-                                '"reason":"Inspect a real runtime implementation site.","hypothesis":"Managed mission dispatch lives in managed_bridge.py.",'
+                                f'"arguments":{{"path":"{bridge_rel}"}},"reason":"Inspect a real runtime implementation site.","hypothesis":"Managed mission dispatch lives in managed_bridge.py.",'
                                 '"expected_information_gain":"Gather code evidence for implementation-site discovery.",'
                                 '"why_not_report_yet":"Need file evidence before reporting."}'
                             )
@@ -613,8 +615,8 @@ def _generate_operational_a3_impl_site(project_root: str) -> str:
                             '{"action_type":"final_report","report":'
                             '{"oss_report_version":"1.0","mission_id":"operational_a3_impl_site",'
                             '"status":"COMPLETE","confidence":"LOW",'
-                            '"files_inspected":[{"path":"codex_oss/managed_bridge.py","complete":true}],'
-                            '"commands_run":[{"tool":"rtk_read","args":{"path":"codex_oss/managed_bridge.py"}}],'
+                            f'"files_inspected":[{{"path":"{bridge_rel}","complete":true}}],'
+                            f'"commands_run":[{{"tool":"rtk_read","args":{{"path":"{bridge_rel}"}}}}],'
                             '"findings":[{"claim":"The managed bridge file was inspected as a real implementation site.","evidence_refs":["command:0"],"confidence":"LOW"}],'
                             '"uncertainties":[],"caveats":["operational burnin"],'
                             '"escalation_recommendation":"GPT-5.5 review required",'
@@ -631,7 +633,7 @@ def _generate_operational_a3_impl_site(project_root: str) -> str:
                     "<OSS_HANDOFF_JSON>\n"
                     '{"schema_version":"oss_agent_mission.v1","mission_id":"operational_a3_impl_site",'
                     '"tier":"A3","mode":"managed_investigation","objective":"Inspect a real implementation site and report.",'
-                    '"risk_tier":"low","write_allowed":false,"allowed_roots":[],"allowed_paths":["codex_oss/managed_bridge.py"],'
+                    f'"risk_tier":"low","write_allowed":false,"allowed_roots":[],"allowed_paths":["{bridge_rel}"],'
                     '"tool_budget":2,"time_budget_seconds":30,"allowed_tool_classes":["read"],'
                     '"stop_conditions":["valid_report"],"report_schema":"managed_investigation_report.v1",'
                     '"required_outputs":["files_inspected","commands_run","findings","uncertainties","confidence","caveats","escalation_recommendation"]}'
@@ -639,7 +641,7 @@ def _generate_operational_a3_impl_site(project_root: str) -> str:
                 ),
             }]
         }
-        with _cwd(root):
+        with _cwd(project_root):
             result = run_managed_mission_from_body(
                 body,
                 "mission-a3-kimi",
@@ -650,15 +652,17 @@ def _generate_operational_a3_impl_site(project_root: str) -> str:
             )
             if not result.handled or result.status != "COMPLETE":
                 raise RuntimeError(f"Operational A3 implementation-site burn-in failed: {result}")
-        _copy_proof_artifacts(root, project_root, mission_id, proof_kind="A3", evidence_set="operational")
+        _tag_existing_mission_artifacts(project_root, mission_id, proof_kind="A3", evidence_set="operational")
     return mission_id
 
 
 def _generate_operational_a3_open_runtime(project_root: str) -> str:
     mission_id = "operational_a3_open_runtime"
-    with tempfile.TemporaryDirectory(prefix="oss_operational_a3_open_") as root:
-        _copy_repo_file(project_root, root, "codex_oss/managed_bridge.py")
-        _copy_repo_file(project_root, root, "codex_oss/audit.py")
+    with tempfile.TemporaryDirectory(dir=project_root, prefix="oss_operational_a3_open_workspace_") as fixture_root:
+        _copy_repo_file(project_root, fixture_root, "codex_oss/managed_bridge.py")
+        _copy_repo_file(project_root, fixture_root, "codex_oss/audit.py")
+        bridge_rel = os.path.relpath(os.path.join(fixture_root, "codex_oss", "managed_bridge.py"), project_root)
+        audit_rel = os.path.relpath(os.path.join(fixture_root, "codex_oss", "audit.py"), project_root)
         call_count = {"n": 0}
 
         def call_payload(payload, timeout):
@@ -669,8 +673,7 @@ def _generate_operational_a3_open_runtime(project_root: str) -> str:
                         "message": {
                             "content": (
                                 '{"action_type":"tool_call","phase":"EXPLORE","tool_name":"rtk_grep",'
-                                '"arguments":{"pattern":"trace.jsonl|claim_graph.json|decision_trace.json","path":"codex_oss/managed_bridge.py"},'
-                                '"reason":"Start with a targeted search over the runtime code.",'
+                                f'"arguments":{{"pattern":"trace.jsonl|claim_graph.json|decision_trace.json","path":"{bridge_rel}"}},"reason":"Start with a targeted search over the runtime code.",'
                                 '"hypothesis":"The readonly artifact bundle is implemented in one runtime writer and enforced in audit.",'
                                 '"target_question":"Which runtime files mention readonly artifact bundle members?",'
                                 '"expected_information_gain":"Discover the implementation and enforcement files before direct inspection.",'
@@ -685,8 +688,7 @@ def _generate_operational_a3_open_runtime(project_root: str) -> str:
                         "message": {
                             "content": (
                                 '{"action_type":"tool_call","phase":"NARROW","tool_name":"rtk_read",'
-                                '"arguments":{"path":"codex_oss/managed_bridge.py"},'
-                                '"reason":"Inspect the runtime writer first.",'
+                                f'"arguments":{{"path":"{bridge_rel}"}},"reason":"Inspect the runtime writer first.",'
                                 '"hypothesis":"managed_bridge.py persists the readonly artifact bundle.",'
                                 '"target_question":"Where are readonly mission artifacts written?",'
                                 '"expected_information_gain":"Find the implementation site that writes readonly artifacts.",'
@@ -701,8 +703,7 @@ def _generate_operational_a3_open_runtime(project_root: str) -> str:
                         "message": {
                             "content": (
                                 '{"action_type":"tool_call","phase":"VERIFY","tool_name":"rtk_read",'
-                                '"arguments":{"path":"codex_oss/audit.py"},'
-                                '"reason":"Inspect audit expectations to verify the contract.",'
+                                f'"arguments":{{"path":"{audit_rel}"}},"reason":"Inspect audit expectations to verify the contract.",'
                                 '"hypothesis":"audit.py enforces the presence of readonly artifacts including decision traces and claim graphs.",'
                                 '"target_question":"What does audit require for readonly missions?",'
                                 '"expected_information_gain":"Cross-check the artifact contract from audit enforcement.",'
@@ -718,8 +719,8 @@ def _generate_operational_a3_open_runtime(project_root: str) -> str:
                             '{"action_type":"final_report","report":'
                             '{"oss_report_version":"1.0","mission_id":"operational_a3_open_runtime",'
                             '"status":"COMPLETE","confidence":"LOW",'
-                            '"files_inspected":[{"path":"codex_oss/managed_bridge.py","complete":true},{"path":"codex_oss/audit.py","complete":true}],'
-                            '"commands_run":[{"tool":"rtk_grep","args":{"pattern":"trace.jsonl|claim_graph.json|decision_trace.json","path":"codex_oss/managed_bridge.py"}},{"tool":"rtk_read","args":{"path":"codex_oss/managed_bridge.py"}},{"tool":"rtk_read","args":{"path":"codex_oss/audit.py"}}],'
+                            f'"files_inspected":[{{"path":"{bridge_rel}","complete":true}},{{"path":"{audit_rel}","complete":true}}],'
+                            f'"commands_run":[{{"tool":"rtk_grep","args":{{"pattern":"trace.jsonl|claim_graph.json|decision_trace.json","path":"{bridge_rel}"}}}},{{"tool":"rtk_read","args":{{"path":"{bridge_rel}"}}}},{{"tool":"rtk_read","args":{{"path":"{audit_rel}"}}}}],'
                             '"findings":[{"claim":"The runtime writes the readonly artifact bundle in managed_bridge.py and audit.py enforces that contract for readonly missions.","evidence_refs":["command:0","command:1","command:2"],"confidence":"LOW"}],'
                             '"uncertainties":["This operational open investigation inspected two files but did not traverse every helper module."],'
                             '"caveats":["operational A3-open burnin"],'
@@ -739,9 +740,9 @@ def _generate_operational_a3_open_runtime(project_root: str) -> str:
                     '"tier":"A3","mode":"managed_investigation","objective":"Investigate how readonly runtime artifacts are written and audited.",'
                     '"objective_style":"open_investigation",'
                     '"sufficiency_policy":{"min_main_claims":1,"min_evidence_refs_per_claim":1,"must_list_uninspected_areas":true,"confidence_cap_if_partial_extracts":"MEDIUM"},'
-                    '"answer_obligations":[{"id":"q1","question":"Which runtime file writes readonly artifacts?","required":true,"source_hints":["codex_oss/managed_bridge.py"],"source_requirements":[{"path":"codex_oss/managed_bridge.py","evidence_kind":"implementation_logic","required":true,"prefetch":true}]},{"id":"q2","question":"Which audit file enforces the readonly artifact contract?","required":true,"source_hints":["codex_oss/audit.py"],"source_requirements":[{"path":"codex_oss/audit.py","evidence_kind":"audit_enforcement","required":true,"prefetch":true}]},{"id":"q3","question":"What conclusion is justified from the implementation and audit evidence?","required":true,"source_hints":["codex_oss/managed_bridge.py","codex_oss/audit.py"]},{"id":"q4","question":"What remains unproven?","required":true,"source_hints":["codex_oss/managed_bridge.py","codex_oss/audit.py"]}],'
-                    '"must_inspect":["codex_oss/managed_bridge.py","codex_oss/audit.py"],'
-                    '"risk_tier":"low","write_allowed":false,"allowed_roots":[],"allowed_paths":["codex_oss/managed_bridge.py","codex_oss/audit.py"],'
+                    f'"answer_obligations":[{{"id":"q1","question":"Which runtime file writes readonly artifacts?","required":true,"source_hints":["{bridge_rel}"]}},{{"id":"q2","question":"Which audit file enforces the readonly artifact contract?","required":true,"source_hints":["{audit_rel}"]}},{{"id":"q3","question":"What conclusion is justified from the implementation and audit evidence?","required":true,"source_hints":["{bridge_rel}","{audit_rel}"]}},{{"id":"q4","question":"What remains unproven?","required":true,"source_hints":["{bridge_rel}","{audit_rel}"]}}],'
+                    f'"must_inspect":["{bridge_rel}","{audit_rel}"],'
+                    f'"risk_tier":"low","write_allowed":false,"allowed_roots":[],"allowed_paths":["{bridge_rel}","{audit_rel}"],'
                     '"tool_budget":5,"time_budget_seconds":45,"allowed_tool_classes":["read","search"],'
                     '"stop_conditions":["valid_report"],"report_schema":"managed_investigation_report.v1",'
                     '"required_outputs":["files_inspected","commands_run","findings","uncertainties","confidence","caveats","escalation_recommendation"]}'
@@ -749,7 +750,7 @@ def _generate_operational_a3_open_runtime(project_root: str) -> str:
                 ),
             }]
         }
-        with _cwd(root):
+        with _cwd(project_root):
             result = run_managed_mission_from_body(
                 body,
                 "mission-a3-kimi",
@@ -760,7 +761,7 @@ def _generate_operational_a3_open_runtime(project_root: str) -> str:
             )
             if not result.handled or result.status != "COMPLETE":
                 raise RuntimeError(f"Operational A3-open burn-in failed: {result}")
-        _copy_proof_artifacts(root, project_root, mission_id, proof_kind="A3_OPEN", evidence_set="operational")
+        _tag_existing_mission_artifacts(project_root, mission_id, proof_kind="A3_OPEN", evidence_set="operational")
     return mission_id
 
 
@@ -1163,6 +1164,26 @@ def _copy_proof_artifacts(
         mission["proof_kind"] = proof_kind
         with open(mission_path, "w", encoding="utf-8") as handle:
             json.dump(mission, handle, indent=2, sort_keys=True)
+
+
+def _tag_existing_mission_artifacts(
+    project_root: str,
+    mission_id: str,
+    *,
+    proof_kind: str,
+    evidence_set: str = "proof",
+) -> None:
+    mission_path = os.path.join(project_root, ".codex-oss", "missions", mission_id, "mission.json")
+    if not os.path.exists(mission_path):
+        return
+    with open(mission_path, "r", encoding="utf-8") as handle:
+        mission = json.load(handle)
+    mission["promotion_proof"] = evidence_set == "proof"
+    mission["operational_burnin"] = evidence_set == "operational"
+    mission["evidence_set"] = evidence_set
+    mission["proof_kind"] = proof_kind
+    with open(mission_path, "w", encoding="utf-8") as handle:
+        json.dump(mission, handle, indent=2, sort_keys=True)
 
 
 def _proposal_dict(

@@ -87,6 +87,7 @@ def main():
     mc.add_argument("--objective-style", choices=["deterministic_lookup", "open_investigation", "implementation"], default="")
     mc.add_argument("--answer-obligation", action="append", default=[])
     mc.add_argument("--must-inspect", action="append", default=[])
+    mc.add_argument("--evidence-collection-mode", choices=["prefetch_floor", "agenda_guided", "model_led"], default="")
     mc.add_argument("--target-symbol", default="")
     mc.add_argument("--target-key", default="")
     mc.add_argument("--target-pattern", default="")
@@ -646,6 +647,7 @@ def _mission_compile(args) -> int:
             sufficiency_policy=sufficiency_policy or None,
             answer_obligations=[{"question": text} for text in (args.answer_obligation or []) if str(text).strip()],
             must_inspect=list(args.must_inspect or []),
+            evidence_collection_mode=args.evidence_collection_mode,
             allow_broad_read_scope=bool(args.allow_broad_read_scope),
             critical_path_read_allowed=bool(args.critical_path_read_allowed),
             critical_path_reason=args.critical_path_reason,

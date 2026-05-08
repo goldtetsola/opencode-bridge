@@ -103,6 +103,8 @@ class MissionV1:
     sufficiency_policy: dict = field(default_factory=dict)
     answer_obligations: List[dict] = field(default_factory=list)
     must_inspect: List[str] = field(default_factory=list)
+    evidence_collection_mode: str = "prefetch_floor"
+    exploration_policy: dict = field(default_factory=dict)
 
     # AdaptiveAutonomyBudgetV1
     max_model_calls: int = 25
@@ -187,6 +189,8 @@ def _build_mission(raw: dict) -> MissionV1:
     sufficiency_policy = _validate_sufficiency_policy(raw.get("sufficiency_policy"), objective_style)
     answer_obligations = _validate_answer_obligations(raw.get("answer_obligations"), objective_style)
     must_inspect = _validate_must_inspect(raw.get("must_inspect"))
+    evidence_collection_mode = _validate_evidence_collection_mode(raw.get("evidence_collection_mode"), objective_style)
+    exploration_policy = _validate_exploration_policy(raw.get("exploration_policy"), objective_style)
 
     risk_tier = str(raw.get("risk_tier", "low")).lower()
     if risk_tier not in ("low", "medium", "critical"):
@@ -320,6 +324,8 @@ def _build_mission(raw: dict) -> MissionV1:
         sufficiency_policy=sufficiency_policy,
         answer_obligations=answer_obligations,
         must_inspect=must_inspect,
+        evidence_collection_mode=evidence_collection_mode,
+        exploration_policy=exploration_policy,
         max_model_calls=max_model_calls,
         max_duplicate_actions=max_duplicate_actions,
         max_broad_searches=max_broad_searches,
@@ -472,6 +478,43 @@ def _validate_must_inspect(raw: Any) -> List[str]:
     return [path for path in paths if path]
 
 
+def _validate_evidence_collection_mode(raw: Any, objective_style: str) -> str:
+    if objective_style != "open_investigation":
+        return "prefetch_floor"
+    mode = str(raw or "agenda_guided").strip().lower()
+    if mode not in {"prefetch_floor", "agenda_guided", "model_led"}:
+        raise InvalidHandoffError("evidence_collection_mode must be prefetch_floor, agenda_guided, or model_led")
+    return mode
+
+
+def _validate_exploration_policy(raw: Any, objective_style: str) -> dict:
+    if objective_style != "open_investigation":
+        return {}
+    if raw in (None, ""):
+        return {
+            "after_required_floor": "allow_model_exploration",
+            "min_optional_actions_after_floor": 1,
+            "max_optional_actions_after_floor": 4,
+            "require_contradiction_search": True,
+        }
+    if not isinstance(raw, dict):
+        raise InvalidHandoffError("exploration_policy must be an object")
+    policy = dict(raw)
+    mode = str(policy.get("after_required_floor", "allow_model_exploration") or "allow_model_exploration")
+    if mode not in {"allow_model_exploration", "close_immediately"}:
+        raise InvalidHandoffError("exploration_policy.after_required_floor must be allow_model_exploration or close_immediately")
+    min_optional = int(policy.get("min_optional_actions_after_floor", 1) or 0)
+    max_optional = int(policy.get("max_optional_actions_after_floor", 4) or 0)
+    if min_optional < 0 or max_optional < 0 or min_optional > max_optional:
+        raise InvalidHandoffError("exploration_policy optional action bounds are invalid")
+    return {
+        "after_required_floor": mode,
+        "min_optional_actions_after_floor": min_optional,
+        "max_optional_actions_after_floor": max_optional,
+        "require_contradiction_search": bool(policy.get("require_contradiction_search", True)),
+    }
+
+
 def _validate_source_requirements(raw: Any, *, field_name: str) -> List[dict]:
     if raw in (None, ""):
         return []
@@ -503,6 +546,8 @@ def _validate_source_requirements(raw: Any, *, field_name: str) -> List[dict]:
             "evidence_kind": evidence_kind,
             "required": bool(item.get("required", True)),
             "prefetch": bool(item.get("prefetch", True)),
+            "required_shapes": [str(shape) for shape in (item.get("required_shapes", []) or []) if str(shape)],
+            "contradiction_markers": [str(marker) for marker in (item.get("contradiction_markers", []) or []) if str(marker)],
         })
     return requirements
 

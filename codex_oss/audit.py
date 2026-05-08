@@ -35,6 +35,7 @@ def audit_mission(project_root: str, mission_id: str) -> dict[str, Any]:
     trace_path = os.path.join(mission_dir, "trace.jsonl")
     patch_path = os.path.join(mission_dir, "patch.diff")
     rollback_path = os.path.join(mission_dir, "rollback.diff")
+    readiness_path = os.path.join(mission_dir, "implementation_readiness_graph.json")
 
     checks.append(_check("mission_json", isinstance(mission, dict), "mission.json present"))
     checks.append(_check("report_json", isinstance(report, dict), "report.json present"))
@@ -46,6 +47,7 @@ def audit_mission(project_root: str, mission_id: str) -> dict[str, Any]:
         checks.append(_check("validation_json", isinstance(validation, dict), "validation.json present"))
         checks.append(_check("patch_artifact", os.path.exists(patch_path), "patch.diff present"))
         checks.append(_check("rollback_artifact", os.path.exists(rollback_path), "rollback.diff present"))
+        checks.append(_check("implementation_readiness_graph_json", os.path.exists(readiness_path), "implementation_readiness_graph.json present"))
         checks.append(_check("verification_json", isinstance(verification, list), "verification.json present"))
         checks.append(_check("ledger_json", isinstance(ledger, dict), "ledger.json present"))
         checks.append(_check("trace_jsonl", os.path.exists(trace_path), "trace.jsonl present"))
@@ -97,6 +99,11 @@ def audit_mission(project_root: str, mission_id: str) -> dict[str, Any]:
             "verification_scope_recorded",
             "verification_scope" in report,
             "verification scope recorded",
+        ))
+        checks.append(_check(
+            "implementation_readiness_recorded",
+            "implementation_readiness" in report and "implementation_readiness_graph" in validation,
+            "implementation readiness recorded in report and validation",
         ))
         checks.append(_check(
             "rollback_recorded",

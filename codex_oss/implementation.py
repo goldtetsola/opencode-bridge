@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
 from codex_oss.decision_trace import append_decision, write_decision_trace
+from codex_oss.implementation_graph import build_implementation_readiness_graph
 from codex_oss.runtime import resolve_path
 from codex_oss.runtime.loop import _extract_model_text
 from codex_oss.runtime.policy import is_critical_path, scan_secrets
@@ -232,6 +233,9 @@ def _persist_implementation_runtime_artifacts(
     certification: JSON | None = None,
 ) -> None:
     _write_json(os.path.join(artifact_dir, "report.json"), report)
+    readiness_graph = validation.get("implementation_readiness_graph")
+    if isinstance(readiness_graph, dict):
+        _write_json(os.path.join(artifact_dir, "implementation_readiness_graph.json"), readiness_graph)
     project_root = os.path.dirname(os.path.dirname(os.path.dirname(artifact_dir)))
     if not isinstance(getattr(mission, "decision_trace", None), list):
         mission.decision_trace = []
@@ -293,6 +297,7 @@ def _implementation_ledger(
         "report_status": str(report.get("status", "") or ""),
         "semantic_review_score": int(report.get("semantic_review_score", 0) or 0),
         "verification_plan_score": int(report.get("verification_plan_score", 0) or 0),
+        "implementation_readiness_status": str((((report.get("implementation_readiness") or {}) if isinstance(report.get("implementation_readiness"), dict) else {}).get("recommended_status", "") or "")),
         "verification_commands": [item.get("command", []) for item in verification if isinstance(item, dict)],
         "verification_exit_codes": [item.get("exit_code") for item in verification if isinstance(item, dict)],
         "certification_status": str((certification or {}).get("status", "") or ""),
@@ -328,6 +333,7 @@ def _implementation_trace_jsonl(
             "semantic_review_score": int(validation.get("checks", {}).get("semantic_review_score", 0) or 0),
             "verification_plan_ok": bool(validation.get("checks", {}).get("verification_plan_ok", False)),
             "verification_plan_score": int(validation.get("checks", {}).get("verification_plan_score", 0) or 0),
+            "implementation_readiness_status": str((((validation.get("implementation_readiness_graph") or {}) if isinstance(validation.get("implementation_readiness_graph"), dict) else {}).get("coverage_status") or {}).get("recommended_status", "") or ""),
             "reasons": list(validation.get("reasons", []) or []),
         },
     ]
@@ -387,6 +393,7 @@ def _implementation_summary_md(
         f"- Changed Files: {', '.join(report.get('changed_files', []) or []) or 'none'}",
         f"- Semantic Review Score: {int(report.get('semantic_review_score', 0) or 0)}",
         f"- Verification Plan Score: {int(report.get('verification_plan_score', 0) or 0)}",
+        f"- Implementation Readiness: {str((((report.get('implementation_readiness') or {}) if isinstance(report.get('implementation_readiness'), dict) else {}).get('recommended_status', '') or ''))}",
         f"- Execution Mode: {str(report.get('execution_mode', '') or '')}",
         f"- Main Workspace Mutated: {str(bool(report.get('main_workspace_mutated', False))).lower()}",
         f"- Rollback Artifact: {str(((report.get('rollback') or {}) if isinstance(report.get('rollback'), dict) else {}).get('artifact', '') or '')}",
@@ -1534,6 +1541,7 @@ def validate_patch_proposal(proposal: JSON, mission: Any, project_root: str) -> 
         "mode_changes": False,
         "deletions_allowed": False,
         "objective_satisfied": False,
+        "implementation_readiness_ok": False,
         "semantic_review_ok": False,
         "verification_plan_ok": False,
         "semantic_review_score": 0,
@@ -1635,7 +1643,16 @@ def validate_patch_proposal(proposal: JSON, mission: Any, project_root: str) -> 
         if not checks["applies_cleanly"]:
             reasons.append("patch does not apply cleanly")
 
+    readiness_graph = build_implementation_readiness_graph(proposal, files, mission, checks)
+    readiness_status = str((readiness_graph.get("coverage_status", {}) or {}).get("recommended_status", "") or "")
+    readiness_reason = str((readiness_graph.get("coverage_status", {}) or {}).get("reason", "") or "")
+    checks["implementation_readiness_ok"] = readiness_status == "VALID"
+    if readiness_reason and readiness_status in {"INVALID", "ESCALATE"} and readiness_reason not in reasons:
+        reasons.append(readiness_reason)
+
     if checks["critical_paths_touched"] and not bool(getattr(mission, "critical_path_write_allowed", False)):
+        status = "ESCALATE"
+    elif readiness_status == "ESCALATE":
         status = "ESCALATE"
     elif all(
         checks[name]
@@ -1649,6 +1666,7 @@ def validate_patch_proposal(proposal: JSON, mission: Any, project_root: str) -> 
             "secret_scan_ok",
             "deletions_allowed",
             "objective_satisfied",
+            "implementation_readiness_ok",
             "semantic_review_ok",
             "verification_plan_ok",
         )
@@ -1656,7 +1674,7 @@ def validate_patch_proposal(proposal: JSON, mission: Any, project_root: str) -> 
         status = "VALID"
     else:
         status = "INVALID"
-    return _validation_report(status, checks, reasons, changed_paths, proposal, mission)
+    return _validation_report(status, checks, reasons, changed_paths, proposal, mission, readiness_graph)
 
 
 def apply_patch_in_isolated_worktree(proposal: JSON, mission: Any, project_root: str) -> JSON:
@@ -2266,6 +2284,8 @@ def _semantic_review_patch(proposal: JSON, files: list[DiffFile], mission: Any) 
 
 def _looks_like_test_path(path: str) -> bool:
     base = os.path.basename(path)
+    if path.startswith("tests/fixtures/"):
+        return base.startswith("test_") or base.endswith("_test.py")
     return path.startswith("tests/") or base.startswith("test_") or base.endswith("_test.py")
 
 
@@ -2446,6 +2466,7 @@ def _validation_report(
     changed_paths: list[str],
     proposal: JSON | None = None,
     mission: Any | None = None,
+    readiness_graph: JSON | None = None,
 ) -> JSON:
     proposal = proposal or {}
     proposal_source = str(proposal.get("proposal_source", "") or "raw_patch_proposal_v1")
@@ -2464,6 +2485,7 @@ def _validation_report(
         "checks": checks,
         "changed_files": sorted(set(changed_paths)),
         "reasons": reasons,
+        "implementation_readiness_graph": readiness_graph if isinstance(readiness_graph, dict) else {},
     }
 
 
@@ -2488,6 +2510,12 @@ def _implementation_report(
     )
     runtime_built_diff = proposal_source in {"desired_state_v1", "patch_recipe_v1", "patch_intent_v1"}
     workspace_policy = getattr(mission, "workspace_apply_policy", {}) or {}
+    readiness_graph = validation.get("implementation_readiness_graph")
+    readiness = (
+        dict((readiness_graph or {}).get("coverage_status", {}))
+        if isinstance(readiness_graph, dict)
+        else {}
+    )
     return {
         "implementation_report_version": "1.0",
         "status": status,
@@ -2503,6 +2531,7 @@ def _implementation_report(
         "semantic_review_score": int(validation.get("checks", {}).get("semantic_review_score", 0) or 0),
         "verification_plan_ok": bool(validation.get("checks", {}).get("verification_plan_ok", False)),
         "verification_plan_score": int(validation.get("checks", {}).get("verification_plan_score", 0) or 0),
+        "implementation_readiness": readiness,
         "verification_scope": _verification_scope(validation.get("changed_files", []) or [], verification),
         "changed_files": changed,
         "patch_artifact": patch_path,

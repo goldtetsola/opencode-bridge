@@ -2974,6 +2974,161 @@ def assert_open_investigation_redirects_to_pending_required_source():
     ), ledger.action_trace
 
 
+def assert_open_investigation_reports_insufficient_evidence_when_shape_missing():
+    import tempfile
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory(dir=ROOT) as td:
+        sample = Path(td) / "shape_missing.py"
+        sample.write_text("VALUE = 1\n", encoding="utf-8")
+        sample_rel = os.path.relpath(sample, ROOT)
+        m = mission(
+            mission_id="mission_open_shape_missing",
+            objective="Investigate whether the required function definition exists.",
+            objective_style="open_investigation",
+            allowed_roots=[],
+            allowed_paths=[sample_rel],
+            allowed_tool_classes=["read"],
+            answer_obligations=[
+                {
+                    "id": "q1",
+                    "question": "Does the source contain the required function definition?",
+                    "required": True,
+                    "source_hints": [sample_rel],
+                    "source_requirements": [{"path": sample_rel, "evidence_kind": "function_presence", "required": True, "prefetch": False, "required_shapes": ["function_definition"]}],
+                }
+            ],
+            must_inspect=[sample_rel],
+        )
+        ledger = EvidenceLedger(mission_id=m.mission_id, tool_budget_remaining=m.tool_budget)
+        calls = {"n": 0}
+
+        def fake_model(messages, tools, timeout):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return {
+                    "choices": [{
+                        "message": {
+                            "content": (
+                                '{"action_type":"tool_call","phase":"NARROW","tool_name":"rtk_read",'
+                                f'"arguments":{{"path":"{sample_rel}"}},'
+                                '"reason":"Inspect the required file.","hypothesis":"The file may define the needed function.",'
+                                '"target_question":"Does the source contain the required function definition?",'
+                                '"expected_information_gain":"Determine whether the required shape exists.",'
+                                '"why_not_report_yet":"Need to inspect the file first."}'
+                            )
+                        }
+                    }]
+                }
+            raise TimeoutError("simulated close timeout")
+
+        result = run_loop(m, ledger, fake_model, [], None, m.allowed_roots, m.allowed_paths, request_deadline=30)
+        assert result["status"] == "PARTIAL", result
+        assert "q1" in result["report"]["insufficient_evidence_obligations"], result
+
+
+def assert_open_investigation_escalates_on_contradiction_marker():
+    import tempfile
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory(dir=ROOT) as td:
+        sample = Path(td) / "contradicted.py"
+        sample.write_text("CONTRADICTION_MARKER = True\n", encoding="utf-8")
+        sample_rel = os.path.relpath(sample, ROOT)
+        m = mission(
+            mission_id="mission_open_contradicted",
+            objective="Investigate whether the source contains contradictory evidence.",
+            objective_style="open_investigation",
+            allowed_roots=[],
+            allowed_paths=[sample_rel],
+            allowed_tool_classes=["read"],
+            answer_obligations=[
+                {
+                    "id": "q1",
+                    "question": "Is the required source free of contradiction markers?",
+                    "required": True,
+                    "source_hints": [sample_rel],
+                    "source_requirements": [{"path": sample_rel, "evidence_kind": "contradiction_check", "required": True, "prefetch": False, "contradiction_markers": ["CONTRADICTION_MARKER"]}],
+                }
+            ],
+            must_inspect=[sample_rel],
+        )
+        ledger = EvidenceLedger(mission_id=m.mission_id, tool_budget_remaining=m.tool_budget)
+        calls = {"n": 0}
+
+        def fake_model(messages, tools, timeout):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return {
+                    "choices": [{
+                        "message": {
+                            "content": (
+                                '{"action_type":"tool_call","phase":"NARROW","tool_name":"rtk_read",'
+                                f'"arguments":{{"path":"{sample_rel}"}},'
+                                '"reason":"Inspect the required file.","hypothesis":"The file may contain contradiction markers.",'
+                                '"target_question":"Is the required source free of contradiction markers?",'
+                                '"expected_information_gain":"Determine whether contradiction blocks completion.",'
+                                '"why_not_report_yet":"Need to inspect the file first."}'
+                            )
+                        }
+                    }]
+                }
+            raise TimeoutError("simulated close timeout")
+
+        result = run_loop(m, ledger, fake_model, [], None, m.allowed_roots, m.allowed_paths, request_deadline=30)
+        assert result["status"] == "ESCALATE", result
+        assert "q1" in result["report"]["contradicted_obligations"], result
+
+
+def assert_open_investigation_escalates_on_blocked_source():
+    with tempfile.TemporaryDirectory(dir=ROOT) as td:
+        missing_abs = os.path.join(td, "mission_open_blocked_source_missing.py")
+        missing_rel = os.path.relpath(missing_abs, ROOT)
+        m = mission(
+            mission_id="mission_open_blocked_source",
+            objective="Investigate whether a blocked source prevents completion.",
+            objective_style="open_investigation",
+            allowed_roots=[],
+            allowed_paths=[missing_rel],
+            allowed_tool_classes=["read"],
+            answer_obligations=[
+                {
+                    "id": "q1",
+                    "question": "Can the required source be inspected successfully?",
+                    "required": True,
+                    "source_hints": [missing_rel],
+                    "source_requirements": [{"path": missing_rel, "evidence_kind": "source_access", "required": True, "prefetch": False}],
+                }
+            ],
+            must_inspect=[missing_rel],
+        )
+        ledger = EvidenceLedger(mission_id=m.mission_id, tool_budget_remaining=m.tool_budget)
+        calls = {"n": 0}
+
+        def fake_model(messages, tools, timeout):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return {
+                    "choices": [{
+                        "message": {
+                            "content": (
+                                '{"action_type":"tool_call","phase":"NARROW","tool_name":"rtk_read",'
+                                f'"arguments":{{"path":"{missing_rel}"}},'
+                                '"reason":"Inspect the required file.","hypothesis":"The required source should be readable.",'
+                                '"target_question":"Can the required source be inspected successfully?",'
+                                '"expected_information_gain":"Determine whether the required source is blocked.",'
+                                '"why_not_report_yet":"Need to attempt the required read first."}'
+                            )
+                        }
+                    }]
+                }
+            raise TimeoutError("simulated close timeout")
+
+        result = run_loop(m, ledger, fake_model, [], None, m.allowed_roots, m.allowed_paths, request_deadline=30)
+        assert result["status"] == "ESCALATE", result
+        assert "q1" in result["report"]["blocked_obligations"], result
+
+
 def main():
     assert_run_loop_accepts_valid_final_report()
     assert_model_text_extraction_handles_provider_variants()
@@ -3032,6 +3187,9 @@ def main():
     assert_open_investigation_runtime_answer_graph_stays_partial_when_obligations_remain_open()
     assert_open_investigation_prefetch_reads_required_sources_before_model_loop()
     assert_open_investigation_redirects_to_pending_required_source()
+    assert_open_investigation_reports_insufficient_evidence_when_shape_missing()
+    assert_open_investigation_escalates_on_contradiction_marker()
+    assert_open_investigation_escalates_on_blocked_source()
     print("PASS: runtime contract suite")
 
 

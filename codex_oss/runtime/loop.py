@@ -227,7 +227,7 @@ def run_loop(mission: Any, ledger: Any, call_model_fn, tools, emitter,
             initial_phase,
             "initial mission phase established",
         )
-        if str(getattr(mission, "objective_style", "") or "") == "open_investigation":
+        if str(getattr(mission, "objective_style", "") or "") == "open_investigation" and str(getattr(mission, "evidence_collection_mode", "prefetch_floor") or "prefetch_floor") == "prefetch_floor":
             initial_answer_graph = _runtime_prefetch_required_sources(
                 mission,
                 ledger,
@@ -486,6 +486,19 @@ def run_loop(mission: Any, ledger: Any, call_model_fn, tools, emitter,
                     pending_required = pending_required_agenda_items(current_answer_graph)
                     action_phase = str(getattr(action, "phase", "") or "").upper()
                     if pending_required and not _action_addresses_pending_requirement(action, pending_required):
+                        if _should_prefetch_pending_sources(mission, ledger, deadline):
+                            current_answer_graph = _runtime_prefetch_required_sources(
+                                mission,
+                                ledger,
+                                current_answer_graph,
+                                allowed_tool_names,
+                                deadline,
+                            )
+                            context.append({"role": "user", "content": (
+                                "Runtime prefetched the still-pending required source because coverage remained incomplete. "
+                                "Use the new evidence or return a final_report if coverage is now sufficient."
+                            )})
+                            continue
                         next_action = pending_required[0]
                         _record_action_trace(
                             mission, ledger, action, _mission_phase(ledger), "redirected",
@@ -883,10 +896,34 @@ def _action_addresses_pending_requirement(action: Any, pending_required: list[di
         return False
     tool_name = str(getattr(action, "tool_name", "") or "")
     path = str((getattr(action, "arguments", {}) or {}).get("path", "") or "")
-    if tool_name != "rtk_read" or not path:
+    if tool_name not in {"rtk_read", "rtk_grep"} or not path:
         return False
     pending_paths = {str(item.get("path", "") or "") for item in pending_required if str(item.get("path", "") or "")}
     return path in pending_paths
+
+
+def _should_prefetch_pending_sources(mission: Any, ledger: Any, deadline: Any | None, *, final_attempt: bool = False) -> bool:
+    mode = str(getattr(mission, "evidence_collection_mode", "prefetch_floor") or "prefetch_floor")
+    if mode == "model_led":
+        return False
+    if mode == "prefetch_floor":
+        return True
+    redirect_count = sum(
+        1
+        for entry in (getattr(ledger, "action_trace", []) or [])
+        if getattr(entry, "runtime_decision", "") == "redirected"
+        and "required source still pending" in str(getattr(entry, "decision_reason", "") or "")
+    )
+    if final_attempt:
+        return True
+    if redirect_count >= 1:
+        return True
+    if deadline is not None:
+        try:
+            return float(deadline.remaining()) < 20
+        except Exception:
+            return False
+    return False
 
 
 def min_confidence(a: str, b: str) -> str:
@@ -902,6 +939,21 @@ def _partial_dict(mission, ledger, reason: str) -> dict:
 
         claim_graph = refresh_claim_graph(mission, ledger, reason="runtime_partial", persist=True)
         answer_graph = refresh_answer_graph(mission, ledger, claim_graph=claim_graph, reason="runtime_partial", persist=True)
+        if _should_prefetch_pending_sources(mission, ledger, None, final_attempt=True):
+            class _NoDeadline:
+                def must_return_partial(self):
+                    return False
+
+                def remaining(self):
+                    return 999
+
+            answer_graph = _runtime_prefetch_required_sources(
+                mission,
+                ledger,
+                answer_graph,
+                _allowed_tool_names(mission),
+                _NoDeadline(),
+            )
         report = build_runtime_report_from_answer_graph(mission, ledger, answer_graph, reason=reason, report_source="runtime_answer_graph")
         _annotate_report_provenance(mission, report, "runtime_answer_graph")
         return {"status": str(report.get("status", "PARTIAL") or "PARTIAL"), "report": report}
