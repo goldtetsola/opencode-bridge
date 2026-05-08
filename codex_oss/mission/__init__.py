@@ -22,8 +22,9 @@ TIER_A4 = "A4"  # Patch proposal (future)
 TIER_A5 = "A5"  # Bounded implementation (future)
 TIER_A6 = "A6"  # Critical autonomous engineer (future)
 
-VALID_TIERS_V1 = {TIER_A0, TIER_A1, TIER_A2, TIER_A3}
-TOOL_AUTONOMY_TIERS = {TIER_A2, TIER_A3}
+VALID_TIERS_V1 = {TIER_A0, TIER_A1, TIER_A2, TIER_A3, TIER_A4, TIER_A5, TIER_A6}
+TOOL_AUTONOMY_TIERS = {TIER_A2, TIER_A3, TIER_A4, TIER_A5, TIER_A6}
+IMPLEMENTATION_TIERS = {TIER_A4, TIER_A5, TIER_A6}
 
 # ── Mode constants ──
 
@@ -31,6 +32,9 @@ MODE_NO_TOOL_EXACT = "no_tool_exact"
 MODE_CONTEXT_PACK = "context_pack_report"
 MODE_GUIDED_EXPLORATION = "guided_exploration"
 MODE_MANAGED_INVESTIGATION = "managed_investigation"
+MODE_PATCH_PROPOSAL = "patch_proposal"
+MODE_BOUNDED_IMPLEMENTATION = "bounded_implementation"
+MODE_CRITICAL_IMPLEMENTATION = "critical_implementation"
 MODE_BOUNDED_WRITE_EXACT = "bounded_write_exact"
 MODE_BOUNDED_WRITE_PATCH = "bounded_write_patch"
 MODE_ESCALATE = "escalate"
@@ -41,6 +45,9 @@ TIER_MODE_MAP = {
     TIER_A1: MODE_CONTEXT_PACK,
     TIER_A2: MODE_GUIDED_EXPLORATION,
     TIER_A3: MODE_MANAGED_INVESTIGATION,
+    TIER_A4: MODE_PATCH_PROPOSAL,
+    TIER_A5: MODE_BOUNDED_IMPLEMENTATION,
+    TIER_A6: MODE_CRITICAL_IMPLEMENTATION,
 }
 
 # ── Tool classes ──
@@ -106,6 +113,16 @@ class MissionV1:
     tool_budget_effective: int = 0
     budget_reduction_reason: str = ""
 
+    # ImplementationMissionV1/A4-A5
+    owned_paths: List[str] = field(default_factory=list)
+    read_only_paths: List[str] = field(default_factory=list)
+    critical_path_write_allowed: bool = False
+    max_files_changed: int = 1
+    max_patch_bytes: int = 12000
+    verification_policy: dict = field(default_factory=dict)
+    apply_mode: str = "none"
+    workspace_apply_policy: dict = field(default_factory=dict)
+
 
 def parse_mission_v1(handoff_text: str) -> MissionV1:
     """Parse a MissionV1 from OSS_HANDOFF_JSON block or structured JSON."""
@@ -151,10 +168,11 @@ def _build_mission(raw: dict) -> MissionV1:
         raise InvalidHandoffError(f"Tier {tier} requires mode '{expected_mode}', got '{mode}'")
     mode = expected_mode
 
-    # v1 write_allowed must be false
     write_allowed = bool(raw.get("write_allowed", False))
-    if write_allowed:
-        raise InvalidHandoffError("v1 managed investigation must be read-only (write_allowed=false)")
+    if tier in (TIER_A0, TIER_A1, TIER_A2, TIER_A3, TIER_A4) and write_allowed:
+        raise InvalidHandoffError(f"{tier} missions require write_allowed=false")
+    if tier in (TIER_A5, TIER_A6) and not write_allowed:
+        raise InvalidHandoffError(f"{tier} missions require explicit write_allowed=true")
 
     objective = str(raw.get("objective", ""))
     if not objective:
@@ -174,9 +192,14 @@ def _build_mission(raw: dict) -> MissionV1:
         raise InvalidHandoffError("A2/A3 missions require allowed_roots or allowed_paths")
     forbidden_roots = _as_str_list(raw.get("forbidden_roots", []))
     forbidden_topics = _as_str_list(raw.get("forbidden_topics", []))
+    owned_paths = _as_str_list(raw.get("owned_paths", []))
+    read_only_paths = _as_str_list(raw.get("read_only_paths", []))
+    if tier in IMPLEMENTATION_TIERS and not owned_paths:
+        raise InvalidHandoffError("A4/A5 missions require non-empty owned_paths")
 
     critical_path_read_allowed = bool(raw.get("critical_path_read_allowed", False))
     critical_path_reason = raw.get("critical_path_reason")
+    critical_path_write_allowed = bool(raw.get("critical_path_write_allowed", False))
 
     tool_budget = int(raw.get("tool_budget", 20))
     time_budget_seconds = int(raw.get("time_budget_seconds", 180))
@@ -242,13 +265,32 @@ def _build_mission(raw: dict) -> MissionV1:
         if value < 0 or value > 100:
             raise InvalidHandoffError(f"{name} must be between 0 and 100")
 
+    max_files_changed = int(raw.get("max_files_changed", 1))
+    max_patch_bytes = int(raw.get("max_patch_bytes", 12000))
+    if max_files_changed < 1 or max_files_changed > 20:
+        raise InvalidHandoffError("max_files_changed must be between 1 and 20")
+    if max_patch_bytes < 1 or max_patch_bytes > 250000:
+        raise InvalidHandoffError("max_patch_bytes must be between 1 and 250000")
+    verification_policy = _validate_verification_policy(raw.get("verification_policy", {}))
+    workspace_apply_policy = _validate_workspace_apply_policy(raw.get("workspace_apply_policy", {}))
+    apply_mode = str(raw.get("apply_mode", "isolated_worktree" if tier in (TIER_A5, TIER_A6) else "none"))
+    allowed_apply_modes = {
+        TIER_A4: {"none"},
+        TIER_A5: {"isolated_worktree", "temp_project", "workspace", "workspace_low_risk", "workspace_explicit"},
+        TIER_A6: {"isolated_worktree", "temp_project", "critical_workspace_certified"},
+    }
+    if tier in allowed_apply_modes and apply_mode not in allowed_apply_modes[tier]:
+        raise InvalidHandoffError(
+            f"{tier} v1 supports apply_mode in {sorted(allowed_apply_modes[tier])}, got '{apply_mode}'"
+        )
+
     return MissionV1(
         mission_id=mission_id,
         tier=tier,
         mode=mode,
         objective=objective,
         risk_tier=risk_tier,
-        write_allowed=False,
+        write_allowed=write_allowed,
         allowed_roots=allowed_roots,
         allowed_paths=allowed_paths,
         forbidden_roots=forbidden_roots + DEFAULT_DENY_ROOTS,
@@ -275,6 +317,14 @@ def _build_mission(raw: dict) -> MissionV1:
         tool_budget_requested=tool_budget,
         tool_budget_effective=effective_budget,
         budget_reduction_reason=budget_reduction_reason,
+        owned_paths=owned_paths,
+        read_only_paths=read_only_paths,
+        critical_path_write_allowed=critical_path_write_allowed,
+        max_files_changed=max_files_changed,
+        max_patch_bytes=max_patch_bytes,
+        verification_policy=verification_policy,
+        apply_mode=apply_mode,
+        workspace_apply_policy=workspace_apply_policy,
     )
 
 
@@ -305,6 +355,10 @@ def _validate_objective_spec(raw: Any) -> Optional[dict]:
         "control_flow_trace",
         "policy_rule_location",
         "test_coverage_location",
+        "implementation_test_only",
+        "documentation_patch",
+        "implementation_patch",
+        "critical_path_patch",
     }
     if objective_type not in allowed_types:
         raise InvalidHandoffError(f"objective_spec.objective_type must be one of {sorted(allowed_types)}")
@@ -317,6 +371,71 @@ def _validate_objective_spec(raw: Any) -> Optional[dict]:
     if "confidence_policy" in raw and not isinstance(raw.get("confidence_policy"), dict):
         raise InvalidHandoffError("objective_spec.confidence_policy must be an object")
     return dict(raw)
+
+
+def _validate_verification_policy(raw: Any) -> dict:
+    if raw in (None, ""):
+        return {}
+    if not isinstance(raw, dict):
+        raise InvalidHandoffError("verification_policy must be an object")
+    allowed_commands = raw.get("allowed_commands", [])
+    if allowed_commands and not isinstance(allowed_commands, list):
+        raise InvalidHandoffError("verification_policy.allowed_commands must be a list")
+    normalized_commands = []
+    for command in allowed_commands:
+        if not isinstance(command, list) or not command or not all(isinstance(part, str) for part in command):
+            raise InvalidHandoffError("verification_policy.allowed_commands entries must be argv string lists")
+        normalized_commands.append(list(command))
+    max_commands = int(raw.get("max_commands", len(normalized_commands) or 0))
+    timeout_seconds = int(raw.get("timeout_seconds", 60))
+    if max_commands < 0 or max_commands > 10:
+        raise InvalidHandoffError("verification_policy.max_commands must be between 0 and 10")
+    if timeout_seconds < 1 or timeout_seconds > 600:
+        raise InvalidHandoffError("verification_policy.timeout_seconds must be between 1 and 600")
+    return {
+        "allowed_commands": normalized_commands,
+        "max_commands": max_commands,
+        "timeout_seconds": timeout_seconds,
+        "network_allowed": bool(raw.get("network_allowed", False)),
+        "env_policy": str(raw.get("env_policy", "minimal")),
+        "allow_broad_suite": bool(raw.get("allow_broad_suite", False)),
+    }
+
+
+def _validate_workspace_apply_policy(raw: Any) -> dict:
+    if raw in (None, ""):
+        return {}
+    if not isinstance(raw, dict):
+        raise InvalidHandoffError("workspace_apply_policy must be an object")
+    reviewer_models = raw.get("reviewer_models", [])
+    if reviewer_models not in (None, "") and (
+        not isinstance(reviewer_models, list) or not all(isinstance(item, str) for item in reviewer_models)
+    ):
+        raise InvalidHandoffError("workspace_apply_policy.reviewer_models must be a list of strings")
+    invariant_commands = raw.get("invariant_commands", [])
+    if invariant_commands not in (None, "") and not isinstance(invariant_commands, list):
+        raise InvalidHandoffError("workspace_apply_policy.invariant_commands must be a list of argv lists")
+    normalized_invariant_commands: list[list[str]] = []
+    for command in invariant_commands or []:
+        if not isinstance(command, list) or not command or not all(isinstance(part, str) and part for part in command):
+            raise InvalidHandoffError("workspace_apply_policy.invariant_commands entries must be non-empty argv string lists")
+        normalized_invariant_commands.append([str(part) for part in command])
+    min_reviewer_approvals = int(raw.get("min_reviewer_approvals", 0) or 0)
+    if min_reviewer_approvals < 0:
+        raise InvalidHandoffError("workspace_apply_policy.min_reviewer_approvals must be >= 0")
+    return {
+        "allow_direct_workspace_apply": bool(raw.get("allow_direct_workspace_apply", False)),
+        "allow_critical_workspace_apply": bool(raw.get("allow_critical_workspace_apply", False)),
+        "require_clean_worktree": bool(raw.get("require_clean_worktree", False)),
+        "allow_dirty_target_files": bool(raw.get("allow_dirty_target_files", False)),
+        "certification_required": bool(raw.get("certification_required", False)),
+        "require_gpt_review": bool(raw.get("require_gpt_review", True)),
+        "reviewer_models": [str(item) for item in (reviewer_models or [])],
+        "min_reviewer_approvals": min_reviewer_approvals,
+        "require_isolated_preflight": bool(raw.get("require_isolated_preflight", False)),
+        "require_rollback_proof": bool(raw.get("require_rollback_proof", False)),
+        "invariant_commands": normalized_invariant_commands,
+    }
 
 
 class InvalidHandoffError(Exception):

@@ -4,10 +4,18 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 
 from .doctor import run_doctor
 from .installer import install
+from .audit import audit_mission
+from .certify import certify_project
+from .legacy import archive_legacy_missions
+from .metrics import broad_low_risk_runtime_status, summarize_missions
+from .mission_compiler import compile_mission_v1
+from .proofs import refresh_claim_proofs
+from .raw_lane import run_raw_probe, summarize_raw_probes
 
 
 def main():
@@ -65,6 +73,39 @@ def main():
     mt.add_argument("--critical-path-read-allowed", action="store_true")
     mt.add_argument("--critical-path-reason", default=None)
 
+    mc = mission_sub.add_parser("compile", help="Compile a stricter MissionV1 with explicit objective_spec")
+    mc.add_argument("--mission-id", default="mission_local_compile_001")
+    mc.add_argument("--objective", required=True)
+    mc.add_argument("--tier", choices=["A2", "A3", "A4", "A5", "A6"], default="A3")
+    mc.add_argument("--risk-tier", choices=["low", "medium", "critical"], default="low")
+    mc.add_argument("--allowed-root", action="append", default=[])
+    mc.add_argument("--allowed-path", action="append", default=[])
+    mc.add_argument("--owned-path", action="append", default=[])
+    mc.add_argument("--read-only-path", action="append", default=[])
+    mc.add_argument("--objective-type", default="")
+    mc.add_argument("--required-test-name", action="append", default=[])
+    mc.add_argument("--required-changed-file", action="append", default=[])
+    mc.add_argument("--required-source-file", action="append", default=[])
+    mc.add_argument("--required-test-file", action="append", default=[])
+    mc.add_argument("--required-symbol", action="append", default=[])
+    mc.add_argument("--verification-command", action="append", default=[])
+    mc.add_argument("--apply-mode", default="isolated_worktree")
+    mc.add_argument("--workspace-allow-direct", action="store_true")
+    mc.add_argument("--workspace-allow-critical", action="store_true")
+    mc.add_argument("--workspace-require-clean", action="store_true")
+    mc.add_argument("--workspace-allow-dirty-targets", action="store_true")
+    mc.add_argument("--workspace-certification-required", action="store_true")
+    mc.add_argument("--workspace-require-gpt-review", action="store_true")
+    mc.add_argument("--workspace-reviewer-model", action="append", default=[])
+    mc.add_argument("--workspace-min-reviewer-approvals", type=int, default=0)
+    mc.add_argument("--workspace-require-isolated-preflight", action="store_true")
+    mc.add_argument("--workspace-require-rollback-proof", action="store_true")
+    mc.add_argument("--workspace-invariant-command", action="append", default=[])
+    mc.add_argument("--critical-path-read-allowed", action="store_true")
+    mc.add_argument("--critical-path-reason", default=None)
+    mc.add_argument("--critical-path-write-allowed", action="store_true")
+    mc.add_argument("--allow-broad-read-scope", action="store_true")
+
     mr = mission_sub.add_parser("run", help="Run a MissionV1 through the local OSS Agent Runtime bridge")
     mr.add_argument("file", help="Mission JSON file, handoff file containing <OSS_HANDOFF_JSON>, or '-' for stdin")
     mr.add_argument("--model", default="mission-a3-kimi", help="Runtime alias, e.g. mission-a3-kimi")
@@ -73,6 +114,60 @@ def main():
     mr.add_argument("--auth", default=None, help="Bearer token, default LITELLM_MASTER_KEY/PROXY_API_KEY")
     mr.add_argument("--timeout", type=float, default=120)
     mr.add_argument("--json", action="store_true", help="Print raw Responses JSON instead of report text")
+
+    audit = sub.add_parser("audit-mission", help="Audit runtime mission artifacts under .codex-oss/missions/<id>")
+    audit.add_argument("mission_id", help="Mission id to audit")
+    audit.add_argument("--project", type=str, default=None, help="Project root path")
+    audit.add_argument("--json", action="store_true", help="Machine-readable output")
+
+    metrics = sub.add_parser("mission-metrics", help="Summarize runtime mission artifacts and claim-supporting evidence")
+    metrics.add_argument("--project", type=str, default=None, help="Project root path")
+    metrics.add_argument("--tier", choices=["A2", "A3", "A4", "A5", "A6"], default=None)
+    metrics.add_argument("--proof-only", action="store_true", help="Only summarize promotion_proof-tagged missions")
+    metrics.add_argument("--operational-only", action="store_true", help="Only summarize operational_burnin-tagged missions")
+    metrics.add_argument("--current-only", action="store_true", help="Only summarize current tagged evidence (proof or operational)")
+    metrics.add_argument("--json", action="store_true", help="Machine-readable output")
+
+    proofs = sub.add_parser("refresh-proofs", help="Generate fresh deterministic promotion proof artifacts")
+    proofs.add_argument("--project", type=str, default=None, help="Project root path")
+    proofs.add_argument("--suite", choices=["proof", "operational", "all"], default="proof", help="Which evidence suite to generate")
+    proofs.add_argument("--json", action="store_true", help="Machine-readable output")
+
+    claim = sub.add_parser("claim-status", help="Report the current supported vs unconfirmed claim surface")
+    claim.add_argument("--project", type=str, default=None, help="Project root path")
+    claim.add_argument("--proof-only", action="store_true", help="Use only promotion_proof-tagged missions")
+    claim.add_argument("--operational-only", action="store_true", help="Use only operational_burnin-tagged missions")
+    claim.add_argument("--all-artifacts", action="store_true", help="Use all mission artifacts instead of default current tagged evidence")
+    claim.add_argument("--json", action="store_true", help="Machine-readable output")
+
+    burnin = sub.add_parser("burnin", help="Run deterministic proof refresh plus claim evaluation")
+    burnin.add_argument("--project", type=str, default=None, help="Project root path")
+    burnin.add_argument("--suite", choices=["proof", "operational", "all"], default="proof", help="Which evidence suite to generate and evaluate")
+    burnin.add_argument("--json", action="store_true", help="Machine-readable output")
+
+    certify = sub.add_parser("certify", help="Run explicit certification gates and write certification artifacts")
+    certify.add_argument("--project", type=str, default=None, help="Project root path")
+    certify.add_argument("--target", choices=["runtime_backed", "repo_hygiene", "raw_free_editing", "all"], default="all")
+    certify.add_argument("--no-refresh", action="store_true", help="Do not regenerate proof/operational evidence before certification")
+    certify.add_argument("--json", action="store_true", help="Machine-readable output")
+
+    legacy = sub.add_parser("archive-legacy-missions", help="Plan or archive legacy/incomplete mission artifacts")
+    legacy.add_argument("--project", type=str, default=None, help="Project root path")
+    legacy.add_argument("--apply", action="store_true", help="Move planned legacy missions into .codex-oss/missions-legacy/")
+    legacy.add_argument("--json", action="store_true", help="Machine-readable output")
+
+    raw = sub.add_parser("raw-claim-status", help="Evaluate raw OSS probe artifacts in fail-closed research mode")
+    raw.add_argument("--project", type=str, default=None, help="Project root path")
+    raw.add_argument("--json", action="store_true", help="Machine-readable output")
+
+    raw_probe = sub.add_parser("raw-probe", help="Run a raw-lane probe command and record fail-closed evidence")
+    raw_probe.add_argument("--project", type=str, default=None, help="Project root path")
+    raw_probe.add_argument("--probe-id", required=True, help="Raw probe id")
+    raw_probe.add_argument("--scope-respected", action="store_true", help="Mark the probe as scope-respecting")
+    raw_probe.add_argument("--verification-recorded", action="store_true", help="Mark the probe as having verification evidence")
+    raw_probe.add_argument("--rollback-recorded", action="store_true", help="Mark the probe as having rollback evidence")
+    raw_probe.add_argument("--json", action="store_true", help="Machine-readable output")
+    raw_probe.add_argument("cmd", nargs=argparse.REMAINDER, help="Command to run for the raw probe")
 
     # up — foreground supervisor
     up = sub.add_parser("up", help="Start bridge with foreground supervisor (keep terminal open)")
@@ -124,6 +219,214 @@ def main():
     elif args.command == "mission":
         sys.exit(_mission(args))
 
+    elif args.command == "audit-mission":
+        project_root = args.project or os.getcwd()
+        report = audit_mission(project_root, args.mission_id)
+        if args.json:
+            print(json_dumps_safe(report))
+        else:
+            print(f"Mission: {report['mission_id']}")
+            print(f"OK: {str(bool(report['ok'])).lower()}")
+            for item in report.get("checks", []):
+                status = "PASS" if item.get("ok") else "FAIL"
+                print(f"- {status} {item.get('name')}: {item.get('message')}")
+        sys.exit(0 if report.get("ok") else 1)
+
+    elif args.command == "mission-metrics":
+        project_root = args.project or os.getcwd()
+        report = summarize_missions(
+            project_root,
+            tier_filter=args.tier,
+            proof_only=bool(args.proof_only),
+            operational_only=bool(args.operational_only),
+            current_only=bool(args.current_only),
+        )
+        if args.json:
+            print(json_dumps_safe(report))
+        else:
+            print(f"Project: {report['project_root']}")
+            print(f"Total missions: {report['total_missions']}")
+            print(f"Audit OK: {report.get('audit_ok_count', 0)}")
+            print(f"Audit Fail: {report.get('audit_fail_count', 0)}")
+            print("Promotion evidence:")
+            for key, value in (report.get("promotion_evidence", {}) or {}).items():
+                print(f"- {key}: {value.get('status')} ({value.get('basis')})")
+        sys.exit(0)
+
+    elif args.command == "refresh-proofs":
+        project_root = args.project or os.getcwd()
+        report = refresh_claim_proofs(project_root, suite=args.suite)
+        if args.json:
+            print(json_dumps_safe(report))
+        else:
+            print(f"Project: {report['project_root']}")
+            print(f"Suite: {report['suite']}")
+            print("Generated proof missions:")
+            for mission_id in report.get("generated_missions", []):
+                print(f"- {mission_id}")
+        sys.exit(0)
+
+    elif args.command == "claim-status":
+        project_root = args.project or os.getcwd()
+        scope = "all_artifacts"
+        if args.proof_only:
+            scope = "proof_only"
+        elif args.operational_only:
+            scope = "operational_only"
+        elif not args.all_artifacts:
+            scope = "current_only"
+
+        summary = summarize_missions(
+            project_root,
+            proof_only=scope == "proof_only",
+            operational_only=scope == "operational_only",
+            current_only=scope == "current_only",
+        )
+        proof_summary = summarize_missions(project_root, proof_only=True)
+        operational_summary = summarize_missions(project_root, operational_only=True)
+        current_summary = summarize_missions(project_root, current_only=True)
+        raw_summary = summarize_raw_probes(project_root)
+        report = {
+            "project_root": project_root,
+            "scope": scope,
+            "proof_only": scope == "proof_only",
+            "operational_only": scope == "operational_only",
+            "current_only": scope == "current_only",
+            "all_artifacts": scope == "all_artifacts",
+            "claim_status": summary.get("claim_status", {}),
+            "promotion_evidence": summary.get("promotion_evidence", {}),
+            "eligible_missions": summary.get("eligible_missions", 0),
+            "legacy_or_incomplete_missions": summary.get("legacy_or_incomplete_missions", 0),
+            "claim_tiers": {
+                "runtime_proof_path": {
+                    "status": "SUPPORTED" if proof_summary.get("claim_status", {}).get("all_supported") else "UNCONFIRMED",
+                    "basis": f"proof_eligible_missions={proof_summary.get('eligible_missions', 0)}",
+                },
+                "runtime_operational_path": {
+                    "status": "SUPPORTED" if operational_summary.get("claim_status", {}).get("all_supported") else "UNCONFIRMED",
+                    "basis": f"operational_eligible_missions={operational_summary.get('eligible_missions', 0)}",
+                },
+                "runtime_current_path": {
+                    "status": "SUPPORTED" if current_summary.get("claim_status", {}).get("all_supported") else "UNCONFIRMED",
+                    "basis": f"current_eligible_missions={current_summary.get('eligible_missions', 0)} legacy_or_incomplete={current_summary.get('legacy_or_incomplete_missions', 0)}",
+                },
+                "broader_low_risk_runtime": broad_low_risk_runtime_status(operational_summary),
+                "raw_research_lane": raw_summary.get("claim_status", {}),
+            },
+        }
+        if args.json:
+            print(json_dumps_safe(report))
+        else:
+            claim_status = report["claim_status"]
+            print(f"Project: {report['project_root']}")
+            print(f"Scope: {report['scope']}")
+            print(f"All supported: {str(bool(claim_status.get('all_supported'))).lower()}")
+            print(f"Supported claims: {', '.join(claim_status.get('supported_claims', [])) or 'none'}")
+            print(f"Unconfirmed claims: {', '.join(claim_status.get('unconfirmed_claims', [])) or 'none'}")
+            print("Claim tiers:")
+            for key, value in (report.get("claim_tiers", {}) or {}).items():
+                print(f"- {key}: {value.get('status')} ({value.get('basis', '')})")
+        sys.exit(0 if report["claim_status"].get("all_supported") else 1)
+
+    elif args.command == "burnin":
+        project_root = args.project or os.getcwd()
+        refresh = refresh_claim_proofs(project_root, suite=args.suite)
+        summary = summarize_missions(
+            project_root,
+            proof_only=args.suite == "proof",
+            operational_only=args.suite == "operational",
+            current_only=args.suite == "all",
+        )
+        report = {
+            "burnin_version": "1.0",
+            "project_root": project_root,
+            "suite": args.suite,
+            "generated_missions": refresh.get("generated_missions", []),
+            "claim_status": summary.get("claim_status", {}),
+            "promotion_evidence": summary.get("promotion_evidence", {}),
+            "eligible_missions": summary.get("eligible_missions", 0),
+            "audit_ok_count": summary.get("audit_ok_count", 0),
+            "audit_fail_count": summary.get("audit_fail_count", 0),
+        }
+        if args.json:
+            print(json_dumps_safe(report))
+        else:
+            print(f"Project: {report['project_root']}")
+            print(f"Suite: {report['suite']}")
+            print("Generated proof missions:")
+            for mission_id in report.get("generated_missions", []):
+                print(f"- {mission_id}")
+            print(f"All supported: {str(bool(report['claim_status'].get('all_supported'))).lower()}")
+            for key, value in (report.get("promotion_evidence", {}) or {}).items():
+                print(f"- {key}: {value.get('status')} ({value.get('basis')})")
+        sys.exit(0 if report["claim_status"].get("all_supported") else 1)
+
+    elif args.command == "certify":
+        project_root = args.project or os.getcwd()
+        report = certify_project(project_root, target=args.target, refresh=not bool(args.no_refresh))
+        if args.json:
+            print(json_dumps_safe(report))
+        else:
+            print(f"Project: {report['project_root']}")
+            print(f"Target: {report['target']}")
+            print(f"Verdict: {report['verdict']['status']}")
+            print("Gates:")
+            for name, gate in (report.get("gates", {}) or {}).items():
+                status = "PASS" if gate.get("ok") else "FAIL"
+                print(f"- {status} {name}: {gate.get('basis', '')}")
+        sys.exit(0 if report["verdict"].get("status") == "CERTIFIED" else 1)
+
+    elif args.command == "archive-legacy-missions":
+        project_root = args.project or os.getcwd()
+        report = archive_legacy_missions(project_root, apply=bool(args.apply))
+        if args.json:
+            print(json_dumps_safe(report))
+        else:
+            print(f"Project: {report['project_root']}")
+            print(f"Apply: {str(report['apply']).lower()}")
+            print(f"Planned: {report['planned_count']}")
+            if args.apply:
+                print(f"Archived: {report['archived_count']}")
+            for item in report.get("planned", []):
+                print(f"- {item['mission_id']}: {item['reason']}")
+        sys.exit(0)
+
+    elif args.command == "raw-claim-status":
+        project_root = args.project or os.getcwd()
+        report = summarize_raw_probes(project_root)
+        if args.json:
+            print(json_dumps_safe(report))
+        else:
+            print(f"Project: {report['project_root']}")
+            print(f"Total probes: {report['total_probes']}")
+            print(f"Raw lane status: {report['claim_status']['status']}")
+            print(f"Basis: {report['claim_status']['basis']}")
+        sys.exit(0 if report["claim_status"].get("status") == "SUPPORTED" else 1)
+
+    elif args.command == "raw-probe":
+        project_root = args.project or os.getcwd()
+        command = list(args.cmd or [])
+        if command and command[0] == "--":
+            command = command[1:]
+        if not command:
+            print("raw-probe requires a command after --", file=sys.stderr)
+            sys.exit(1)
+        report = run_raw_probe(
+            project_root,
+            probe_id=args.probe_id,
+            command=command,
+            scope_respected=bool(args.scope_respected),
+            verification_recorded=bool(args.verification_recorded),
+            rollback_recorded=bool(args.rollback_recorded),
+        )
+        if args.json:
+            print(json_dumps_safe(report))
+        else:
+            print(f"Probe: {report['probe_id']}")
+            print(f"Exit code: {report['exit_code']}")
+            print(f"Structured report: {str(report['structured_report_present']).lower()}")
+        sys.exit(0 if report.get("exit_code") == 0 else 1)
+
     elif args.command == "up":
         sys.exit(_supervise(args.port, daemon=args.daemon, foreground=args.foreground))
 
@@ -173,9 +476,11 @@ def _validate_handoff(path: str) -> int:
 def _mission(args) -> int:
     if args.mission_command == "template":
         return _mission_template(args)
+    if args.mission_command == "compile":
+        return _mission_compile(args)
     if args.mission_command == "run":
         return _mission_run(args)
-    print("Usage: codex-oss mission <template|run>")
+    print("Usage: codex-oss mission <template|compile|run>")
     return 1
 
 
@@ -223,6 +528,63 @@ def _mission_template(args) -> int:
         "critical_path_read_allowed": bool(args.critical_path_read_allowed),
         "critical_path_reason": args.critical_path_reason,
     }
+    print(json.dumps(mission, indent=2))
+    return 0
+
+
+def _mission_compile(args) -> int:
+    import json
+
+    allowed_roots = args.allowed_root or []
+    allowed_paths = args.allowed_path or []
+    owned_paths = args.owned_path or []
+    read_only_paths = args.read_only_path or []
+    if args.tier in ("A2", "A3") and not (allowed_roots or allowed_paths):
+        print("Mission compile requires at least one --allowed-root or --allowed-path for A2/A3", file=sys.stderr)
+        return 1
+    if args.tier in ("A4", "A5", "A6") and not owned_paths:
+        print("Mission compile requires at least one --owned-path for A4/A5/A6", file=sys.stderr)
+        return 1
+    verification_commands = [_split_shell_words(command) for command in (args.verification_command or [])]
+    try:
+        mission = compile_mission_v1(
+            mission_id=args.mission_id,
+            objective=args.objective,
+            tier=args.tier,
+            risk_tier=args.risk_tier,
+            allowed_roots=allowed_roots,
+            allowed_paths=allowed_paths,
+            owned_paths=owned_paths,
+            read_only_paths=read_only_paths,
+            objective_type=args.objective_type,
+            required_test_names=args.required_test_name or [],
+            required_changed_files=args.required_changed_file or [],
+            required_source_files=args.required_source_file or [],
+            required_test_files=args.required_test_file or [],
+            required_symbols=args.required_symbol or [],
+            verification_commands=verification_commands,
+            apply_mode=args.apply_mode,
+            allow_broad_read_scope=bool(args.allow_broad_read_scope),
+            critical_path_read_allowed=bool(args.critical_path_read_allowed),
+            critical_path_reason=args.critical_path_reason,
+            critical_path_write_allowed=bool(args.critical_path_write_allowed),
+            workspace_apply_policy={
+                "allow_direct_workspace_apply": bool(args.workspace_allow_direct),
+                "allow_critical_workspace_apply": bool(args.workspace_allow_critical),
+                "require_clean_worktree": bool(args.workspace_require_clean),
+                "allow_dirty_target_files": bool(args.workspace_allow_dirty_targets),
+                "certification_required": bool(args.workspace_certification_required),
+                "require_gpt_review": bool(args.workspace_require_gpt_review or args.workspace_certification_required),
+                "reviewer_models": list(args.workspace_reviewer_model or []),
+                "min_reviewer_approvals": int(args.workspace_min_reviewer_approvals or 0),
+                "require_isolated_preflight": bool(args.workspace_require_isolated_preflight),
+                "require_rollback_proof": bool(args.workspace_require_rollback_proof),
+                "invariant_commands": [_split_shell_words(command) for command in (args.workspace_invariant_command or [])],
+            },
+        )
+    except ValueError as exc:
+        print(f"Mission compile failed: {exc}", file=sys.stderr)
+        return 1
     print(json.dumps(mission, indent=2))
     return 0
 
@@ -320,6 +682,12 @@ def json_dumps_safe(value) -> str:
         return json.dumps(value, indent=2)
     except Exception:
         return str(value)
+
+
+def _split_shell_words(command: str) -> list[str]:
+    import shlex
+
+    return [part for part in shlex.split(command) if part]
 
 
 def _start_bridge(port: int, mode: str):

@@ -211,3 +211,72 @@ def _low_information_count(ledger: Any) -> int:
         elif getattr(trace, "information_gain", "") in ("none", "low"):
             count += 1
     return count
+
+
+def grade_trace(ledger: Any, report: dict | None = None) -> dict[str, Any]:
+    """Assign structured labels to a mission trace for observability and review."""
+    traces = list(getattr(ledger, "action_trace", []) or [])
+    labels: list[str] = []
+    reasons: list[str] = []
+    counts = {
+        "allowed": 0,
+        "redirected": 0,
+        "blocked": 0,
+        "duplicate": 0,
+        "repaired": 0,
+        "cache_hit": 0,
+        "medium_gain": 0,
+        "low_gain": 0,
+        "unsupported_arg_events": 0,
+    }
+    for trace in traces:
+        decision = str(getattr(trace, "runtime_decision", "") or "")
+        gain = str(getattr(trace, "information_gain", "") or "")
+        counts[decision] = counts.get(decision, 0) + 1
+        if gain == "medium":
+            counts["medium_gain"] += 1
+        elif gain in ("low", "none"):
+            counts["low_gain"] += 1
+        if getattr(trace, "unsupported_arguments", []) or []:
+            counts["unsupported_arg_events"] += 1
+
+    if (
+        counts["medium_gain"] > 0
+        or (counts["allowed"] > 0 and bool(getattr(ledger, "files_inspected", {}) or getattr(ledger, "commands_run", [])))
+    ) and counts["allowed"] + counts["cache_hit"] > counts["redirected"] + counts["blocked"]:
+        labels.append("productive_exploration")
+        reasons.append("Trace contains allowed or cached evidence-gathering actions with non-trivial information gain.")
+
+    if counts["duplicate"] > 0 or any(
+        getattr(trace, "tool_name", "") == "rtk_grep" and getattr(trace, "novelty", "") == "repeated"
+        for trace in traces
+    ):
+        labels.append("redundant_search")
+        reasons.append("Trace includes duplicate or repeated search behavior.")
+
+    if counts["unsupported_arg_events"] > 0 or counts["repaired"] > 0:
+        labels.append("tool_contract_confusion")
+        reasons.append("Trace shows unsupported-argument repair or tool-contract drift.")
+
+    status = str((report or {}).get("status", "") or "").upper()
+    caveats = [str(item).lower() for item in ((report or {}).get("caveats", []) or [])]
+    if status == "PARTIAL" and counts["medium_gain"] > 0:
+        labels.append("closure_failure")
+        reasons.append("Mission gathered evidence but still terminated PARTIAL.")
+    if any("model_call_failed" in caveat or "upstream" in caveat or "provider" in caveat for caveat in caveats):
+        labels.append("provider_failure")
+        reasons.append("Final report caveats indicate provider or upstream failure.")
+    if counts["blocked"] > 0 and counts["medium_gain"] == 0 and counts["allowed"] == 0:
+        labels.append("policy_overreach")
+        reasons.append("Trace was dominated by blocked actions with little forward progress.")
+
+    if not labels:
+        labels.append("unclassified")
+        reasons.append("No strong trace-grade pattern matched.")
+
+    return {
+        "trace_grading_version": "1.0",
+        "labels": labels,
+        "reasons": reasons,
+        "counts": counts,
+    }

@@ -8,9 +8,11 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict
 
+from codex_oss.implementation import run_implementation_mission
 from codex_oss.ledger import EvidenceLedger
 from codex_oss.mission import InvalidHandoffError, _build_mission
 from codex_oss.runtime.loop import run_loop
@@ -26,6 +28,15 @@ RUNTIME_MODEL_ALIASES = {
     "mission-a3-deepseek": "ocg-deepseek-v4-pro",
     "mission-a2-flash": "ocg-deepseek-v4-flash",
     "mission-a3-flash": "ocg-deepseek-v4-flash",
+    "mission-a4-kimi": "ocg-kimi-k2.6",
+    "mission-a4-deepseek": "ocg-deepseek-v4-pro",
+    "mission-a4-flash": "ocg-deepseek-v4-flash",
+    "mission-a5-kimi": "ocg-kimi-k2.6",
+    "mission-a5-deepseek": "ocg-deepseek-v4-pro",
+    "mission-a5-flash": "ocg-deepseek-v4-flash",
+    "mission-a6-kimi": "ocg-kimi-k2.6",
+    "mission-a6-deepseek": "ocg-deepseek-v4-pro",
+    "mission-a6-flash": "ocg-deepseek-v4-flash",
 }
 
 RUNTIME_MODEL_FALLBACKS = {
@@ -35,6 +46,15 @@ RUNTIME_MODEL_FALLBACKS = {
     "mission-a3-deepseek": ["ocg-kimi-k2.6", "ocg-deepseek-v4-flash"],
     "mission-a2-flash": ["ocg-kimi-k2.6"],
     "mission-a3-flash": ["ocg-kimi-k2.6"],
+    "mission-a4-kimi": ["ocg-deepseek-v4-pro", "ocg-deepseek-v4-flash"],
+    "mission-a4-deepseek": ["ocg-kimi-k2.6", "ocg-deepseek-v4-flash"],
+    "mission-a4-flash": ["ocg-kimi-k2.6"],
+    "mission-a5-kimi": ["ocg-deepseek-v4-pro", "ocg-deepseek-v4-flash"],
+    "mission-a5-deepseek": ["ocg-kimi-k2.6", "ocg-deepseek-v4-flash"],
+    "mission-a5-flash": ["ocg-kimi-k2.6"],
+    "mission-a6-kimi": ["ocg-deepseek-v4-pro"],
+    "mission-a6-deepseek": ["ocg-kimi-k2.6"],
+    "mission-a6-flash": ["ocg-kimi-k2.6"],
 }
 
 RUNTIME_AUTONOMY_PROFILES = {
@@ -44,6 +64,15 @@ RUNTIME_AUTONOMY_PROFILES = {
     "mission-a3-kimi": {"max_tool_budget": 14, "max_time_seconds": 150},
     "mission-a2-deepseek": {"max_tool_budget": 12, "max_time_seconds": 120},
     "mission-a3-deepseek": {"max_tool_budget": 20, "max_time_seconds": 180},
+    "mission-a4-kimi": {"max_tool_budget": 14, "max_time_seconds": 150},
+    "mission-a4-deepseek": {"max_tool_budget": 20, "max_time_seconds": 180},
+    "mission-a4-flash": {"max_tool_budget": 8, "max_time_seconds": 90},
+    "mission-a5-kimi": {"max_tool_budget": 14, "max_time_seconds": 150},
+    "mission-a5-deepseek": {"max_tool_budget": 20, "max_time_seconds": 180},
+    "mission-a5-flash": {"max_tool_budget": 8, "max_time_seconds": 90},
+    "mission-a6-kimi": {"max_tool_budget": 20, "max_time_seconds": 180},
+    "mission-a6-deepseek": {"max_tool_budget": 24, "max_time_seconds": 180},
+    "mission-a6-flash": {"max_tool_budget": 10, "max_time_seconds": 120},
 }
 
 
@@ -116,18 +145,24 @@ def run_managed_mission_from_body(
         log_fn("mission_dispatch", tier=mission.tier, mode=mission.mode, mission_id=mission.mission_id)
 
         if mission.tier not in ("A2", "A3"):
-            return ManagedMissionResult(handled=False)
+            if mission.tier not in ("A4", "A5", "A6"):
+                return ManagedMissionResult(handled=False)
 
         ledger = EvidenceLedger(mission_id=mission.mission_id, tool_budget_remaining=mission.tool_budget)
 
-        def call_model(messages, tools, timeout):
-            primary = RUNTIME_MODEL_ALIASES.get(raw_model_alias, raw_model_alias or "ocg-kimi-k2.6")
+        def call_model(messages, tools, timeout, model_alias_override=None):
+            selected_alias = str(model_alias_override or raw_model_alias or "ocg-kimi-k2.6")
+            primary = RUNTIME_MODEL_ALIASES.get(selected_alias, selected_alias)
             candidates = [primary]
-            for fallback in RUNTIME_MODEL_FALLBACKS.get(raw_model_alias, []):
+            for fallback in RUNTIME_MODEL_FALLBACKS.get(selected_alias, []):
                 if fallback not in candidates:
                     candidates.append(fallback)
             last_exc: Exception | None = None
+            deadline = time.monotonic() + max(1.0, float(timeout or 1.0))
             for idx, reasoning_model in enumerate(candidates):
+                remaining = deadline - time.monotonic()
+                if remaining <= 1.0:
+                    break
                 payload = {
                     "model": map_model_fn(reasoning_model),
                     "messages": messages,
@@ -137,7 +172,7 @@ def run_managed_mission_from_body(
                 if idx:
                     log_fn("mission_model_fallback_attempt", mission_id=mission.mission_id, model=payload["model"])
                 try:
-                    response = call_payload_fn(payload, timeout)
+                    response = call_payload_fn(payload, remaining)
                     mission.last_reasoning_model = payload["model"]
                     history = list(getattr(mission, "reasoning_model_history", []) or [])
                     history.append(payload["model"])
@@ -166,6 +201,22 @@ def run_managed_mission_from_body(
                 raise last_exc
             raise RuntimeError("no runtime reasoning model candidates")
 
+        if mission.tier in ("A4", "A5", "A6"):
+            result = run_implementation_mission(
+                mission=mission,
+                raw_model_alias=raw_model_alias,
+                handoff=handoff,
+                call_model=call_model,
+                timeout=effective_deadline,
+                project_root=os.getcwd(),
+            )
+            return ManagedMissionResult(
+                handled=True,
+                status=str(result.get("status", "FAILED")),
+                mission_id=mission.mission_id,
+                report_text=str(result.get("text", "")),
+            )
+
         result = run_loop(
             mission,
             ledger,
@@ -177,6 +228,8 @@ def run_managed_mission_from_body(
             request_deadline=effective_deadline,
         )
         report = result.get("report", {})
+        if isinstance(report, dict):
+            _write_readonly_mission_artifacts(mission, ledger, report, str(result.get("status", "PARTIAL")))
         report_text = render_report(report) if isinstance(report, dict) else str(report)
         return ManagedMissionResult(
             handled=True,
@@ -229,6 +282,114 @@ def _failure_report(mission_id: str, reason: str) -> JSON:
 class _MissionStub:
     def __init__(self, mission_id: str):
         self.mission_id = mission_id
+
+
+def _write_readonly_mission_artifacts(mission: Any, ledger: Any, report: dict, status: str) -> None:
+    try:
+        from codex_oss.runtime.autonomy import grade_trace
+    except Exception:
+        grade_trace = None
+
+    root = os.getcwd()
+    mission_id = str(getattr(mission, "mission_id", "mission_unknown"))
+    artifact_dir = os.path.join(root, ".codex-oss", "missions", mission_id)
+    os.makedirs(artifact_dir, exist_ok=True)
+
+    mission_payload = {
+        "mission_id": mission_id,
+        "tier": getattr(mission, "tier", ""),
+        "mode": getattr(mission, "mode", ""),
+        "apply_mode": getattr(mission, "apply_mode", ""),
+        "objective": getattr(mission, "objective", ""),
+        "risk_tier": getattr(mission, "risk_tier", ""),
+        "allowed_roots": list(getattr(mission, "allowed_roots", []) or []),
+        "allowed_paths": list(getattr(mission, "allowed_paths", []) or []),
+        "phase_policy_enabled": bool(getattr(mission, "phase_policy_enabled", True)),
+        "progress_policy_enabled": bool(getattr(mission, "progress_policy_enabled", True)),
+        "objective_spec": dict(getattr(mission, "objective_spec", {}) or {}) if isinstance(getattr(mission, "objective_spec", None), dict) else None,
+    }
+    ledger_payload = {
+        "mission_id": mission_id,
+        "tool_budget_remaining": int(getattr(ledger, "tool_budget_remaining", 0) or 0),
+        "total_bytes_read": int(getattr(ledger, "total_bytes_read", 0) or 0),
+        "redactions_applied": bool(getattr(ledger, "redactions_applied", False)),
+        "duplicate_actions_blocked": int(getattr(ledger, "duplicate_actions_blocked", 0) or 0),
+        "risk_flags": list(getattr(ledger, "risk_flags", []) or []),
+        "files_inspected": [
+            {
+                "path": path,
+                "complete": bool(entry.complete),
+                "full_content_cached": bool(entry.full_content_cached),
+                "chars_total": int(entry.chars_total),
+                "chars_returned": int(entry.chars_returned),
+                "sha256": entry.sha256,
+                "tool": entry.tool,
+                "extract_refs": [extract.get("id") for extract in (entry.extracts or []) if isinstance(extract, dict)],
+            }
+            for path, entry in (getattr(ledger, "files_inspected", {}) or {}).items()
+        ],
+        "commands_run": [
+            {
+                "tool": entry.tool,
+                "args": dict(entry.args or {}),
+                "exit_code": int(entry.exit_code),
+                "matches_count": int(entry.matches_count),
+                "stdout_sha256": entry.stdout_sha256,
+                "extract_refs": [extract.get("id") for extract in (entry.extracts or []) if isinstance(extract, dict)],
+            }
+            for entry in (getattr(ledger, "commands_run", []) or [])
+        ],
+        "action_trace_count": len(getattr(ledger, "action_trace", []) or []),
+    }
+    trace_grading = grade_trace(ledger, report) if grade_trace else {
+        "trace_grading_version": "1.0",
+        "labels": ["unavailable"],
+        "reasons": ["grade_trace import failed"],
+        "counts": {},
+    }
+    summary_lines = [
+        f"# Mission {mission_id}",
+        "",
+        f"- Status: {status}",
+        f"- Objective: {getattr(mission, 'objective', '')}",
+        f"- Trace Labels: {', '.join(trace_grading.get('labels', []))}",
+        f"- Budget Remaining: {getattr(ledger, 'tool_budget_remaining', 0)}",
+        "",
+        "## Findings",
+    ]
+    findings = report.get("findings", []) or []
+    if findings:
+        for finding in findings:
+            if isinstance(finding, dict):
+                summary_lines.append(f"- {finding.get('claim', '(missing claim)')}")
+    else:
+        summary_lines.append("- (none)")
+    summary_lines.extend(["", "## Caveats"])
+    caveats = report.get("caveats", []) or []
+    if caveats:
+        for caveat in caveats:
+            summary_lines.append(f"- {caveat}")
+    else:
+        summary_lines.append("- (none)")
+    summary_lines.extend(["", "## Trace Reasons"])
+    for reason in trace_grading.get("reasons", []) or []:
+        summary_lines.append(f"- {reason}")
+
+    _write_json(os.path.join(artifact_dir, "mission.json"), mission_payload)
+    _write_json(os.path.join(artifact_dir, "ledger.json"), ledger_payload)
+    _write_json(os.path.join(artifact_dir, "report.json"), report)
+    _write_json(os.path.join(artifact_dir, "trace_grading.json"), trace_grading)
+    _write_text(os.path.join(artifact_dir, "summary.md"), "\n".join(summary_lines) + "\n")
+
+
+def _write_json(path: str, data: Any) -> None:
+    _write_text(path, json.dumps(data, indent=2, sort_keys=True))
+
+
+def _write_text(path: str, text: str) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(text)
 
 
 def _managed_runtime_deadline(mission: Any, request_deadline: float) -> float:

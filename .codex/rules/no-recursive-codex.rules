@@ -1,0 +1,12 @@
+# codex-oss: generated rule — do not edit manually
+prefix_rule(
+    pattern = ["codex", "exec"],
+    decision = "forbidden",
+    justification = "Recursive codex exec is blocked. Use native SpawnAgent or run codex exec from external terminal."
+)
+
+prefix_rule(
+    pattern = ["npx", "codex", "exec"],
+    decision = "forbidden",
+    justification = "Nested Codex execution is blocked. Use native SpawnAgent or run from external terminal."
+)

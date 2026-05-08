@@ -9,6 +9,7 @@ import sys
 import tempfile
 import threading
 import time
+import shutil
 
 os.environ["ALLOW_MISSING_OPENCODE_KEY"] = "1"
 ROOT = os.path.dirname(os.path.dirname(__file__))
@@ -16,6 +17,7 @@ sys.path.insert(0, ROOT)
 
 from codex_oss.ledger import EvidenceLedger
 from codex_oss.health import build_health_status
+from codex_oss.audit import audit_mission
 from codex_oss.managed_bridge import run_managed_mission_from_body
 from codex_oss.mission import InvalidHandoffError, _build_mission
 from codex_oss.runtime import ToolResult, resolve_path
@@ -41,6 +43,7 @@ def mission(**overrides):
         "risk_tier": "low",
         "write_allowed": False,
         "allowed_roots": ["codex_oss/"],
+        "allow_broad_read_scope": True,
         "allowed_paths": [],
         "tool_budget": 3,
         "time_budget_seconds": 30,
@@ -234,7 +237,7 @@ def assert_managed_bridge_returns_terminal_report_on_runtime_error():
                     '{"schema_version":"oss_agent_mission.v1","mission_id":"mission_bridge_test",'
                     '"tier":"A3","mode":"managed_investigation","objective":"Crash safely",'
                     '"risk_tier":"low","write_allowed":false,"allowed_roots":["codex_oss/"],'
-                    '"allowed_paths":[],"tool_budget":1,"time_budget_seconds":30,'
+                    '"allow_broad_read_scope":true,"allowed_paths":[],"tool_budget":1,"time_budget_seconds":30,'
                     '"allowed_tool_classes":["read"],"stop_conditions":["valid_report"],'
                     '"report_schema":"managed_investigation_report.v1",'
                     '"required_outputs":["files_inspected","commands_run","findings","uncertainties",'
@@ -330,7 +333,7 @@ def assert_runtime_model_alias_requires_mission_and_maps_reasoning_model():
                     '{"schema_version":"oss_agent_mission.v1","mission_id":"mission_alias_test",'
                     '"tier":"A3","mode":"managed_investigation","objective":"Alias route smoke",'
                     '"risk_tier":"low","write_allowed":false,"allowed_roots":["codex_oss/"],'
-                    '"allowed_paths":[],"tool_budget":1,"time_budget_seconds":30,'
+                    '"allow_broad_read_scope":true,"allowed_paths":[],"tool_budget":1,"time_budget_seconds":30,'
                     '"allowed_tool_classes":["read"],"stop_conditions":["valid_report"],'
                     '"report_schema":"managed_investigation_report.v1",'
                     '"required_outputs":["files_inspected","commands_run","findings","uncertainties",'
@@ -389,7 +392,7 @@ def assert_runtime_model_alias_uses_fallback_on_model_failure():
                     '{"schema_version":"oss_agent_mission.v1","mission_id":"mission_fallback_test",'
                     '"tier":"A3","mode":"managed_investigation","objective":"Fallback route smoke",'
                     '"risk_tier":"low","write_allowed":false,"allowed_roots":["codex_oss/"],'
-                    '"allowed_paths":[],"tool_budget":1,"time_budget_seconds":30,'
+                    '"allow_broad_read_scope":true,"allowed_paths":[],"tool_budget":1,"time_budget_seconds":30,'
                     '"allowed_tool_classes":["read"],"stop_conditions":["valid_report"],'
                     '"report_schema":"managed_investigation_report.v1",'
                     '"required_outputs":["files_inspected","commands_run","findings","uncertainties",'
@@ -412,6 +415,99 @@ def assert_runtime_model_alias_uses_fallback_on_model_failure():
     assert [call["model"] for call in calls] == ["deepseek-pro", "kimi"], calls
     assert any(event == "mission_model_primary_failed" for event, _ in logs), logs
     assert any(event == "mission_model_fallback_ok" for event, _ in logs), logs
+
+
+def assert_readonly_mission_writes_artifact_bundle():
+    cwd = os.getcwd()
+    root = tempfile.mkdtemp(prefix="runtime_artifacts_")
+    try:
+        os.chdir(root)
+        os.makedirs("notes", exist_ok=True)
+        with open("notes/example.txt", "w", encoding="utf-8") as handle:
+            handle.write("alpha\nbeta\n")
+
+        calls = {"count": 0}
+
+        def call_payload(payload, timeout):
+            calls["count"] += 1
+            if calls["count"] == 1:
+                return {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": (
+                                    '{"action_type":"tool_call","tool_name":"rtk_read",'
+                                    '"arguments":{"path":"notes/example.txt"},'
+                                    '"reason":"Read the file","hypothesis":"The file contains the answer.",'
+                                    '"expected_information_gain":"Gather file evidence.",'
+                                    '"why_not_report_yet":"Need evidence first."}'
+                                )
+                            }
+                        }
+                    ]
+                }
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": (
+                                '{"action_type":"final_report","report":'
+                                '{"oss_report_version":"1.0","mission_id":"mission_artifact_test",'
+                                '"status":"COMPLETE","confidence":"LOW",'
+                                '"files_inspected":[{"path":"notes/example.txt","complete":true}],'
+                                '"commands_run":[{"tool":"rtk_read","args":{"path":"notes/example.txt"}}],'
+                                '"findings":[{"claim":"The file was inspected.","evidence_refs":["command:0"],"confidence":"LOW"}],'
+                                '"uncertainties":[],"caveats":["artifact smoke"],'
+                                '"escalation_recommendation":"GPT-5.5 review required",'
+                                '"missing_fields":[]}}'
+                            )
+                        }
+                    }
+                ]
+            }
+
+        body = {
+            "input": [
+                {
+                    "role": "user",
+                    "content": (
+                        "<OSS_HANDOFF_JSON>\n"
+                        '{"schema_version":"oss_agent_mission.v1","mission_id":"mission_artifact_test",'
+                        '"tier":"A3","mode":"managed_investigation","objective":"Inspect one file and report.",'
+                        '"risk_tier":"low","write_allowed":false,"allowed_roots":[],"allowed_paths":["notes/example.txt"],'
+                        '"tool_budget":2,"time_budget_seconds":30,"allowed_tool_classes":["read"],'
+                        '"stop_conditions":["valid_report"],"report_schema":"managed_investigation_report.v1",'
+                        '"required_outputs":["files_inspected","commands_run","findings","uncertainties","confidence","caveats","escalation_recommendation"]}'
+                        "\n</OSS_HANDOFF_JSON>"
+                    ),
+                }
+            ]
+        }
+        result = run_managed_mission_from_body(
+            body,
+            "mission-a3-kimi",
+            lambda *args, **kwargs: None,
+            call_payload,
+            lambda model: model,
+            request_deadline=30,
+        )
+        assert result.handled, result
+        assert result.status == "COMPLETE", result
+        artifact_dir = os.path.join(root, ".codex-oss", "missions", "mission_artifact_test")
+        for name in ("mission.json", "ledger.json", "report.json", "summary.md", "trace.jsonl", "trace_grading.json"):
+            assert os.path.exists(os.path.join(artifact_dir, name)), name
+        with open(os.path.join(artifact_dir, "trace_grading.json"), encoding="utf-8") as handle:
+            grading = json.load(handle)
+        assert "productive_exploration" in grading["labels"], grading
+        with open(os.path.join(artifact_dir, "summary.md"), encoding="utf-8") as handle:
+            summary = handle.read()
+        assert "Mission mission_artifact_test" in summary, summary
+        assert "artifact smoke" in summary, summary
+        audited = audit_mission(root, "mission_artifact_test")
+        assert audited["ok"] is True, audited
+    finally:
+        os.chdir(cwd)
+        shutil.rmtree(root)
 
 
 def assert_runtime_mission_time_budget_extends_internal_deadline():
@@ -454,7 +550,7 @@ def assert_runtime_mission_time_budget_extends_internal_deadline():
                     '{"schema_version":"oss_agent_mission.v1","mission_id":"mission_deadline_extension_test",'
                     '"tier":"A3","mode":"managed_investigation","objective":"Deadline route smoke",'
                     '"risk_tier":"low","write_allowed":false,"allowed_roots":["codex_oss/"],'
-                    '"allowed_paths":[],"tool_budget":20,"time_budget_seconds":180,'
+                    '"allow_broad_read_scope":true,"allowed_paths":[],"tool_budget":20,"time_budget_seconds":180,'
                     '"allowed_tool_classes":["read"],"stop_conditions":["valid_report"],'
                     '"report_schema":"managed_investigation_report.v1",'
                     '"required_outputs":["files_inspected","commands_run","findings","uncertainties",'
@@ -2536,6 +2632,7 @@ def main():
     assert_managed_bridge_returns_terminal_report_on_runtime_error()
     assert_runtime_model_alias_requires_mission_and_maps_reasoning_model()
     assert_runtime_model_alias_uses_fallback_on_model_failure()
+    assert_readonly_mission_writes_artifact_bundle()
     assert_runtime_mission_time_budget_extends_internal_deadline()
     assert_tool_classes_are_enforced_and_aliases_normalize()
     assert_duplicate_searches_are_suppressed()

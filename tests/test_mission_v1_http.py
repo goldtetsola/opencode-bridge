@@ -18,6 +18,9 @@ BRIDGE_PORT = 4006
 FAKE_UPSTREAM_PORT = 9006
 AUTH = "sk-local-codex-bridge"
 UPSTREAM_REQUESTS = []
+ROOT = os.path.dirname(os.path.dirname(__file__))
+HTTP_TARGET = "tests/fixtures/a4_http_target.py"
+HTTP_TARGET_ORIGINAL = 'VALUE = "original"\n\n\ndef describe():\n    return VALUE\n'
 
 
 def fake_chat_response(content: str) -> bytes:
@@ -35,20 +38,54 @@ def fake_chat_response(content: str) -> bytes:
     }).encode()
 
 
+def http_target_patch_intent() -> str:
+    return json.dumps({
+        "patch_intent_version": "1.0",
+        "status": "PROPOSED",
+        "summary": "Add a small isolated helper to the HTTP fixture.",
+        "edits": [
+            {
+                "operation": "insert_after",
+                "path": HTTP_TARGET,
+                "anchor": "def describe():\n    return VALUE",
+                "content": "\n\n\ndef added_by_runtime_patch():\n    return \"isolated\"\n",
+                "reason": "Exercise runtime-owned diff construction through the HTTP bridge.",
+            }
+        ],
+        "risk_assessment": {
+            "risk_tier": "low",
+            "critical_paths_touched": False,
+            "blast_radius": "fixture-only",
+        },
+        "verification_plan": [{
+            "command": ["python3", HTTP_TARGET],
+            "reason": "Run the changed fixture as a syntax smoke.",
+        }],
+        "evidence_refs": [f"file:{HTTP_TARGET}#extract:describe"],
+        "caveats": ["Fixture-only patch intent."],
+    })
+
+
 class FakeUpstream(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         length = int(self.headers.get("Content-Length", "0"))
+        request = {}
         if length:
-            UPSTREAM_REQUESTS.append(json.loads(self.rfile.read(length)))
-        content = (
-            '{"action_type":"final_report","report":'
-            '{"oss_report_version":"1.0","mission_id":"mission_http_test",'
-            '"status":"PARTIAL","confidence":"LOW","files_inspected":[],'
-            '"commands_run":[],"findings":[],"uncertainties":[],'
-            '"caveats":["http boundary smoke"],'
-            '"escalation_recommendation":"GPT-5.5 review required",'
-            '"missing_fields":[]}}'
-        )
+            request = json.loads(self.rfile.read(length))
+            UPSTREAM_REQUESTS.append(request)
+        serialized = json.dumps(request)
+        if "PatchIntentV1" in serialized:
+            content = http_target_patch_intent()
+        else:
+            content = (
+                '{"action_type":"final_report","report":'
+                '{"oss_report_version":"1.0","mission_id":"mission_http_test",'
+                '"status":"PARTIAL","confidence":"LOW","files_inspected":[],'
+                '"commands_run":[],"findings":[],"uncertainties":[],'
+                '"caveats":["http boundary smoke"],'
+                '"escalation_recommendation":"GPT-5.5 review required",'
+                '"missing_fields":[]}}'
+            )
         data = fake_chat_response(content)
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -108,6 +145,7 @@ def test_mission_v1_returns_terminal_report():
         "write_allowed": False,
         "allowed_roots": ["codex_oss/"],
         "allowed_paths": [],
+        "allow_broad_read_scope": True,
         "tool_budget": 3,
         "time_budget_seconds": 30,
         "allowed_tool_classes": ["read"],
@@ -154,6 +192,7 @@ def test_runtime_alias_maps_model_and_disables_provider_tools():
         "write_allowed": False,
         "allowed_roots": ["codex_oss/"],
         "allowed_paths": [],
+        "allow_broad_read_scope": True,
         "tool_budget": 3,
         "time_budget_seconds": 30,
         "allowed_tool_classes": ["read"],
@@ -219,6 +258,7 @@ def test_cli_mission_run_uses_runtime_bridge():
         "write_allowed": False,
         "allowed_roots": ["codex_oss/"],
         "allowed_paths": [],
+        "allow_broad_read_scope": True,
         "tool_budget": 3,
         "time_budget_seconds": 30,
         "allowed_tool_classes": ["read"],
@@ -266,6 +306,98 @@ def test_cli_mission_run_uses_runtime_bridge():
     print("  PASS: CLI mission run uses runtime bridge alias end-to-end")
 
 
+def implementation_mission(tier: str, mode: str, write_allowed: bool) -> dict:
+    mission = {
+        "schema_version": "oss_agent_mission.v1",
+        "mission_id": f"mission_http_{tier.lower()}",
+        "tier": tier,
+        "mode": mode,
+        "objective": "Exercise patch-mediated implementation through the HTTP runtime bridge.",
+        "risk_tier": "low",
+        "write_allowed": write_allowed,
+        "allowed_roots": [],
+        "allowed_paths": [HTTP_TARGET],
+        "owned_paths": [HTTP_TARGET],
+        "read_only_paths": [HTTP_TARGET],
+        "forbidden_roots": [".env", ".git", ".codex-oss/"],
+        "allowed_tool_classes": ["read", "search"],
+        "tool_budget": 4,
+        "time_budget_seconds": 30,
+        "stop_conditions": ["valid_patch", "deadline_reached"],
+        "report_schema": "patch_validation_report.v1" if tier == "A4" else "implementation_report.v1",
+        "required_outputs": ["patch", "changed_files", "risk_assessment", "verification_plan", "evidence_refs"],
+        "max_files_changed": 1,
+        "max_patch_bytes": 12000,
+        "verification_policy": {
+            "allowed_commands": [["python3", HTTP_TARGET]],
+            "max_commands": 1,
+            "timeout_seconds": 20,
+        },
+    }
+    if tier == "A5":
+        mission["apply_mode"] = "isolated_worktree"
+    return mission
+
+
+def test_a4_runtime_alias_returns_patch_validation_report():
+    UPSTREAM_REQUESTS.clear()
+    with open(os.path.join(ROOT, HTTP_TARGET), encoding="utf-8") as handle:
+        assert handle.read() == HTTP_TARGET_ORIGINAL
+    mission = implementation_mission("A4", "patch_proposal", False)
+    body = {
+        "model": "mission-a4-kimi",
+        "stream": False,
+        "tools": [{"type": "function", "name": "should_not_reach_upstream"}],
+        "input": [
+            {
+                "role": "user",
+                "content": "<OSS_HANDOFF_JSON>\n" + json.dumps(mission) + "\n</OSS_HANDOFF_JSON>",
+            }
+        ],
+    }
+    response = call_bridge(body)
+    assert response.get("status") == "completed", response
+    text = response["output"][0]["content"][0]["text"]
+    assert "OSS_PATCH_VALIDATION_BEGIN" in text, text
+    assert "Status: VALID" in text, text
+    assert HTTP_TARGET in text, text
+    assert UPSTREAM_REQUESTS, "A4 runtime alias did not call fake upstream"
+    assert UPSTREAM_REQUESTS[-1]["model"] == "kimi-k2.6", UPSTREAM_REQUESTS[-1]
+    assert UPSTREAM_REQUESTS[-1]["tools"] == [], UPSTREAM_REQUESTS[-1]
+    with open(os.path.join(ROOT, HTTP_TARGET), encoding="utf-8") as handle:
+        assert handle.read() == HTTP_TARGET_ORIGINAL
+    print("  PASS: A4 runtime alias returns validated patch report without workspace mutation")
+
+
+def test_a5_runtime_alias_applies_patch_in_isolation_only():
+    UPSTREAM_REQUESTS.clear()
+    with open(os.path.join(ROOT, HTTP_TARGET), encoding="utf-8") as handle:
+        assert handle.read() == HTTP_TARGET_ORIGINAL
+    mission = implementation_mission("A5", "bounded_implementation", True)
+    body = {
+        "model": "mission-a5-kimi",
+        "stream": False,
+        "input": [
+            {
+                "role": "user",
+                "content": "<OSS_HANDOFF_JSON>\n" + json.dumps(mission) + "\n</OSS_HANDOFF_JSON>",
+            }
+        ],
+    }
+    response = call_bridge(body)
+    assert response.get("status") == "completed", response
+    text = response["output"][0]["content"][0]["text"]
+    assert "OSS_IMPLEMENTATION_REPORT_BEGIN" in text, text
+    assert "Status: VERIFIED" in text, text
+    assert "Main workspace mutated: false" in text, text
+    assert UPSTREAM_REQUESTS, "A5 runtime alias did not call fake upstream"
+    assert UPSTREAM_REQUESTS[-1]["model"] == "kimi-k2.6", UPSTREAM_REQUESTS[-1]
+    assert UPSTREAM_REQUESTS[-1]["tools"] == [], UPSTREAM_REQUESTS[-1]
+    with open(os.path.join(ROOT, HTTP_TARGET), encoding="utf-8") as handle:
+        assert handle.read() == HTTP_TARGET_ORIGINAL
+    print("  PASS: A5 runtime alias applies in isolation and leaves main workspace unchanged")
+
+
 def main():
     print("MissionV1 HTTP boundary test")
     print("============================")
@@ -291,6 +423,8 @@ def main():
         test_runtime_alias_maps_model_and_disables_provider_tools()
         test_runtime_alias_without_mission_fails_closed()
         test_cli_mission_run_uses_runtime_bridge()
+        test_a4_runtime_alias_returns_patch_validation_report()
+        test_a5_runtime_alias_applies_patch_in_isolation_only()
         print("PASS: MissionV1 HTTP boundary suite")
     finally:
         bridge_proc.terminate()

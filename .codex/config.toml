@@ -1,0 +1,25 @@
+[model_providers.opencode_bridge]
+name = "OpenCode Bridge"
+base_url = "http://127.0.0.1:4000/v1"
+wire_api = "responses"
+request_max_retries = 2
+stream_max_retries = 2
+stream_idle_timeout_ms = 300000
+
+[model_providers.opencode_bridge.auth]
+command = "echo"
+args = ["sk-local-codex-bridge"]
+timeout_ms = 1000
+
+[model_providers.oss_runtime]
+name = "OSS Agent Runtime"
+base_url = "http://127.0.0.1:4000/v1"
+wire_api = "responses"
+request_max_retries = 1
+stream_max_retries = 1
+stream_idle_timeout_ms = 1800000
+
+[model_providers.oss_runtime.auth]
+command = "echo"
+args = ["sk-local-codex-bridge"]
+timeout_ms = 1000
