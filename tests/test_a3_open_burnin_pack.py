@@ -1,0 +1,586 @@
+#!/usr/bin/env python3
+r"""A3-open live burn-in pack — varied investigations with metrics tracking.
+
+Run:
+  set -a; source .codex-oss/env/opencode-go.env; set +a; LIVE_BURNIN=1 python3 tests/test_a3_open_burnin_pack.py
+
+Categories:
+  1. Contradiction/blocked-source investigations
+  2. Evidence-kind with required_shapes
+  3. Ambiguous multi-file investigations
+  4. Agenda-guided exploration investigations
+  5. Exploration policy + optional check investigations
+
+Metrics per run:
+  - status (COMPLETE | PARTIAL | ESCALATE | FAILED)
+  - closure_source (model | runtime_answer_graph | prefetch)
+  - required_sources_covered / required_total
+  - required_evidence_shapes_covered
+  - optional_exploration_count
+  - contradiction_search_done
+  - false_COMPLETE (COMPLETE with missing required evidence)
+  - raw_dump_incidents
+  - GPT_cleanup_rating (subjective: minor|moderate|major)
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+import time
+import http.client
+import urllib.error
+import urllib.request
+from dataclasses import dataclass, field
+from typing import Any
+
+ROOT = os.path.dirname(os.path.dirname(__file__))
+BASE_URL = os.getenv("OSS_LIVE_BURNIN_BASE_URL", "http://127.0.0.1:4000/v1").rstrip("/")
+AUTH = os.getenv("PROXY_API_KEY") or os.getenv("LITELLM_MASTER_KEY") or "sk-local-codex-bridge"
+TIMEOUT = float(os.getenv("OSS_LIVE_BURNIN_TIMEOUT", "180"))
+MODEL = os.getenv("OSS_LIVE_BURNIN_MODEL", "mission-a3-kimi")
+
+REQUIRED_OUTPUTS = [
+    "files_inspected", "commands_run", "findings", "uncertainties",
+    "confidence", "caveats", "escalation_recommendation",
+]
+
+
+@dataclass
+class BurninCase:
+    name: str
+    category: str
+    mission: dict
+    expected_requires_closure: str = ""  # COMPLETE | PARTIAL | ESCALATE
+    tolerance_for_false_complete: bool = False  # True if COMPLETE is acceptable even with gaps
+
+
+@dataclass
+class BurninResult:
+    case: str = ""
+    category: str = ""
+    status: str = ""
+    closure_source: str = ""
+    required_sources_covered: int = 0
+    required_total: int = 0
+    evidence_shapes_covered: int = 0
+    optional_exploration: int = 0
+    contradiction_search: bool = False
+    runtime_finalized: bool = False
+    false_complete: bool = False
+    raw_dump_incidents: int = 0
+    caveats: list[str] = field(default_factory=list)
+    missing_evidence: list[str] = field(default_factory=list)
+    passed: bool = False
+
+
+def _make_mission(name: str, objective: str, **overrides) -> dict:
+    base = {
+        "schema_version": "oss_agent_mission.v1",
+        "mission_id": f"mission_a3_open_burnin_{name}",
+        "tier": "A3",
+        "mode": "managed_investigation",
+        "objective": objective,
+        "risk_tier": "low",
+        "write_allowed": False,
+        "allowed_roots": [],
+        "allow_broad_read_scope": True,
+        "allowed_paths": [],
+        "allowed_tool_classes": ["read", "search", "list"],
+        "tool_budget": 8,
+        "time_budget_seconds": 120,
+        "stop_conditions": ["valid_report", "budget_exhausted", "deadline_reached"],
+        "report_schema": "managed_investigation_report.v1",
+        "required_outputs": REQUIRED_OUTPUTS,
+        "objective_style": "open_investigation",
+        "evidence_collection_mode": "agenda_guided",
+        "exploration_policy": {
+            "after_required_floor": "allow_model_exploration",
+            "min_optional_actions_after_floor": 1,
+            "max_optional_actions_after_floor": 3,
+            "require_contradiction_search": True,
+        },
+        "sufficiency_policy": {
+            "required_source_coverage": 1.0,
+            "allow_closure_when_missing_sources": False,
+        },
+    }
+    base.update(overrides)
+    return base
+
+
+def build_burnin_cases() -> list[BurninCase]:
+    cases: list[BurninCase] = []
+
+    # Category 1: Contradiction/blocked-source investigations
+    cases.append(BurninCase(
+        name="blocked_source_missing_file",
+        category="contradiction_blocked",
+        mission=_make_mission("blocked_missing",
+            objective="Investigate whether a non-existent required file can block completion.",
+            allowed_paths=["codex_oss/nonexistent.py"],
+            allowed_tool_classes=["read"],
+            answer_obligations=[{
+                "id": "q1", "question": "What does the nonexistent file contain?",
+                "required": True,
+                "source_hints": ["codex_oss/nonexistent.py"],
+                "source_requirements": [{"path": "codex_oss/nonexistent.py", "evidence_kind": "source_access", "required": True, "prefetch": False}],
+            }],
+            must_inspect=["codex_oss/nonexistent.py"],
+        ),
+        expected_requires_closure="PARTIAL",
+    ))
+
+    cases.append(BurninCase(
+        name="contradiction_marker_in_source",
+        category="contradiction_blocked",
+        mission=_make_mission("contradiction_marker",
+            objective="Check if contradiction markers block COMPLETE status.",
+            allowed_paths=["codex_oss/raw_lane.py"],
+            allowed_tool_classes=["read"],
+            answer_obligations=[{
+                "id": "q1", "question": "Is the raw lane free of probe flag references?",
+                "required": True,
+                "source_hints": ["codex_oss/raw_lane.py"],
+                "source_requirements": [{
+                    "path": "codex_oss/raw_lane.py",
+                    "evidence_kind": "contradiction_check",
+                    "required": True, "prefetch": False,
+                    "contradiction_markers": ["probe_flag", "raw_cert_accepts_flags"],
+                }],
+            }],
+            must_inspect=["codex_oss/raw_lane.py"],
+        ),
+        expected_requires_closure="PARTIAL",
+        tolerance_for_false_complete=True,
+    ))
+
+    cases.append(BurninCase(
+        name="required_source_readable_no_contradiction",
+        category="contradiction_blocked",
+        mission=_make_mission("required_readable",
+            objective="Verify the audit module is readable and returns expected fields.",
+            allowed_paths=["codex_oss/audit.py"],
+            allowed_tool_classes=["read"],
+            answer_obligations=[{
+                "id": "q1", "question": "Does audit.py define audit_mission and _check?",
+                "required": True,
+                "source_hints": ["codex_oss/audit.py"],
+                "source_requirements": [{"path": "codex_oss/audit.py", "evidence_kind": "function_defs", "required": True, "prefetch": False, "contradiction_markers": ["TOKEN_AUDIT_FAILED"]}],
+            }],
+            must_inspect=["codex_oss/audit.py"],
+        ),
+        expected_requires_closure="COMPLETE",
+    ))
+
+    # Category 2: Evidence-kind with required_shapes
+    cases.append(BurninCase(
+        name="shape_function_definition",
+        category="evidence_kind",
+        mission=_make_mission("shape_func_def",
+            objective="Find which files define the build_implementation_readiness_graph function.",
+            allowed_paths=["codex_oss/implementation_graph.py", "codex_oss/implementation.py"],
+            allowed_tool_classes=["read", "search"],
+            answer_obligations=[{
+                "id": "q1", "question": "Which file defines build_implementation_readiness_graph?",
+                "required": True,
+                "source_hints": ["codex_oss/implementation_graph.py"],
+                "source_requirements": [{
+                    "path": "codex_oss/implementation_graph.py",
+                    "evidence_kind": "function_definition",
+                    "required": True, "prefetch": False,
+                    "required_shapes": ["function_definition"],
+                }],
+            }],
+            must_inspect=["codex_oss/implementation_graph.py"],
+        ),
+        expected_requires_closure="COMPLETE",
+    ))
+
+    cases.append(BurninCase(
+        name="shape_config_value",
+        category="evidence_kind",
+        mission=_make_mission("shape_config",
+            objective="Find the fallback budget value in the deadline policy.",
+            allowed_paths=["codex_oss/runtime/policy.py"],
+            allowed_tool_classes=["read"],
+            answer_obligations=[{
+                "id": "q1", "question": "What is the fallback_budget in DeadlinePolicy?",
+                "required": True,
+                "source_hints": ["codex_oss/runtime/policy.py"],
+                "source_requirements": [{
+                    "path": "codex_oss/runtime/policy.py",
+                    "evidence_kind": "config_value",
+                    "required": True, "prefetch": False,
+                    "required_shapes": ["config_value", "class_definition"],
+                }],
+            }],
+            must_inspect=["codex_oss/runtime/policy.py"],
+        ),
+        expected_requires_closure="COMPLETE",
+    ))
+
+    # Category 3: Ambiguous multi-file investigations
+    cases.append(BurninCase(
+        name="ambiguous_which_model_aliases",
+        category="ambiguous_multifile",
+        mission=_make_mission("ambiguous_model_aliases",
+            objective="Find all model alias mappings used in the runtime and report how they work.",
+            allowed_paths=[
+                "codex_oss/runtime/loop.py",
+                "codex_oss/runtime/policy.py",
+                "codex_oss/managed_bridge.py",
+            ],
+            allowed_tool_classes=["read", "search"],
+            answer_obligations=[{
+                "id": "q1", "question": "How are OSS model aliases mapped to provider-specific model names?",
+                "required": True,
+                "source_hints": [
+                    "codex_oss/runtime/loop.py",
+                    "codex_oss/managed_bridge.py",
+                ],
+                "source_requirements": [
+                    {"path": "codex_oss/runtime/loop.py", "evidence_kind": "model_alias_logic", "required": True, "prefetch": False},
+                    {"path": "codex_oss/managed_bridge.py", "evidence_kind": "bridge_mapping", "required": True, "prefetch": False},
+                ],
+            }],
+            must_inspect=["codex_oss/runtime/loop.py", "codex_oss/managed_bridge.py"],
+        ),
+        expected_requires_closure="COMPLETE",
+    ))
+
+    cases.append(BurninCase(
+        name="ambiguous_artifact_pipeline",
+        category="ambiguous_multifile",
+        mission=_make_mission("artifact_pipeline",
+            objective="Trace how implementation artifacts flow from patch proposal through persistence. Which files write which artifacts?",
+            allowed_paths=[
+                "codex_oss/implementation.py",
+                "codex_oss/implementation_graph.py",
+                "codex_oss/audit.py",
+            ],
+            allowed_tool_classes=["read", "search"],
+            answer_obligations=[{
+                "id": "q1", "question": "What artifacts are persisted during implementation (A4/A5/A6), and which functions write them?",
+                "required": True,
+                "source_hints": ["codex_oss/implementation.py"],
+                "source_requirements": [
+                    {"path": "codex_oss/implementation.py", "evidence_kind": "artifact_persistence", "required": True, "prefetch": False},
+                ],
+            }],
+            must_inspect=["codex_oss/implementation.py"],
+        ),
+        expected_requires_closure="COMPLETE",
+    ))
+
+    # Category 4: Agenda-guided exploration
+    cases.append(BurninCase(
+        name="agenda_guided_explore_before_close",
+        category="agenda_guided",
+        mission=_make_mission("agenda_explore",
+            objective="Explore the coverage model: what does CoverageGraphV1 track beyond just source_read?",
+            evidence_collection_mode="agenda_guided",
+            exploration_policy={
+                "after_required_floor": "allow_model_exploration",
+                "min_optional_actions_after_floor": 2,
+                "max_optional_actions_after_floor": 4,
+                "require_contradiction_search": True,
+            },
+            allowed_paths=[
+                "codex_oss/answer_graph.py",
+                "codex_oss/claim_graph.py",
+                "codex_oss/coverage_graph.py",
+            ],
+            allowed_tool_classes=["read", "search"],
+            answer_obligations=[{
+                "id": "q1", "question": "What does CoverageGraphV1 track, and how does it relate to answer obligations?",
+                "required": True,
+                "source_hints": ["codex_oss/coverage_graph.py", "codex_oss/answer_graph.py"],
+                "source_requirements": [
+                    {"path": "codex_oss/coverage_graph.py", "evidence_kind": "coverage_model", "required": True, "prefetch": False},
+                    {"path": "codex_oss/answer_graph.py", "evidence_kind": "obligation_model", "required": True, "prefetch": False},
+                ],
+            }],
+            must_inspect=["codex_oss/coverage_graph.py", "codex_oss/answer_graph.py"],
+        ),
+        expected_requires_closure="COMPLETE",
+    ))
+
+    # Category 5: Exploration policy + close_immediately
+    cases.append(BurninCase(
+        name="close_immediately_deterministic",
+        category="exploration_policy",
+        mission=_make_mission("close_immediate",
+            objective="Find and report the exact value of LANE_CAPACITY['read_pool'] in codex_oss/runtime/policy.py.",
+            evidence_collection_mode="prefetch_floor",
+            exploration_policy={"after_required_floor": "close_immediately"},
+            allowed_paths=["codex_oss/runtime/policy.py"],
+            allowed_tool_classes=["read", "search"],
+            answer_obligations=[{
+                "id": "q1", "question": "What is LANE_CAPACITY['read_pool']?",
+                "required": True,
+                "source_hints": ["codex_oss/runtime/policy.py"],
+                "source_requirements": [{
+                    "path": "codex_oss/runtime/policy.py",
+                    "evidence_kind": "config_value",
+                    "required": True, "prefetch": True,
+                    "required_shapes": ["config_value", "mapping_assignment"],
+                }],
+            }],
+            must_inspect=["codex_oss/runtime/policy.py"],
+        ),
+        expected_requires_closure="COMPLETE",
+    ))
+
+    cases.append(BurninCase(
+        name="model_led_experimental",
+        category="exploration_policy",
+        mission=_make_mission("model_led_experiment",
+            objective="Investigate how the decision trace works during investigations. What does append_decision record?",
+            evidence_collection_mode="model_led",
+            exploration_policy={
+                "after_required_floor": "allow_model_exploration",
+                "min_optional_actions_after_floor": 0,
+                "max_optional_actions_after_floor": 5,
+                "require_contradiction_search": False,
+            },
+            allowed_paths=["codex_oss/decision_trace.py", "codex_oss/runtime/loop.py"],
+            allowed_tool_classes=["read", "search"],
+            answer_obligations=[{
+                "id": "q1", "question": "How does the decision trace record investigation progress?",
+                "required": True,
+                "source_hints": ["codex_oss/decision_trace.py"],
+                "source_requirements": [
+                    {"path": "codex_oss/decision_trace.py", "evidence_kind": "trace_logic", "required": True, "prefetch": False},
+                ],
+            }],
+            must_inspect=["codex_oss/decision_trace.py"],
+        ),
+        expected_requires_closure="COMPLETE",
+        tolerance_for_false_complete=True,
+    ))
+
+    return cases
+
+
+def call_bridge(payload: dict) -> dict:
+    """Submit a payload to the bridge and return the response JSON."""
+    body = json.dumps(payload).encode("utf-8")
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {AUTH}",
+    }
+    for attempt in range(3):
+        try:
+            req = urllib.request.Request(
+                f"{BASE_URL.rstrip('/')}/chat/completions",
+                data=body, headers=headers, method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except (urllib.error.HTTPError, urllib.error.URLError, http.client.HTTPException, OSError) as e:
+            if attempt < 2:
+                time.sleep(5 * (attempt + 1))
+                continue
+            return {"error": str(e), "bridge_unreachable": True}
+    return {"error": "all attempts failed", "bridge_unreachable": True}
+
+
+def extract_metrics(mission: dict, response: dict) -> BurninResult:
+    """Extract burn-in metrics from a mission run response."""
+    result = BurninResult(case=str(mission.get("mission_id", "")))
+    result.category = mission.get("mission_id", "")
+
+    choices = response.get("choices", [])
+    if not choices:
+        result.passed = False
+        return result
+
+    message = choices[0].get("message", {}) if isinstance(choices[0], dict) else {}
+    content = str(message.get("content", "") or "")
+
+    if "OSS_REPORT_BEGIN" in content and "OSS_REPORT_END" in content:
+        report_section = content.split("OSS_REPORT_BEGIN", 1)[1].split("OSS_REPORT_END", 1)[0]
+        result.status = "COMPLETE" if '"COMPLETE"' in report_section or "COMPLETE" in report_section[:500] else "PARTIAL"
+    elif "OSS_IMPLEMENTATION_REPORT_BEGIN" in content:
+        report_section = content.split("OSS_IMPLEMENTATION_REPORT_BEGIN", 1)[1].split("OSS_IMPLEMENTATION_REPORT_END", 1)[0]
+        result.status = "COMPLETE" if '"COMPLETE"' in report_section else "VERIFIED"
+    else:
+        result.status = "UNKNOWN"
+
+    if "runtime_answer_graph" in content.lower():
+        result.closure_source = "runtime_answer_graph"
+        result.runtime_finalized = True
+    elif "OSS_REPORT_JSON" in content and '"report_source": "runtime_answer_graph"' in content:
+        result.closure_source = "runtime_answer_graph"
+        result.runtime_finalized = True
+    else:
+        result.closure_source = "model"
+
+    if '"optional_exploration_count"' in content:
+        import re
+        m = re.search(r'"optional_exploration_count":\s*(\d+)', content)
+        if m:
+            result.optional_exploration = int(m.group(1))
+
+    result.contradiction_search = '"contradiction_search_done":\s*true' in content.lower()
+
+    try:
+        report_json_start = content.index("OSS_REPORT_JSON:")
+        report_json_end = content.index("OSS_REPORT_END", report_json_start)
+        report_str = content[report_json_start:report_json_end]
+        brace_start = report_str.index("{")
+        brace_end = report_str.rindex("}") + 1
+        report = json.loads(report_str[brace_start:brace_end])
+        result.required_sources_covered = int(report.get("answer_graph_summary", {}).get("required_answered", 0))
+        result.required_total = int(report.get("answer_graph_summary", {}).get("required_total", 0))
+        if result.required_total > 0 and result.required_sources_covered < result.required_total:
+            if result.status == "COMPLETE":
+                result.false_complete = True
+        missing = list(report.get("missing_required_sources", []) or [])
+        result.missing_evidence = missing
+        result.caveats = list(report.get("caveats", []) or [])
+        result.evidence_shapes_covered = int(report.get("answer_graph_summary", {}).get("required_evidence_shapes_covered", 0))
+    except (ValueError, KeyError, json.JSONDecodeError):
+        pass
+
+    if "raw dump" in content.lower() or "RAW_DUMP" in content:
+        result.raw_dump_incidents = 1
+
+    result.passed = not result.false_complete and result.raw_dump_incidents == 0
+    if result.status == "COMPLETE":
+        result.passed = result.passed or not result.false_complete
+
+    return result
+
+
+def run_burnin(cases: list[BurninCase], limit: int = 25, start: int = 1):
+    """Run burn-in cases against the live bridge."""
+    results: list[BurninResult] = []
+    total = min(limit, len(cases))
+
+    print(f"\nA3-Open Burn-In Pack: {total} cases ({len(cases)} defined)")
+    print(f"Bridge: {BASE_URL}")
+    print(f"Model: {MODEL}")
+    print(f"Timeout: {TIMEOUT}s")
+    print("-" * 60)
+
+    for idx, case in enumerate(cases[start - 1 : start - 1 + total], start=start):
+        mission = dict(case.mission)
+        mission["mission_id"] = f"{mission['mission_id']}_{idx}"
+        payload = {
+            "model": MODEL,
+            "messages": [
+                {"role": "system", "content": "You are an OSS runtime investigator. Follow the mission protocol."},
+                {"role": "user", "content": (
+                    f"<OSS_HANDOFF_JSON>\n{json.dumps({'handoff_version': '1.0', 'mission': mission})}\n</OSS_HANDOFF_JSON>\n\n"
+                    f"Mission {idx}: {case.mission.get('objective', '')}"
+                )},
+            ],
+            "temperature": 0.0,
+            "max_tokens": 4096,
+        }
+
+        print(f"\n[{idx}/{total}] {case.name} ({case.category})")
+        start_time = time.time()
+        response = call_bridge(payload)
+        elapsed = time.time() - start_time
+
+        if response.get("bridge_unreachable"):
+            print(f"  SKIP: Bridge unreachable ({response.get('error', '')})")
+            continue
+
+        if "error" in response:
+            print(f"  ERROR: {response['error'][:120]}")
+            results.append(BurninResult(case=case.name, category=case.category, passed=False))
+            continue
+
+        result = extract_metrics(mission, response)
+        result.case = case.name
+        result.category = case.category
+
+        print(f"  Status: {result.status} | Closure: {result.closure_source} | "
+              f"Sources: {result.required_sources_covered}/{result.required_total} | "
+              f"Optional: {result.optional_exploration} | "
+              f"Contradiction: {result.contradiction_search} | "
+              f"FalseComplete: {result.false_complete} | "
+              f"Raws: {result.raw_dump_incidents} | "
+              f"Elapsed: {elapsed:.1f}s")
+        if result.missing_evidence:
+            print(f"  Missing: {result.missing_evidence[:3]}")
+        if result.caveats:
+            for c in result.caveats[:2]:
+                print(f"  Caveat: {c[:100]}")
+
+        results.append(result)
+
+    print("\n" + "=" * 60)
+    passed = [r for r in results if r.passed]
+    false_completes = [r for r in results if r.false_complete]
+    raw_dumps = [r for r in results if r.raw_dump_incidents > 0]
+    completed = [r for r in results if r.status == "COMPLETE"]
+    partials = [r for r in results if r.status == "PARTIAL"]
+
+    print(f"Results: {len(results)} total")
+    print(f"  Passed: {len(passed)}/{len(results)} ({_pct(len(passed), len(results))})")
+    print(f"  COMPLETE: {len(completed)} | PARTIAL: {len(partials)}")
+    print(f"  False COMPLETE: {len(false_completes)} | Raw dumps: {len(raw_dumps)}")
+    print(f"  Runtime closures: {len([r for r in results if r.runtime_finalized])}")
+
+    if false_completes:
+        print("\nFalse COMPLETE cases:")
+        for fc in false_completes:
+            print(f"  - {fc.case}: sources={fc.required_sources_covered}/{fc.required_total}")
+    if raw_dumps:
+        print("\nRaw dump incidents:")
+        for rd in raw_dumps:
+            print(f"  - {rd.case}")
+
+    by_category: dict[str, list] = {}
+    for r in results:
+        by_category.setdefault(r.category, []).append(r)
+
+    print("\nBy category:")
+    for cat, cat_results in sorted(by_category.items()):
+        cat_passed = len([r for r in cat_results if r.passed])
+        print(f"  {cat}: {cat_passed}/{len(cat_results)}")
+
+    return results
+
+
+def _pct(part: int, total: int) -> str:
+    if total == 0:
+        return "0%"
+    return f"{part / total * 100:.0f}%"
+
+
+def main():
+    if not os.getenv("LIVE_BURNIN"):
+        print("Skipping live burn-in (set LIVE_BURNIN=1 to run).")
+        print("Run: set -a; source .codex-oss/env/opencode-go.env; set +a; LIVE_BURNIN=1 python3 tests/test_a3_open_burnin_pack.py")
+        return 0
+
+    cases = build_burnin_cases()
+    limit = int(os.getenv("OSS_LIVE_BURNIN_LIMIT", "25"))
+    start = int(os.getenv("OSS_LIVE_BURNIN_START_INDEX", "1"))
+    results = run_burnin(cases, limit=limit, start=start)
+
+    false_completes = len([r for r in results if r.false_complete])
+    raw_dumps = len([r for r in results if r.raw_dump_incidents > 0])
+    passed = len([r for r in results if r.passed])
+
+    if false_completes > 0 or raw_dumps > 0:
+        print(f"\nBURN-IN FAILED: {false_completes} false COMPLETE, {raw_dumps} raw dumps")
+        return 1
+
+    if len(results) > 0 and passed / len(results) < 0.5:
+        print(f"\nBURN-IN WEAK: only {_pct(passed, len(results))} passed")
+        return 2
+
+    print(f"\nBURN-IN PASSED: {passed}/{len(results)} cases ok")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
