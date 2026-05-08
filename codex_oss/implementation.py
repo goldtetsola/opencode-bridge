@@ -233,6 +233,21 @@ def _persist_implementation_runtime_artifacts(
 ) -> None:
     _write_json(os.path.join(artifact_dir, "report.json"), report)
     project_root = os.path.dirname(os.path.dirname(os.path.dirname(artifact_dir)))
+    if not isinstance(getattr(mission, "decision_trace", None), list):
+        mission.decision_trace = []
+    append_decision(
+        mission,
+        decision_type="artifact_persistence",
+        result="recorded",
+        policy="DecisionTraceV1",
+        reason="Implementation mission artifacts were persisted for audit and explain surfaces",
+        source_module="codex_oss/implementation.py",
+        input_payload={
+            "artifact_dir": artifact_dir,
+            "report_status": str(report.get("status", "") or ""),
+            "validation_status": str(validation.get("status", "") or ""),
+        },
+    )
     write_decision_trace(project_root, getattr(mission, "mission_id", "mission_unknown"), mission)
     _write_json(
         os.path.join(artifact_dir, "ledger.json"),

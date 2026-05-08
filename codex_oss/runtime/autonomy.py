@@ -147,9 +147,17 @@ def assess_action_progress(mission: Any, ledger: Any, action: Any, deadline: Any
 
 
 def mission_phase(ledger: Any) -> str:
-    if getattr(ledger, "files_inspected", {}) and getattr(ledger, "claims", []):
-        return "REPORT"
+    answer_graph = getattr(ledger, "answer_graph", {}) or {}
+    sufficiency = answer_graph.get("sufficiency", {}) if isinstance(answer_graph, dict) else {}
+    if isinstance(sufficiency, dict):
+        if bool(sufficiency.get("can_close")):
+            return "REPORT"
+        if int(sufficiency.get("required_answered", 0) or 0) > 0 or int(sufficiency.get("partially_answered", 0) or 0) > 0:
+            return "VERIFY"
     if getattr(ledger, "files_inspected", {}):
+        claims = list(getattr(ledger, "claims", []) or [])
+        if any(str(claim.get("status", "") or "") == "supported" for claim in claims if isinstance(claim, dict)):
+            return "REPORT"
         return "VERIFY"
     if getattr(ledger, "commands_run", []):
         return "NARROW"

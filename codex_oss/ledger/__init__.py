@@ -47,6 +47,7 @@ class ActionTraceEntry:
     phase: str
     action_type: str
     tool_name: str = ""
+    target_question: str = ""
     raw_arguments: dict = field(default_factory=dict)
     normalized_arguments: dict = field(default_factory=dict)
     unsupported_arguments: List[str] = field(default_factory=list)
@@ -81,6 +82,10 @@ class EvidenceLedger:
     total_bytes_read: int = 0
     redactions_applied: bool = False
     action_trace: List[ActionTraceEntry] = field(default_factory=list)
+    claim_graph: dict = field(default_factory=dict)
+    answer_graph: dict = field(default_factory=dict)
+    coverage_graph: dict = field(default_factory=dict)
+    evidence_agenda: dict = field(default_factory=dict)
 
     def add_file(self, path: str, result: "ToolResult", turn: int):
         args = getattr(result, "args", {}) or {}
@@ -123,6 +128,39 @@ class EvidenceLedger:
 
     def add_action_trace(self, entry: ActionTraceEntry):
         self.action_trace.append(entry)
+
+    def add_claim(self, claim: dict):
+        text = str((claim or {}).get("text") or "").strip()
+        if not text:
+            return
+        existing = next((item for item in self.claims if str(item.get("text") or "").strip() == text), None)
+        if existing is None:
+            self.claims.append(dict(claim))
+            return
+        for key, value in dict(claim).items():
+            if key == "evidence_refs":
+                merged = list(dict.fromkeys(list(existing.get("evidence_refs", []) or []) + list(value or [])))
+                existing["evidence_refs"] = merged
+            elif value not in (None, "", [], {}):
+                existing[key] = value
+
+    def add_open_question(self, question: str, *, priority: str = "normal", evidence_refs: Optional[List[str]] = None):
+        text = str(question or "").strip()
+        if not text:
+            return
+        existing = next((item for item in self.open_questions if str(item.get("question") or "").strip() == text), None)
+        if existing is None:
+            self.open_questions.append({
+                "question": text,
+                "status": "open",
+                "priority": priority,
+                "evidence_refs": list(evidence_refs or []),
+            })
+            return
+        if evidence_refs:
+            existing["evidence_refs"] = list(dict.fromkeys(list(existing.get("evidence_refs", []) or []) + list(evidence_refs)))
+        if priority and existing.get("priority") in (None, "", "normal"):
+            existing["priority"] = priority
 
     def is_duplicate(self, path: str) -> bool:
         entry = self.files_inspected.get(path)

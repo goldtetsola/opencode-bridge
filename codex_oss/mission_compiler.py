@@ -27,6 +27,10 @@ def compile_mission_v1(
     required_symbols: list[str],
     verification_commands: list[list[str]],
     apply_mode: str,
+    objective_style: str = "",
+    sufficiency_policy: dict[str, Any] | None = None,
+    answer_obligations: list[dict[str, Any]] | None = None,
+    must_inspect: list[str] | None = None,
     allow_broad_read_scope: bool = False,
     critical_path_read_allowed: bool = False,
     critical_path_reason: str | None = None,
@@ -66,6 +70,12 @@ def compile_mission_v1(
         "critical_path_reason": critical_path_reason,
         "critical_path_write_allowed": bool(critical_path_write_allowed),
     }
+    if objective_style:
+        mission["objective_style"] = objective_style
+    if sufficiency_policy:
+        mission["sufficiency_policy"] = dict(sufficiency_policy)
+    if must_inspect:
+        mission["must_inspect"] = list(must_inspect)
 
     if tier in {"A2", "A3"}:
         mission["report_schema"] = "managed_investigation_report.v1"
@@ -110,6 +120,17 @@ def compile_mission_v1(
             required_test_files=required_test_files,
             required_symbols=required_symbols,
         )
+    if mission.get("objective_style") == "open_investigation":
+        mission["answer_obligations"] = list(answer_obligations or _default_open_answer_obligations(
+            objective=objective,
+            allowed_paths=allowed_paths,
+            objective_spec=mission.get("objective_spec"),
+        ))
+        if "must_inspect" not in mission:
+            mission["must_inspect"] = _default_must_inspect(
+                allowed_paths=allowed_paths,
+                objective_spec=mission.get("objective_spec"),
+            )
     return mission
 
 
@@ -224,3 +245,109 @@ def _objective_spec(
         "required_evidence_shapes": [],
         "completion_criteria": [],
     }
+
+
+def _default_open_answer_obligations(*, objective: str, allowed_paths: list[str], objective_spec: dict[str, Any] | None) -> list[dict[str, Any]]:
+    objective_spec = objective_spec if isinstance(objective_spec, dict) else {}
+    objective_type = str(objective_spec.get("objective_type", "") or "")
+    target = objective_spec.get("target", {}) if isinstance(objective_spec.get("target", {}), dict) else {}
+    target_name = str(target.get("symbol") or target.get("key") or target.get("pattern") or "")
+    path0 = allowed_paths[0] if allowed_paths else ""
+    path1 = allowed_paths[1] if len(allowed_paths) > 1 else path0
+    summary_paths = [path for path in [path0, path1] if path]
+    if objective_type in {"function_location", "mapping_lookup", "config_value_extraction", "zero_match_evidence"}:
+        label = target_name or objective_type
+        return [
+            {
+                "id": "q1",
+                "question": f"Where is the relevant implementation or evidence source for {label}?",
+                "required": True,
+                "source_hints": [path for path in [path0] if path],
+                "source_requirements": _source_requirements([path0], evidence_kind="primary_evidence_source"),
+                "evidence_needed": ["implementation_location"],
+            },
+            {
+                "id": "q2",
+                "question": f"What does the current evidence say about {label}?",
+                "required": True,
+                "source_hints": [path for path in [path1] if path],
+                "source_requirements": _source_requirements([path1], evidence_kind="behavior_evidence_source"),
+                "evidence_needed": ["behavior_evidence"],
+            },
+            {
+                "id": "q3",
+                "question": "What conclusion is justified from the inspected evidence?",
+                "required": True,
+                "source_hints": list(summary_paths),
+                "evidence_needed": ["scope_of_claim"],
+            },
+            {
+                "id": "q4",
+                "question": "What remains unproven or uncertain?",
+                "required": True,
+                "source_hints": list(summary_paths),
+                "evidence_needed": ["remaining_uncertainty"],
+            },
+        ]
+    return [
+        {
+            "id": "q1",
+            "question": f"What concrete evidence sources are relevant to: {objective}",
+            "required": True,
+            "source_hints": [path for path in [path0] if path],
+            "source_requirements": _source_requirements([path0], evidence_kind="primary_evidence_source"),
+            "evidence_needed": ["relevant_sources"],
+        },
+        {
+            "id": "q2",
+            "question": f"What does the inspected evidence show about: {objective}",
+            "required": True,
+            "source_hints": [path for path in [path1] if path],
+            "source_requirements": _source_requirements([path1], evidence_kind="supporting_evidence_source"),
+            "evidence_needed": ["supported_claim"],
+        },
+        {
+            "id": "q3",
+            "question": "What conclusion is justified?",
+            "required": True,
+            "source_hints": list(summary_paths),
+            "evidence_needed": ["scope_of_claim"],
+        },
+        {
+            "id": "q4",
+            "question": "What remains unknown, blocked, or unproven?",
+            "required": True,
+            "source_hints": list(summary_paths),
+            "evidence_needed": ["remaining_uncertainty"],
+        },
+    ]
+
+
+def _default_must_inspect(*, allowed_paths: list[str], objective_spec: dict[str, Any] | None) -> list[str]:
+    objective_spec = objective_spec if isinstance(objective_spec, dict) else {}
+    target = objective_spec.get("target", {}) if isinstance(objective_spec.get("target", {}), dict) else {}
+    required_paths = []
+    for key in ("required_source_files", "required_test_files", "required_changed_files"):
+        values = target.get(key, [])
+        if isinstance(values, list):
+            required_paths.extend(str(value) for value in values if str(value))
+    required_paths.extend(str(path) for path in allowed_paths[:2] if str(path))
+    seen: list[str] = []
+    for path in required_paths:
+        if path and path not in seen:
+            seen.append(path)
+    return seen
+
+
+def _source_requirements(paths: list[str], *, evidence_kind: str) -> list[dict[str, Any]]:
+    requirements: list[dict[str, Any]] = []
+    for path in paths:
+        if not path:
+            continue
+        requirements.append({
+            "path": str(path),
+            "evidence_kind": evidence_kind,
+            "required": True,
+            "prefetch": True,
+        })
+    return requirements

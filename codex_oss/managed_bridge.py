@@ -17,6 +17,8 @@ from codex_oss.fast_path import run_deterministic_fast_path
 from codex_oss.implementation import run_implementation_mission
 from codex_oss.ledger import EvidenceLedger
 from codex_oss.mission import InvalidHandoffError, _build_mission
+from codex_oss.claim_graph import refresh_claim_graph
+from codex_oss.answer_graph import build_investigation_plan, refresh_answer_graph
 from codex_oss.runtime.loop import run_loop
 from codex_oss.runtime.policy import (
     acquire_mission_slot,
@@ -371,12 +373,14 @@ def _write_readonly_mission_artifacts(mission: Any, ledger: Any, report: dict, s
         "mode": getattr(mission, "mode", ""),
         "apply_mode": getattr(mission, "apply_mode", ""),
         "objective": getattr(mission, "objective", ""),
+        "objective_style": getattr(mission, "objective_style", ""),
         "risk_tier": getattr(mission, "risk_tier", ""),
         "allowed_roots": list(getattr(mission, "allowed_roots", []) or []),
         "allowed_paths": list(getattr(mission, "allowed_paths", []) or []),
         "phase_policy_enabled": bool(getattr(mission, "phase_policy_enabled", True)),
         "progress_policy_enabled": bool(getattr(mission, "progress_policy_enabled", True)),
         "objective_spec": dict(getattr(mission, "objective_spec", {}) or {}) if isinstance(getattr(mission, "objective_spec", None), dict) else None,
+        "sufficiency_policy": dict(getattr(mission, "sufficiency_policy", {}) or {}),
     }
     ledger_payload = {
         "mission_id": mission_id,
@@ -411,6 +415,11 @@ def _write_readonly_mission_artifacts(mission: Any, ledger: Any, report: dict, s
         ],
         "action_trace_count": len(getattr(ledger, "action_trace", []) or []),
     }
+    claim_graph = refresh_claim_graph(mission, ledger, report=report, reason="artifact_write", persist=False)
+    answer_graph = refresh_answer_graph(mission, ledger, claim_graph=claim_graph, report=report, reason="artifact_write", persist=False)
+    coverage_graph = dict(answer_graph.get("coverage_graph", {}) or getattr(ledger, "coverage_graph", {}) or {})
+    evidence_agenda = dict(answer_graph.get("evidence_agenda", {}) or getattr(ledger, "evidence_agenda", {}) or {})
+    investigation_plan = build_investigation_plan(mission)
     trace_grading = grade_trace(ledger, report) if grade_trace else {
         "trace_grading_version": "1.0",
         "labels": ["unavailable"],
@@ -422,8 +431,13 @@ def _write_readonly_mission_artifacts(mission: Any, ledger: Any, report: dict, s
         "",
         f"- Status: {status}",
         f"- Objective: {getattr(mission, 'objective', '')}",
+        f"- Objective Style: {getattr(mission, 'objective_style', '')}",
         f"- Trace Labels: {', '.join(trace_grading.get('labels', []))}",
         f"- Budget Remaining: {getattr(ledger, 'tool_budget_remaining', 0)}",
+        f"- Claim Graph Main Claims: {claim_graph.get('sufficiency', {}).get('main_claim_count', 0)}",
+        f"- Answer Obligations: {answer_graph.get('sufficiency', {}).get('required_answered', 0)}/{answer_graph.get('sufficiency', {}).get('required_total', 0)}",
+        f"- Missing Required Sources: {', '.join(answer_graph.get('sufficiency', {}).get('missing_required_sources', []) or []) or '(none)'}",
+        f"- Closure Source: {report.get('closure_source', report.get('report_source', ''))}",
         "",
         "## Findings",
     ]
@@ -448,8 +462,56 @@ def _write_readonly_mission_artifacts(mission: Any, ledger: Any, report: dict, s
     _write_json(os.path.join(artifact_dir, "mission.json"), mission_payload)
     _write_json(os.path.join(artifact_dir, "ledger.json"), ledger_payload)
     _write_json(os.path.join(artifact_dir, "report.json"), report)
+    _write_json(os.path.join(artifact_dir, "claim_graph.json"), claim_graph)
+    _write_json(os.path.join(artifact_dir, "investigation_plan.json"), investigation_plan)
+    _write_json(os.path.join(artifact_dir, "answer_graph.json"), answer_graph)
+    _write_json(os.path.join(artifact_dir, "coverage_graph.json"), coverage_graph)
+    _write_json(os.path.join(artifact_dir, "evidence_agenda.json"), evidence_agenda)
     _write_json(os.path.join(artifact_dir, "trace_grading.json"), trace_grading)
+    _write_text(os.path.join(artifact_dir, "trace.jsonl"), _readonly_trace_jsonl(ledger, report))
     _write_text(os.path.join(artifact_dir, "summary.md"), "\n".join(summary_lines) + "\n")
+
+
+def _readonly_trace_jsonl(ledger: Any, report: dict) -> str:
+    raw_entries = list(getattr(ledger, "action_trace", []) or [])
+    entries = [_trace_entry_payload(entry) for entry in raw_entries]
+    if not entries:
+        entries = []
+        for idx, command in enumerate(getattr(ledger, "commands_run", []) or [], start=1):
+            entries.append({
+                "turn": idx,
+                "phase": "VERIFY",
+                "action_type": "tool_call",
+                "tool_name": getattr(command, "tool", ""),
+                "raw_arguments": dict(getattr(command, "args", {}) or {}),
+                "normalized_arguments": dict(getattr(command, "args", {}) or {}),
+                "runtime_decision": "allowed",
+                "decision_reason": "tool executed",
+                "tool_result_summary": {
+                    "exit_code": int(getattr(command, "exit_code", 0) or 0),
+                    "matches_count": int(getattr(command, "matches_count", 0) or 0),
+                },
+                "why_not_report_yet": "Runtime gathered required evidence before finalizing the report.",
+                "report_status": str(report.get("status", "") or ""),
+                "report_source": str(report.get("report_source", "") or ""),
+            })
+    return "".join(json.dumps(entry, sort_keys=True) + "\n" for entry in entries)
+
+
+def _trace_entry_payload(entry: Any) -> dict[str, Any]:
+    if isinstance(entry, dict):
+        return dict(entry)
+    if hasattr(entry, "__dict__"):
+        payload = {}
+        for key, value in vars(entry).items():
+            if isinstance(value, dict):
+                payload[key] = dict(value)
+            elif isinstance(value, list):
+                payload[key] = list(value)
+            else:
+                payload[key] = value
+        return payload
+    return {"value": str(entry)}
 
 
 def _write_json(path: str, data: Any) -> None:

@@ -84,6 +84,9 @@ def main():
     mc.add_argument("--owned-path", action="append", default=[])
     mc.add_argument("--read-only-path", action="append", default=[])
     mc.add_argument("--objective-type", default="")
+    mc.add_argument("--objective-style", choices=["deterministic_lookup", "open_investigation", "implementation"], default="")
+    mc.add_argument("--answer-obligation", action="append", default=[])
+    mc.add_argument("--must-inspect", action="append", default=[])
     mc.add_argument("--target-symbol", default="")
     mc.add_argument("--target-key", default="")
     mc.add_argument("--target-pattern", default="")
@@ -106,6 +109,10 @@ def main():
     mc.add_argument("--workspace-require-isolated-preflight", action="store_true")
     mc.add_argument("--workspace-require-rollback-proof", action="store_true")
     mc.add_argument("--workspace-invariant-command", action="append", default=[])
+    mc.add_argument("--sufficiency-min-main-claims", type=int, default=None)
+    mc.add_argument("--sufficiency-min-evidence-refs-per-claim", type=int, default=None)
+    mc.add_argument("--sufficiency-must-list-uninspected-areas", action="store_true")
+    mc.add_argument("--sufficiency-confidence-cap", choices=["LOW", "MEDIUM", "HIGH"], default=None)
     mc.add_argument("--critical-path-read-allowed", action="store_true")
     mc.add_argument("--critical-path-reason", default=None)
     mc.add_argument("--critical-path-write-allowed", action="store_true")
@@ -158,7 +165,7 @@ def main():
 
     certify = sub.add_parser("certify", help="Run explicit certification gates and write certification artifacts")
     certify.add_argument("--project", type=str, default=None, help="Project root path")
-    certify.add_argument("--target", choices=["runtime_backed", "repo_hygiene", "raw_free_editing", "all"], default="all")
+    certify.add_argument("--target", choices=["runtime_backed", "open_investigation", "repo_hygiene", "raw_free_editing_smoke", "raw_free_editing", "all"], default="all")
     certify.add_argument("--no-refresh", action="store_true", help="Do not regenerate proof/operational evidence before certification")
     certify.add_argument("--json", action="store_true", help="Machine-readable output")
 
@@ -177,6 +184,9 @@ def main():
     raw_probe.add_argument("--scope-respected", action="store_true", help="Mark the probe as scope-respecting")
     raw_probe.add_argument("--verification-recorded", action="store_true", help="Mark the probe as having verification evidence")
     raw_probe.add_argument("--rollback-recorded", action="store_true", help="Mark the probe as having rollback evidence")
+    raw_probe.add_argument("--allow-change", action="append", default=[], help="Expected changed path for behavior-derived scope proof")
+    raw_probe.add_argument("--verification-artifact", action="append", default=[], help="Artifact path that must exist to prove verification")
+    raw_probe.add_argument("--rollback-artifact", action="append", default=[], help="Artifact path that must exist to prove rollback recording")
     raw_probe.add_argument("--json", action="store_true", help="Machine-readable output")
     raw_probe.add_argument("cmd", nargs=argparse.REMAINDER, help="Command to run for the raw probe")
 
@@ -185,10 +195,12 @@ def main():
     up.add_argument("--port", type=int, default=4000)
     up.add_argument("--daemon", action="store_true", help="Start bridge as daemon (detach and exit after health check)")
     up.add_argument("--foreground", action="store_true", help="Keep terminal open with live log tailing")
+    up.add_argument("--allow-missing-upstream", action="store_true", help="Allow supervised bridge startup without an upstream API key for deterministic/local runtime testing")
 
     # run — start bridge, run command, cleanup
     run = sub.add_parser("run", help="Start bridge, run command, stop bridge")
     run.add_argument("--port", type=int, default=4000)
+    run.add_argument("--allow-missing-upstream", action="store_true", help="Allow bridge startup without an upstream API key for deterministic/local runtime testing")
     run.add_argument("cmd", nargs=argparse.REMAINDER, help="Command to run while bridge is alive")
 
     sd = sub.add_parser("supervise-daemon", help=argparse.SUPPRESS)
@@ -249,10 +261,27 @@ def main():
         if trace is None:
             print(f"Decision trace missing for mission {args.mission_id}", file=sys.stderr)
             sys.exit(1)
+        phase_path = [
+            str(item.get("result", "") or "")
+            for item in (trace.get("decisions", []) or [])
+            if str(item.get("decision_type", "") or "") == "phase_transition"
+        ]
+        decision_counts: dict[str, int] = {}
+        for item in (trace.get("decisions", []) or []):
+            key = str(item.get("decision_type", "") or "unknown")
+            decision_counts[key] = decision_counts.get(key, 0) + 1
+        explained = dict(trace)
+        explained["summary"] = {
+            "decision_count": len(trace.get("decisions", []) or []),
+            "decision_type_counts": decision_counts,
+            "phase_path": phase_path,
+        }
         if args.json:
-            print(json_dumps_safe(trace))
+            print(json_dumps_safe(explained))
         else:
             print(f"Mission: {args.mission_id}")
+            if phase_path:
+                print(f"Phase path: {' -> '.join(phase_path)}")
             for idx, item in enumerate(trace.get("decisions", []) or [], start=1):
                 print(f"{idx}. {item.get('decision_type')} -> {item.get('result')}")
                 print(f"   policy: {item.get('policy')}")
@@ -427,6 +456,8 @@ def main():
         else:
             print(f"Project: {report['project_root']}")
             print(f"Total probes: {report['total_probes']}")
+            print(f"Raw smoke status: {report['smoke_claim_status']['status']}")
+            print(f"Smoke basis: {report['smoke_claim_status']['basis']}")
             print(f"Raw lane status: {report['claim_status']['status']}")
             print(f"Basis: {report['claim_status']['basis']}")
         sys.exit(0 if report["claim_status"].get("status") == "SUPPORTED" else 1)
@@ -446,6 +477,9 @@ def main():
             scope_respected=bool(args.scope_respected),
             verification_recorded=bool(args.verification_recorded),
             rollback_recorded=bool(args.rollback_recorded),
+            allowed_changed_paths=list(args.allow_change or []),
+            verification_artifact_paths=list(args.verification_artifact or []),
+            rollback_artifact_paths=list(args.rollback_artifact or []),
         )
         if args.json:
             print(json_dumps_safe(report))
@@ -453,13 +487,16 @@ def main():
             print(f"Probe: {report['probe_id']}")
             print(f"Exit code: {report['exit_code']}")
             print(f"Structured report: {str(report['structured_report_present']).lower()}")
+            print(f"Derived scope respected: {str(report['derived_scope_respected']).lower()}")
+            print(f"Derived verification recorded: {str(report['derived_verification_recorded']).lower()}")
+            print(f"Derived rollback recorded: {str(report['derived_rollback_recorded']).lower()}")
         sys.exit(0 if report.get("exit_code") == 0 else 1)
 
     elif args.command == "up":
-        sys.exit(_supervise(args.port, daemon=args.daemon, foreground=args.foreground))
+        sys.exit(_supervise(args.port, daemon=args.daemon, foreground=args.foreground, allow_missing_upstream=bool(args.allow_missing_upstream)))
 
     elif args.command == "run":
-        sys.exit(_run_with_bridge(args.port, args.cmd))
+        sys.exit(_run_with_bridge(args.port, args.cmd, allow_missing_upstream=bool(args.allow_missing_upstream)))
 
     elif args.command == "supervise-daemon":
         sys.exit(_daemon_supervisor(args.port))
@@ -574,6 +611,15 @@ def _mission_compile(args) -> int:
         print("Mission compile requires at least one --owned-path for A4/A5/A6", file=sys.stderr)
         return 1
     verification_commands = [_split_shell_words(command) for command in (args.verification_command or [])]
+    sufficiency_policy = {}
+    if args.sufficiency_min_main_claims is not None:
+        sufficiency_policy["min_main_claims"] = int(args.sufficiency_min_main_claims)
+    if args.sufficiency_min_evidence_refs_per_claim is not None:
+        sufficiency_policy["min_evidence_refs_per_claim"] = int(args.sufficiency_min_evidence_refs_per_claim)
+    if args.sufficiency_must_list_uninspected_areas:
+        sufficiency_policy["must_list_uninspected_areas"] = True
+    if args.sufficiency_confidence_cap:
+        sufficiency_policy["confidence_cap_if_partial_extracts"] = str(args.sufficiency_confidence_cap).upper()
     try:
         mission = compile_mission_v1(
             mission_id=args.mission_id,
@@ -596,6 +642,10 @@ def _mission_compile(args) -> int:
             required_symbols=args.required_symbol or [],
             verification_commands=verification_commands,
             apply_mode=args.apply_mode,
+            objective_style=args.objective_style,
+            sufficiency_policy=sufficiency_policy or None,
+            answer_obligations=[{"question": text} for text in (args.answer_obligation or []) if str(text).strip()],
+            must_inspect=list(args.must_inspect or []),
             allow_broad_read_scope=bool(args.allow_broad_read_scope),
             critical_path_read_allowed=bool(args.critical_path_read_allowed),
             critical_path_reason=args.critical_path_reason,
@@ -875,7 +925,7 @@ def _bridge_status():
 
 # ── Supervisor ──
 
-def _supervise(port: int, daemon: bool = False, foreground: bool = False) -> int:
+def _supervise(port: int, daemon: bool = False, foreground: bool = False, allow_missing_upstream: bool = False) -> int:
     """Foreground supervisor: start bridge, monitor health, stream logs, handle Ctrl+C.
     With --daemon: exit after health, bridge keeps running independently.
     """
@@ -895,19 +945,7 @@ def _supervise(port: int, daemon: bool = False, foreground: bool = False) -> int
     os.makedirs(state_dir, exist_ok=True)
     env["PROXY_STATE_DB"] = env.get("PROXY_STATE_DB", os.path.join(state_dir, "proxy.sqlite3"))
 
-    if not env.get("OPENCODE_GO_API_KEY"):
-        env_file = os.path.join(os.getcwd(), ".codex-oss", "env", "opencode-go.env")
-        if os.path.exists(env_file):
-            with open(env_file) as f:
-                for line in f:
-                    if line.startswith("OPENCODE_GO_API_KEY="):
-                        env["OPENCODE_GO_API_KEY"] = line.strip().split("=", 1)[1]
-                        break
-
-    if not env.get("OPENCODE_GO_API_KEY"):
-        print("ERROR: OPENCODE_GO_API_KEY not set")
-        print("  Set it via: export OPENCODE_GO_API_KEY=sk-...")
-        print("  Or create .codex-oss/env/opencode-go.env")
+    if not _prepare_bridge_auth_env(env, os.getcwd(), allow_missing_upstream=allow_missing_upstream):
         return 1
 
     log_dir = os.path.join(os.getcwd(), ".codex-oss", "logs")
@@ -923,7 +961,10 @@ def _supervise(port: int, daemon: bool = False, foreground: bool = False) -> int
             return "unknown"
 
     source_hash = _get_hash()
-    print(f"  OpenCode Go key: loaded")
+    if env.get("OPENCODE_GO_API_KEY"):
+        print("  OpenCode Go key: loaded")
+    else:
+        print("  OpenCode Go key: missing (allowed for deterministic/local runtime testing)")
     print(f"  bridge.py source hash: {source_hash}")
 
     if daemon:
@@ -954,7 +995,7 @@ def _supervise(port: int, daemon: bool = False, foreground: bool = False) -> int
 
     # Wait for health
     print(f"  Waiting for health...") if not daemon else None
-    for i in range(30):
+    for i in range(60):
         try:
             req = urllib.request.Request(f"http://127.0.0.1:{port}/health")
             key = env.get("LITELLM_MASTER_KEY", "sk-local-codex-bridge")
@@ -976,7 +1017,7 @@ def _supervise(port: int, daemon: bool = False, foreground: bool = False) -> int
         except Exception:
             time.sleep(0.5)
     else:
-        print("  WARN: Bridge did not respond to health check within 15s")
+        print("  WARN: Bridge did not respond to health check within 30s")
         print("  Check .codex-oss/logs/bridge.err.log")
         if daemon:
             return 1
@@ -1058,7 +1099,7 @@ def _start_daemon_supervisor(port: int, env: dict, source_hash: str) -> int:
     with open(supervisor_pid_file, "w") as f:
         f.write(str(proc.pid))
 
-    for _ in range(30):
+    for _ in range(60):
         try:
             req = urllib.request.Request(f"http://127.0.0.1:{port}/health")
             key = env.get("LITELLM_MASTER_KEY", "sk-local-codex-bridge")
@@ -1072,7 +1113,7 @@ def _start_daemon_supervisor(port: int, env: dict, source_hash: str) -> int:
         except Exception:
             time.sleep(0.5)
 
-    print("  WARN: supervised bridge did not respond to health check within 15s")
+    print("  WARN: supervised bridge did not respond to health check within 30s")
     return 1
 
 
@@ -1154,7 +1195,7 @@ def _daemon_supervisor(port: int) -> int:
     return 0
 
 
-def _run_with_bridge(port: int, cmd: list) -> int:
+def _run_with_bridge(port: int, cmd: list, allow_missing_upstream: bool = False) -> int:
     """Start bridge, run command, stop bridge when done."""
     import os, time, subprocess, urllib.request, json
 
@@ -1169,6 +1210,8 @@ def _run_with_bridge(port: int, cmd: list) -> int:
     state_dir = os.path.join(os.getcwd(), ".codex-oss", "state")
     os.makedirs(state_dir, exist_ok=True)
     env["PROXY_STATE_DB"] = env.get("PROXY_STATE_DB", os.path.join(state_dir, "proxy.sqlite3"))
+    if not _prepare_bridge_auth_env(env, os.getcwd(), allow_missing_upstream=allow_missing_upstream):
+        return 1
 
     package_dir = os.path.dirname(os.path.abspath(__file__))
     bridge_path = os.path.join(os.path.dirname(package_dir), "bridge.py")
@@ -1213,6 +1256,27 @@ def _run_with_bridge(port: int, cmd: list) -> int:
         proc.kill()
     print(f"Bridge stopped (command exited with {rc})")
     return rc
+
+
+def _prepare_bridge_auth_env(env: dict, cwd: str, allow_missing_upstream: bool = False) -> bool:
+    if not env.get("OPENCODE_GO_API_KEY"):
+        env_file = os.path.join(cwd, ".codex-oss", "env", "opencode-go.env")
+        if os.path.exists(env_file):
+            with open(env_file) as f:
+                for line in f:
+                    if line.startswith("OPENCODE_GO_API_KEY="):
+                        env["OPENCODE_GO_API_KEY"] = line.strip().split("=", 1)[1]
+                        break
+    if env.get("OPENCODE_GO_API_KEY"):
+        return True
+    if allow_missing_upstream:
+        env["ALLOW_MISSING_OPENCODE_KEY"] = "1"
+        return True
+    print("ERROR: OPENCODE_GO_API_KEY not set")
+    print("  Set it via: export OPENCODE_GO_API_KEY=sk-...")
+    print("  Or create .codex-oss/env/opencode-go.env")
+    print("  Or use --allow-missing-upstream for deterministic/local runtime testing")
+    return False
 
 
 if __name__ == "__main__":

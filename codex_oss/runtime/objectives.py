@@ -212,6 +212,8 @@ def _synthesize_config_value(spec: ObjectiveSpec, ledger: Any) -> Optional[dict]
         else:
             claim = f"Configuration values for {target} were found; {field_text}."
         refs = [definition_ref] if definition_ref else []
+        if target and re.fullmatch(r"[A-Z][A-Z0-9_]{4,}", target) and path:
+            refs = [f"file:{path}"]
         if evidence.ref not in refs:
             refs.append(evidence.ref)
         return {"claim": claim, "evidence_refs": refs or [evidence.ref], "confidence": "LOW"}

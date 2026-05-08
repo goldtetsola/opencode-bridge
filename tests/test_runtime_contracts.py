@@ -551,7 +551,7 @@ def assert_readonly_mission_writes_artifact_bundle():
         assert result.handled, result
         assert result.status == "COMPLETE", result
         artifact_dir = os.path.join(root, ".codex-oss", "missions", "mission_artifact_test")
-        for name in ("mission.json", "ledger.json", "report.json", "summary.md", "trace.jsonl", "trace_grading.json"):
+        for name in ("mission.json", "ledger.json", "report.json", "claim_graph.json", "summary.md", "trace.jsonl", "trace_grading.json"):
             assert os.path.exists(os.path.join(artifact_dir, name)), name
         with open(os.path.join(artifact_dir, "trace_grading.json"), encoding="utf-8") as handle:
             grading = json.load(handle)
@@ -2747,6 +2747,233 @@ def assert_health_exposes_source_identity():
     assert status["transport_contract"]["stream_terminal_guarantee"] is True, status
 
 
+def assert_open_investigation_runtime_answer_graph_can_complete_after_model_timeout():
+    m = mission(
+        mission_id="mission_open_timeout_complete",
+        objective="Investigate where readonly artifacts are written.",
+        objective_style="open_investigation",
+        allowed_roots=[],
+        allowed_paths=["codex_oss/managed_bridge.py"],
+        allowed_tool_classes=["read"],
+        answer_obligations=[
+            {"id": "q1", "question": "Which runtime file writes readonly artifacts?", "required": True, "source_hints": ["codex_oss/managed_bridge.py"]},
+            {"id": "q2", "question": "What conclusion is justified from the inspected evidence?", "required": True, "source_hints": ["codex_oss/managed_bridge.py"]},
+        ],
+        must_inspect=["codex_oss/managed_bridge.py"],
+        objective_spec={
+            "schema_version": "objective_spec.v1",
+            "objective_type": "function_location",
+            "target": {"symbol": "_write_readonly_mission_artifacts"},
+            "required_outputs": ["file_path", "function_definition"],
+            "required_evidence_shapes": ["function_definition"],
+            "completion_criteria": ["function_definition_present"],
+        },
+    )
+    ledger = EvidenceLedger(mission_id=m.mission_id, tool_budget_remaining=m.tool_budget)
+    calls = {"n": 0}
+
+    def fake_model(messages, tools, timeout):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return {
+                "choices": [{
+                    "message": {
+                        "content": (
+                            '{"action_type":"tool_call","phase":"NARROW","tool_name":"rtk_read",'
+                            '"arguments":{"path":"codex_oss/managed_bridge.py"},'
+                            '"reason":"Inspect the runtime writer.","hypothesis":"The managed bridge persists readonly artifacts.",'
+                            '"target_question":"Which runtime file writes readonly artifacts?",'
+                            '"expected_information_gain":"Gather implementation evidence.",'
+                            '"why_not_report_yet":"Need the implementation evidence before closing."}'
+                        )
+                    }
+                }]
+            }
+        raise TimeoutError("simulated close timeout")
+
+    result = run_loop(m, ledger, fake_model, [], None, m.allowed_roots, m.allowed_paths, request_deadline=30)
+    assert result["status"] == "COMPLETE", result
+    assert result["report"]["status"] == "COMPLETE", result
+    assert result["report"]["report_source"] == "runtime_answer_graph", result
+    assert result["report"]["closure_source"] == "runtime_answer_graph", result
+    assert result["report"]["answer_graph_summary"]["required_answered"] == 2, result
+
+
+def assert_open_investigation_runtime_answer_graph_stays_partial_when_obligations_remain_open():
+    m = mission(
+        mission_id="mission_open_timeout_partial",
+        objective="Investigate where readonly artifacts are written and audited.",
+        objective_style="open_investigation",
+        allowed_roots=[],
+        allowed_paths=["codex_oss/managed_bridge.py", "codex_oss/audit.py"],
+        allowed_tool_classes=["read"],
+        answer_obligations=[
+            {"id": "q1", "question": "Which runtime file writes readonly artifacts?", "required": True, "source_hints": ["codex_oss/managed_bridge.py"]},
+            {"id": "q2", "question": "Which audit file enforces the readonly artifact contract?", "required": True, "source_hints": ["codex_oss/audit.py"]},
+            {
+                "id": "q3",
+                "question": "What remains unproven about the broader trust claim?",
+                "required": True,
+                "source_hints": ["codex_oss/claim_graph.py"],
+                "source_requirements": [{"path": "codex_oss/claim_graph.py", "evidence_kind": "trust_gap_source", "required": True, "prefetch": True}],
+            },
+        ],
+        must_inspect=["codex_oss/managed_bridge.py", "codex_oss/audit.py", "codex_oss/claim_graph.py"],
+        objective_spec={
+            "schema_version": "objective_spec.v1",
+            "objective_type": "function_location",
+            "target": {"symbol": "_write_readonly_mission_artifacts"},
+            "required_outputs": ["file_path", "function_definition"],
+            "required_evidence_shapes": ["function_definition"],
+            "completion_criteria": ["function_definition_present"],
+        },
+    )
+    ledger = EvidenceLedger(mission_id=m.mission_id, tool_budget_remaining=m.tool_budget)
+    calls = {"n": 0}
+
+    def fake_model(messages, tools, timeout):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return {
+                "choices": [{
+                    "message": {
+                        "content": (
+                            '{"action_type":"tool_call","phase":"NARROW","tool_name":"rtk_read",'
+                            '"arguments":{"path":"codex_oss/managed_bridge.py"},'
+                            '"reason":"Inspect the runtime writer.","hypothesis":"The managed bridge persists readonly artifacts.",'
+                            '"target_question":"Which runtime file writes readonly artifacts?",'
+                            '"expected_information_gain":"Gather implementation evidence.",'
+                            '"why_not_report_yet":"Need audit evidence too before closing."}'
+                        )
+                    }
+                }]
+            }
+        raise TimeoutError("simulated close timeout")
+
+    result = run_loop(m, ledger, fake_model, [], None, m.allowed_roots, m.allowed_paths, request_deadline=30)
+    assert result["status"] == "PARTIAL", result
+    assert result["report"]["status"] == "PARTIAL", result
+    assert result["report"]["report_source"] == "runtime_answer_graph", result
+    assert any("claim_graph.py" in missing.lower() for missing in result["report"]["missing_fields"]), result
+
+
+def assert_open_investigation_prefetch_reads_required_sources_before_model_loop():
+    m = mission(
+        mission_id="mission_open_prefetch_reads",
+        objective="Investigate readonly artifact coverage with required source prefetch.",
+        objective_style="open_investigation",
+        allowed_roots=[],
+        allowed_paths=["codex_oss/managed_bridge.py", "codex_oss/audit.py"],
+        allowed_tool_classes=["read", "search"],
+        answer_obligations=[
+            {
+                "id": "q1",
+                "question": "Which runtime file writes readonly artifacts?",
+                "required": True,
+                "source_hints": ["codex_oss/managed_bridge.py"],
+                "source_requirements": [{"path": "codex_oss/managed_bridge.py", "evidence_kind": "implementation_logic", "required": True, "prefetch": True}],
+            },
+            {
+                "id": "q2",
+                "question": "Which audit file enforces the readonly artifact contract?",
+                "required": True,
+                "source_hints": ["codex_oss/audit.py"],
+                "source_requirements": [{"path": "codex_oss/audit.py", "evidence_kind": "audit_enforcement", "required": True, "prefetch": True}],
+            },
+        ],
+        must_inspect=["codex_oss/managed_bridge.py", "codex_oss/audit.py"],
+    )
+    ledger = EvidenceLedger(mission_id=m.mission_id, tool_budget_remaining=m.tool_budget)
+
+    def fake_model(messages, tools, timeout):
+        raise TimeoutError("simulated timeout after prefetch")
+
+    result = run_loop(m, ledger, fake_model, [], None, m.allowed_roots, m.allowed_paths, request_deadline=30)
+    assert result["status"] == "COMPLETE", result
+    assert sorted(ledger.files_inspected.keys()) == ["codex_oss/audit.py", "codex_oss/managed_bridge.py"], ledger.files_inspected
+    assert result["report"]["closure_source"] == "runtime_answer_graph", result
+    assert result["report"]["answer_graph_summary"]["required_answered"] == 2, result
+
+
+def assert_open_investigation_redirects_to_pending_required_source():
+    m = mission(
+        mission_id="mission_open_redirect_required_source",
+        objective="Investigate readonly artifact coverage without skipping the pending audit source.",
+        objective_style="open_investigation",
+        allowed_roots=[],
+        allowed_paths=["codex_oss/managed_bridge.py", "codex_oss/audit.py"],
+        allowed_tool_classes=["read"],
+        answer_obligations=[
+            {
+                "id": "q1",
+                "question": "Which runtime file writes readonly artifacts?",
+                "required": True,
+                "source_hints": ["codex_oss/managed_bridge.py"],
+                "source_requirements": [{"path": "codex_oss/managed_bridge.py", "evidence_kind": "implementation_logic", "required": True, "prefetch": False}],
+            },
+            {
+                "id": "q2",
+                "question": "Which audit file enforces the readonly artifact contract?",
+                "required": True,
+                "source_hints": ["codex_oss/audit.py"],
+                "source_requirements": [{"path": "codex_oss/audit.py", "evidence_kind": "audit_enforcement", "required": True, "prefetch": False}],
+            },
+            {
+                "id": "q3",
+                "question": "What remains unproven?",
+                "required": True,
+                "source_hints": ["codex_oss/audit.py"],
+            },
+        ],
+        must_inspect=["codex_oss/managed_bridge.py", "codex_oss/audit.py"],
+    )
+    ledger = EvidenceLedger(mission_id=m.mission_id, tool_budget_remaining=m.tool_budget)
+    calls = {"n": 0}
+
+    def fake_model(messages, tools, timeout):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return {
+                "choices": [{
+                    "message": {
+                        "content": (
+                            '{"action_type":"tool_call","phase":"NARROW","tool_name":"rtk_read",'
+                            '"arguments":{"path":"codex_oss/managed_bridge.py"},'
+                            '"reason":"Inspect the runtime writer.","hypothesis":"The managed bridge writes the artifacts.",'
+                            '"target_question":"Which runtime file writes readonly artifacts?",'
+                            '"expected_information_gain":"Gather implementation evidence.",'
+                            '"why_not_report_yet":"Need the audit source too."}'
+                        )
+                    }
+                }]
+            }
+        if calls["n"] == 2:
+            return {
+                "choices": [{
+                    "message": {
+                        "content": (
+                            '{"action_type":"tool_call","phase":"VERIFY","tool_name":"rtk_read",'
+                            '"arguments":{"path":"codex_oss/managed_bridge.py"},'
+                            '"reason":"Reread the writer.","hypothesis":"More runtime detail may help.",'
+                            '"target_question":"Which runtime file writes readonly artifacts?",'
+                            '"expected_information_gain":"Maybe gather more detail.",'
+                            '"why_not_report_yet":"Still thinking."}'
+                        )
+                    }
+                }]
+            }
+        raise TimeoutError("simulated timeout after redirect")
+
+    result = run_loop(m, ledger, fake_model, [], None, m.allowed_roots, m.allowed_paths, request_deadline=30)
+    assert result["status"] == "PARTIAL", result
+    assert list(ledger.files_inspected.keys()) == ["codex_oss/managed_bridge.py"], ledger.files_inspected
+    assert any("audit.py" in missing.lower() for missing in result["report"]["missing_required_sources"]), result
+    assert any(
+        entry.runtime_decision == "redirected" and "required source still pending" in entry.decision_reason
+        for entry in ledger.action_trace
+    ), ledger.action_trace
+
+
 def main():
     assert_run_loop_accepts_valid_final_report()
     assert_model_text_extraction_handles_provider_variants()
@@ -2801,6 +3028,10 @@ def main():
     assert_read_line_ranges_are_supported()
     assert_incidental_critical_terms_do_not_stop_low_risk_mission()
     assert_health_exposes_source_identity()
+    assert_open_investigation_runtime_answer_graph_can_complete_after_model_timeout()
+    assert_open_investigation_runtime_answer_graph_stays_partial_when_obligations_remain_open()
+    assert_open_investigation_prefetch_reads_required_sources_before_model_loop()
+    assert_open_investigation_redirects_to_pending_required_source()
     print("PASS: runtime contract suite")
 
 

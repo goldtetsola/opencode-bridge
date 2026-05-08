@@ -43,9 +43,17 @@ def certify_project(project_root: str, target: str = "all", refresh: bool = True
             broad_low_risk.get("status") == "SUPPORTED",
             broad_low_risk.get("basis", ""),
         ),
+        "open_investigation_supported": _gate(
+            current_summary.get("promotion_evidence", {}).get("open_investigation_runtime", {}).get("status") == "SUPPORTED",
+            current_summary.get("promotion_evidence", {}).get("open_investigation_runtime", {}).get("basis", ""),
+        ),
         "legacy_clean": _gate(
             int(legacy_plan.get("planned_count", 0) or 0) == 0,
             f"legacy_planned_count={legacy_plan.get('planned_count', 0)}",
+        ),
+        "raw_lane_smoke_supported": _gate(
+            raw_summary.get("smoke_claim_status", {}).get("status") == "SUPPORTED",
+            raw_summary.get("smoke_claim_status", {}).get("basis", ""),
         ),
         "raw_lane_supported": _gate(
             raw_summary.get("claim_status", {}).get("status") == "SUPPORTED",
@@ -60,20 +68,24 @@ def certify_project(project_root: str, target: str = "all", refresh: bool = True
                 gates["operational_path_supported"],
                 gates["current_path_supported"],
                 gates["broader_low_risk_supported"],
+                gates["open_investigation_supported"],
             ]
         ),
+        "open_investigation": _target_verdict([gates["open_investigation_supported"]]),
         "repo_hygiene": _target_verdict([gates["legacy_clean"]]),
+        "raw_free_editing_smoke": _target_verdict([gates["raw_lane_smoke_supported"]]),
         "raw_free_editing": _target_verdict([gates["raw_lane_supported"]]),
     }
     target_verdicts["all"] = _target_verdict(
         [
             {"ok": target_verdicts["runtime_backed"]["status"] == "CERTIFIED"},
+            {"ok": target_verdicts["open_investigation"]["status"] == "CERTIFIED"},
             {"ok": target_verdicts["repo_hygiene"]["status"] == "CERTIFIED"},
             {"ok": target_verdicts["raw_free_editing"]["status"] == "CERTIFIED"},
         ]
     )
 
-    effective_target = target if target in {"runtime_backed", "repo_hygiene", "raw_free_editing", "all"} else "all"
+    effective_target = target if target in {"runtime_backed", "open_investigation", "repo_hygiene", "raw_free_editing_smoke", "raw_free_editing", "all"} else "all"
     verdict = target_verdicts[effective_target]
     report = {
         "certification_report_version": "1.0",

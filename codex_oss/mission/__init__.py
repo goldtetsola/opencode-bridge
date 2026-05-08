@@ -99,6 +99,10 @@ class MissionV1:
     deadline_policy: str = "deadline_policy.v1"
     objective_spec: Optional[dict] = None
     allow_heuristic_objective: bool = True
+    objective_style: str = "deterministic_lookup"
+    sufficiency_policy: dict = field(default_factory=dict)
+    answer_obligations: List[dict] = field(default_factory=list)
+    must_inspect: List[str] = field(default_factory=list)
 
     # AdaptiveAutonomyBudgetV1
     max_model_calls: int = 25
@@ -179,6 +183,10 @@ def _build_mission(raw: dict) -> MissionV1:
         raise InvalidHandoffError("objective is required")
     objective_spec = _validate_objective_spec(raw.get("objective_spec"))
     allow_heuristic_objective = bool(raw.get("allow_heuristic_objective", True))
+    objective_style = _validate_objective_style(raw.get("objective_style"), tier, objective_spec)
+    sufficiency_policy = _validate_sufficiency_policy(raw.get("sufficiency_policy"), objective_style)
+    answer_obligations = _validate_answer_obligations(raw.get("answer_obligations"), objective_style)
+    must_inspect = _validate_must_inspect(raw.get("must_inspect"))
 
     risk_tier = str(raw.get("risk_tier", "low")).lower()
     if risk_tier not in ("low", "medium", "critical"):
@@ -308,6 +316,10 @@ def _build_mission(raw: dict) -> MissionV1:
         required_outputs=required_outputs,
         objective_spec=objective_spec,
         allow_heuristic_objective=allow_heuristic_objective,
+        objective_style=objective_style,
+        sufficiency_policy=sufficiency_policy,
+        answer_obligations=answer_obligations,
+        must_inspect=must_inspect,
         max_model_calls=max_model_calls,
         max_duplicate_actions=max_duplicate_actions,
         max_broad_searches=max_broad_searches,
@@ -371,6 +383,128 @@ def _validate_objective_spec(raw: Any) -> Optional[dict]:
     if "confidence_policy" in raw and not isinstance(raw.get("confidence_policy"), dict):
         raise InvalidHandoffError("objective_spec.confidence_policy must be an object")
     return dict(raw)
+
+
+def _validate_objective_style(raw: Any, tier: str, objective_spec: Optional[dict]) -> str:
+    allowed = {"deterministic_lookup", "open_investigation", "implementation"}
+    if raw is None or str(raw).strip() == "":
+        if tier in IMPLEMENTATION_TIERS:
+            return "implementation"
+        return "deterministic_lookup"
+    style = str(raw).strip().lower()
+    if style not in allowed:
+        raise InvalidHandoffError(f"objective_style must be one of {sorted(allowed)}, got '{style}'")
+    return style
+
+
+def _validate_sufficiency_policy(raw: Any, objective_style: str) -> dict:
+    default = {
+        "min_main_claims": 1 if objective_style == "open_investigation" else 0,
+        "min_evidence_refs_per_claim": 1,
+        "must_list_uninspected_areas": bool(objective_style == "open_investigation"),
+        "confidence_cap_if_partial_extracts": "MEDIUM" if objective_style == "open_investigation" else "LOW",
+        "allow_runtime_answer_graph_closure": bool(objective_style == "open_investigation"),
+    }
+    if raw is None:
+        return default
+    if not isinstance(raw, dict):
+        raise InvalidHandoffError("sufficiency_policy must be an object")
+    policy = dict(default)
+    policy.update(raw)
+    try:
+        policy["min_main_claims"] = int(policy.get("min_main_claims", default["min_main_claims"]))
+        policy["min_evidence_refs_per_claim"] = int(policy.get("min_evidence_refs_per_claim", default["min_evidence_refs_per_claim"]))
+    except (TypeError, ValueError):
+        raise InvalidHandoffError("sufficiency_policy numeric fields must be integers")
+    if policy["min_main_claims"] < 0 or policy["min_evidence_refs_per_claim"] < 0:
+        raise InvalidHandoffError("sufficiency_policy numeric fields must be >= 0")
+    policy["must_list_uninspected_areas"] = bool(policy.get("must_list_uninspected_areas", False))
+    policy["allow_runtime_answer_graph_closure"] = bool(policy.get("allow_runtime_answer_graph_closure", default["allow_runtime_answer_graph_closure"]))
+    cap = str(policy.get("confidence_cap_if_partial_extracts", default["confidence_cap_if_partial_extracts"])).upper()
+    if cap not in {"LOW", "MEDIUM", "HIGH"}:
+        raise InvalidHandoffError("sufficiency_policy.confidence_cap_if_partial_extracts must be LOW, MEDIUM, or HIGH")
+    policy["confidence_cap_if_partial_extracts"] = cap
+    return policy
+
+
+def _validate_answer_obligations(raw: Any, objective_style: str) -> List[dict]:
+    if raw in (None, ""):
+        return []
+    if objective_style != "open_investigation":
+        raise InvalidHandoffError("answer_obligations are only valid for objective_style=open_investigation")
+    if not isinstance(raw, list):
+        raise InvalidHandoffError("answer_obligations must be a list")
+    obligations: list[dict] = []
+    for idx, item in enumerate(raw):
+        if isinstance(item, str):
+            text = item.strip()
+            if not text:
+                raise InvalidHandoffError(f"answer_obligations[{idx}] must not be empty")
+            obligations.append({"id": f"q{idx + 1}", "question": text, "required": True})
+            continue
+        if not isinstance(item, dict):
+            raise InvalidHandoffError(f"answer_obligations[{idx}] must be a string or object")
+        question = str(item.get("question", "") or "").strip()
+        if not question:
+            raise InvalidHandoffError(f"answer_obligations[{idx}].question is required")
+        source_hints = item.get("source_hints", [])
+        if source_hints not in (None, "") and (
+            not isinstance(source_hints, list) or not all(isinstance(part, str) and part.strip() for part in source_hints)
+        ):
+            raise InvalidHandoffError(f"answer_obligations[{idx}].source_hints must be a list of strings")
+        source_requirements = _validate_source_requirements(
+            item.get("source_requirements"),
+            field_name=f"answer_obligations[{idx}].source_requirements",
+        )
+        obligations.append({
+            "id": str(item.get("id", f"q{idx + 1}")),
+            "question": question,
+            "required": bool(item.get("required", True)),
+            "source_hints": [str(part) for part in (source_hints or [])],
+            "source_requirements": source_requirements,
+            "evidence_needed": [str(part) for part in (item.get("evidence_needed", []) or []) if str(part)],
+        })
+    return obligations
+
+
+def _validate_must_inspect(raw: Any) -> List[str]:
+    paths = _as_str_list(raw)
+    return [path for path in paths if path]
+
+
+def _validate_source_requirements(raw: Any, *, field_name: str) -> List[dict]:
+    if raw in (None, ""):
+        return []
+    if not isinstance(raw, list):
+        raise InvalidHandoffError(f"{field_name} must be a list")
+    requirements: list[dict] = []
+    for idx, item in enumerate(raw):
+        if isinstance(item, str):
+            path = item.strip()
+            if not path:
+                raise InvalidHandoffError(f"{field_name}[{idx}] must not be empty")
+            requirements.append({
+                "path": path,
+                "evidence_kind": "source_read",
+                "required": True,
+                "prefetch": True,
+            })
+            continue
+        if not isinstance(item, dict):
+            raise InvalidHandoffError(f"{field_name}[{idx}] must be a string or object")
+        path = str(item.get("path", "") or "").strip()
+        if not path:
+            raise InvalidHandoffError(f"{field_name}[{idx}].path is required")
+        evidence_kind = str(item.get("evidence_kind", "source_read") or "source_read").strip()
+        if not evidence_kind:
+            raise InvalidHandoffError(f"{field_name}[{idx}].evidence_kind must not be empty")
+        requirements.append({
+            "path": path,
+            "evidence_kind": evidence_kind,
+            "required": bool(item.get("required", True)),
+            "prefetch": bool(item.get("prefetch", True)),
+        })
+    return requirements
 
 
 def _validate_verification_policy(raw: Any) -> dict:

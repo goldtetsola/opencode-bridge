@@ -20,6 +20,14 @@ def build_health_status(app: Any, bridge_version: str, bridge_path: str, start_t
             "since": health.get("since", 0),
         }
 
+    project_root = os.getcwd()
+    source_path = os.path.abspath(bridge_path)
+    source_sha = sha256_file(source_path)
+    state_db = getattr(app.state, "path", os.getenv("PROXY_STATE_DB", "unknown"))
+    supervisor_mode = os.getenv("CODEX_OSS_SUPERVISOR_MODE", "unknown")
+    config_fingerprint = hashlib.sha256(
+        f"{project_root}|{source_path}|{source_sha}|{state_db}|{supervisor_mode}".encode("utf-8")
+    ).hexdigest()[:16]
     return {
         "ok": True,
         "service": "responses-chat-proxy",
@@ -29,16 +37,19 @@ def build_health_status(app: Any, bridge_version: str, bridge_path: str, start_t
         "ppid": os.getppid(),
         "uptime_seconds": int(time.time() - start_time),
         "argv": sys.argv,
-        "source_path": os.path.abspath(bridge_path),
-        "source_sha256": sha256_file(os.path.abspath(bridge_path)),
+        "source_path": source_path,
+        "source_sha256": source_sha,
+        "project_root": project_root,
+        "cwd": project_root,
         "supervisor": {
-            "mode": os.getenv("CODEX_OSS_SUPERVISOR_MODE", "unknown"),
-            "durable": os.getenv("CODEX_OSS_SUPERVISOR_MODE", "") != "",
+            "mode": supervisor_mode,
+            "durable": supervisor_mode != "",
         },
         "gpt_model_strategy": app.gpt_model_strategy,
         "upstream_stream": getattr(app, "upstream_streaming", True),
         "has_opencode_key": bool(app.upstream_key),
-        "state_db": getattr(app.state, "path", os.getenv("PROXY_STATE_DB", "unknown")),
+        "state_db": state_db,
+        "config_fingerprint": config_fingerprint,
         "model_health": model_health,
         "concurrency": {
             "max_global": app.max_global_concurrency,

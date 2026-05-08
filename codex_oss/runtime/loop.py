@@ -24,6 +24,8 @@ class ModelAction:
         self.arguments = raw.get("arguments", {})
         self.reason = str(raw.get("reason", ""))
         self.hypothesis = str(raw.get("hypothesis", ""))
+        self.target_question = str(raw.get("target_question", ""))
+        self.phase = str(raw.get("phase", ""))
         self.expected_information_gain = str(raw.get("expected_information_gain", ""))
         self.why_not_report_yet = str(raw.get("why_not_report_yet", ""))
         self.report = raw.get("report")
@@ -132,6 +134,13 @@ def run_loop(mission: Any, ledger: Any, call_model_fn, tools, emitter,
         critical_read_allowed_for_path, objective_coverage_errors,
     )
     from codex_oss.runtime.autonomy import assess_action_progress
+    from codex_oss.claim_graph import evaluate_sufficiency, refresh_claim_graph
+    from codex_oss.answer_graph import (
+        build_runtime_report_from_answer_graph,
+        evaluate_answer_sufficiency,
+        pending_required_agenda_items,
+        refresh_answer_graph,
+    )
     from codex_oss.decision_trace import append_decision
 
     start = _time.time()
@@ -209,6 +218,29 @@ def run_loop(mission: Any, ledger: Any, call_model_fn, tools, emitter,
         if model_call_uses_internal_tools_only(mission.tier):
             tools = []
         allowed_tool_names = _allowed_tool_names(mission)
+        initial_graph = refresh_claim_graph(mission, ledger, reason="mission_start", persist=True)
+        initial_answer_graph = refresh_answer_graph(mission, ledger, claim_graph=initial_graph, reason="mission_start", persist=True)
+        initial_phase = str(initial_answer_graph.get("investigation_state", {}).get("phase", "") or initial_graph.get("phase", "") or "PLAN")
+        _record_phase_transition(
+            mission,
+            "",
+            initial_phase,
+            "initial mission phase established",
+        )
+        if str(getattr(mission, "objective_style", "") or "") == "open_investigation":
+            initial_answer_graph = _runtime_prefetch_required_sources(
+                mission,
+                ledger,
+                initial_answer_graph,
+                allowed_tool_names,
+                deadline,
+            )
+        _record_phase_transition(
+            mission,
+            initial_phase,
+            str(initial_answer_graph.get("investigation_state", {}).get("phase", "") or initial_graph.get("phase", "") or initial_phase),
+            "phase recomputed after runtime prefetch",
+        )
         context = _build_context(mission, ledger, allowed_tool_names)
 
         while True:
@@ -271,6 +303,19 @@ def run_loop(mission: Any, ledger: Any, call_model_fn, tools, emitter,
                 from codex_oss.validation import validate_report
                 report = action.report
                 if isinstance(report, dict):
+                    if str(getattr(mission, "objective_style", "") or "") == "open_investigation":
+                        current_answer_graph = getattr(ledger, "answer_graph", {}) or {}
+                        pending_required = pending_required_agenda_items(current_answer_graph)
+                        if pending_required and str(report.get("status", "") or "").upper() == "COMPLETE":
+                            if repair_count < max_repair:
+                                repair_count += 1
+                                context.append({"role": "user", "content": (
+                                    "You cannot return COMPLETE yet. Required evidence sources are still pending: "
+                                    f"{', '.join(item.get('path', '') for item in pending_required[:3])}. "
+                                    "Inspect the pending required source or return a PARTIAL final_report that names the missing source explicitly."
+                                )})
+                                continue
+                            return _partial(mission, ledger, "complete_report_before_required_sources", deadline)
                     # Check critical finality claims
                     rendered = ""
                     from codex_oss.validation import render_report
@@ -287,7 +332,34 @@ def run_loop(mission: Any, ledger: Any, call_model_fn, tools, emitter,
 
                     result = validate_report(report, ledger)
                     if result.is_valid:
+                        previous_phase = str((getattr(ledger, "claim_graph", {}) or {}).get("phase", "") or "")
+                        refreshed_graph = refresh_claim_graph(mission, ledger, report=report, reason="final_report", persist=True)
+                        refreshed_answer_graph = refresh_answer_graph(
+                            mission,
+                            ledger,
+                            claim_graph=refreshed_graph,
+                            report=report,
+                            reason="final_report",
+                            persist=True,
+                        )
+                        _record_phase_transition(
+                            mission,
+                            previous_phase,
+                            str(refreshed_answer_graph.get("investigation_state", {}).get("phase", "") or refreshed_graph.get("phase", "") or "REPORT"),
+                            "final report accepted and claim graph refreshed",
+                        )
                         coverage_errors = objective_coverage_errors(mission, report, ledger)
+                        answer_sufficiency = evaluate_answer_sufficiency(
+                            mission,
+                            list(refreshed_answer_graph.get("required_obligations", []) or []) + list(refreshed_answer_graph.get("optional_obligations", []) or []),
+                            ledger=ledger,
+                        ) if str(getattr(mission, "objective_style", "") or "") == "open_investigation" else None
+                        sufficiency = evaluate_sufficiency(mission, ledger, report=report, graph=getattr(ledger, "claim_graph", {}) or None)
+                        if answer_sufficiency is not None:
+                            if not bool(answer_sufficiency.get("can_close", False)):
+                                coverage_errors = list(coverage_errors) + list(answer_sufficiency.get("open_high_priority_questions", []) or []) + list(answer_sufficiency.get("missing_must_inspect", []) or [])
+                        elif not bool(sufficiency.get("enough_evidence_to_report", False)):
+                            coverage_errors = list(coverage_errors) + list(sufficiency.get("missing_requirements", []) or [])
                         if coverage_errors:
                             if repair_count < max_repair:
                                 repair_count += 1
@@ -405,6 +477,74 @@ def run_loop(mission: Any, ledger: Any, call_model_fn, tools, emitter,
                         )
                         return _partial(mission, ledger, f"critical_path_detected:{critical_reason}", deadline)
                     ledger.add_risk_flag("critical_path_read_allowed")
+
+                if str(getattr(mission, "objective_style", "") or "") == "open_investigation":
+                    current_answer_graph = getattr(ledger, "answer_graph", {}) or {}
+                    current_sufficiency = current_answer_graph.get("sufficiency", {}) if isinstance(current_answer_graph, dict) else {}
+                    required_answered = int(current_sufficiency.get("required_answered", 0) or 0)
+                    required_total = int(current_sufficiency.get("required_total", 0) or 0)
+                    pending_required = pending_required_agenda_items(current_answer_graph)
+                    action_phase = str(getattr(action, "phase", "") or "").upper()
+                    if pending_required and not _action_addresses_pending_requirement(action, pending_required):
+                        next_action = pending_required[0]
+                        _record_action_trace(
+                            mission, ledger, action, _mission_phase(ledger), "redirected",
+                            f"required source still pending: {next_action.get('path', '')}",
+                            deadline, raw_arguments, action.arguments, [],
+                        )
+                        context.append({"role": "user", "content": (
+                            "A required evidence source is still pending. "
+                            f"The next valid progress action is rtk_read on {next_action.get('path', '')} "
+                            f"for obligation {next_action.get('obligation_id', '')}. "
+                            "Do not reread already-covered sources or move to VERIFY/REPORT yet."
+                        )})
+                        continue
+                    if action_phase == "VERIFY" and required_answered == 0:
+                        _record_action_trace(
+                            mission, ledger, action, _mission_phase(ledger), "redirected",
+                            "VERIFY phase rejected before any required answer obligation was addressed",
+                            deadline, raw_arguments, action.arguments, [],
+                        )
+                        context.append({"role": "user", "content": (
+                            "You cannot enter VERIFY yet. No required answer obligations are answered. "
+                            "Continue exploration or narrowing with a tool call tied to a target_question."
+                        )})
+                        continue
+                    if action_phase == "VERIFY" and pending_required:
+                        _record_action_trace(
+                            mission, ledger, action, _mission_phase(ledger), "redirected",
+                            "VERIFY phase rejected while required sources remain pending",
+                            deadline, raw_arguments, action.arguments, [],
+                        )
+                        context.append({"role": "user", "content": (
+                            "You cannot enter VERIFY yet. Required evidence sources remain pending: "
+                            f"{', '.join(item.get('path', '') for item in pending_required[:3])}. "
+                            "Inspect the pending required source first."
+                        )})
+                        continue
+                    if action_phase == "REPORT" and required_total > 0 and required_answered < required_total:
+                        _record_action_trace(
+                            mission, ledger, action, _mission_phase(ledger), "redirected",
+                            "REPORT phase rejected before all required answer obligations were satisfied",
+                            deadline, raw_arguments, action.arguments, [],
+                        )
+                        context.append({"role": "user", "content": (
+                            "You cannot enter REPORT yet. Some required answer obligations remain open. "
+                            "Address the missing obligations or return a PARTIAL final_report that names them explicitly."
+                        )})
+                        continue
+                    if action_phase == "REPORT" and pending_required:
+                        _record_action_trace(
+                            mission, ledger, action, _mission_phase(ledger), "redirected",
+                            "REPORT phase rejected while required sources remain pending",
+                            deadline, raw_arguments, action.arguments, [],
+                        )
+                        context.append({"role": "user", "content": (
+                            "You cannot enter REPORT yet. Required evidence sources remain pending: "
+                            f"{', '.join(item.get('path', '') for item in pending_required[:3])}. "
+                            "Inspect the pending source first or return a PARTIAL final_report that names it explicitly."
+                        )})
+                        continue
 
                 progress = assess_action_progress(mission, ledger, action, deadline)
                 if progress.decision == "finalize":
@@ -544,6 +684,21 @@ def run_loop(mission: Any, ledger: Any, call_model_fn, tools, emitter,
                 next_action_hint = _next_action_hint(tool_name, result)
                 hint_text = f"\nRuntime next-action hint: {next_action_hint}\n" if next_action_hint else ""
                 objective_satisfied = _objective_satisfied(mission, ledger)
+                previous_phase = str((getattr(ledger, "claim_graph", {}) or {}).get("phase", "") or "")
+                claim_graph = refresh_claim_graph(mission, ledger, action=action, reason="tool_result", persist=True)
+                answer_graph = refresh_answer_graph(mission, ledger, claim_graph=claim_graph, reason="tool_result", persist=True)
+                _record_phase_transition(
+                    mission,
+                    previous_phase,
+                    str(answer_graph.get("investigation_state", {}).get("phase", "") or claim_graph.get("phase", "") or ""),
+                    f"phase recomputed after {tool_name}",
+                )
+                sufficiency = evaluate_sufficiency(mission, ledger, graph=claim_graph)
+                answer_sufficiency = evaluate_answer_sufficiency(
+                    mission,
+                    list(answer_graph.get("required_obligations", []) or []) + list(answer_graph.get("optional_obligations", []) or []),
+                    ledger=ledger,
+                ) if str(getattr(mission, "objective_style", "") or "") == "open_investigation" else None
                 objective_text = ""
                 if objective_satisfied:
                     forced_final_requested = True
@@ -551,11 +706,25 @@ def run_loop(mission: Any, ledger: Any, call_model_fn, tools, emitter,
                         "\nRuntime objective check: explicit objective_spec appears satisfied by current evidence. "
                         "Return final_report now; do not call another tool.\n"
                     )
+                elif answer_sufficiency is not None and bool(answer_sufficiency.get("can_close", False)):
+                    forced_final_requested = True
+                    objective_text = (
+                        "\nRuntime answer-graph check: required answer obligations are satisfied. "
+                        "Return final_report now; do not call another tool.\n"
+                    )
+                elif bool(sufficiency.get("enough_evidence_to_report", False)):
+                    forced_final_requested = True
+                    objective_text = (
+                        "\nRuntime sufficiency check: current evidence is strong enough to draft a report. "
+                        "Return final_report now; do not call another tool.\n"
+                    )
                 context.append({"role": "user", "content": (
                     f"Tool result ({tool_name}):\n{obs}\n\n"
                     f"Available evidence refs for final_report findings: {_evidence_ref_summary(ledger)}\n"
                     f"{hint_text}"
                     f"{objective_text}"
+                    f"Current claim graph summary: {json.dumps({'phase': claim_graph.get('phase'), 'main_claim_count': claim_graph.get('sufficiency', {}).get('main_claim_count', 0), 'missing_requirements': claim_graph.get('sufficiency', {}).get('missing_requirements', []), 'uninspected_allowed_paths': claim_graph.get('uninspected_allowed_paths', [])[:5]})}\n"
+                    f"Current answer graph summary: {json.dumps({'phase': answer_graph.get('investigation_state', {}).get('phase'), 'required_answered': answer_graph.get('sufficiency', {}).get('required_answered', 0), 'required_total': answer_graph.get('sufficiency', {}).get('required_total', 0), 'open_questions': answer_graph.get('sufficiency', {}).get('open_high_priority_questions', [])[:5], 'missing_required_sources': answer_graph.get('sufficiency', {}).get('missing_required_sources', [])[:5], 'next_required_actions': answer_graph.get('sufficiency', {}).get('next_required_actions', [])[:2]})}\n"
                     f"Current phase: {_mission_phase(ledger)}. "
                     "If this evidence is sufficient, return final_report now. If more exploration is needed, "
                     "the next action must include hypothesis, expected_information_gain, and why_not_report_yet."
@@ -636,6 +805,90 @@ def _content_to_text(content: Any) -> str:
     return str(content)
 
 
+def _runtime_prefetch_required_sources(
+    mission: Any,
+    ledger: Any,
+    answer_graph: dict[str, Any],
+    allowed_tool_names: set[str],
+    deadline: Any,
+) -> dict[str, Any]:
+    if "rtk_read" not in allowed_tool_names:
+        return answer_graph
+    pending = []
+    try:
+        from codex_oss.answer_graph import pending_required_agenda_items, refresh_answer_graph
+        from codex_oss.runtime import TOOL_EXECUTORS, resolve_path
+        from codex_oss.runtime.policy import scan_secrets
+    except Exception:
+        return answer_graph
+    pending = [
+        item for item in pending_required_agenda_items(answer_graph)
+        if bool(item.get("prefetch", True))
+    ]
+    if not pending:
+        return answer_graph
+    executor = TOOL_EXECUTORS.get("rtk_read")
+    if not executor:
+        return answer_graph
+    for item in pending:
+        if ledger.tool_budget_remaining <= 0 or deadline.must_return_partial():
+            break
+        raw_path = str(item.get("path", "") or "")
+        if not raw_path or raw_path in (getattr(ledger, "files_inspected", {}) or {}):
+            continue
+        resolved, error = resolve_path(raw_path, getattr(mission, "allowed_roots", []) or [], getattr(mission, "allowed_paths", []) or [])
+        if error:
+            continue
+        synthetic_action = type("RuntimePrefetchAction", (), {
+            "action_type": "tool_call",
+            "tool_name": "rtk_read",
+            "arguments": {"path": resolved},
+            "reason": f"Runtime prefetch for required source {resolved}",
+            "hypothesis": f"Required source {resolved} is needed before coverage can complete.",
+            "target_question": str(item.get("obligation_id", "") or "required_source"),
+            "phase": _mission_phase(ledger),
+            "expected_information_gain": "Satisfy a pending required source requirement.",
+            "why_not_report_yet": "Required source coverage is incomplete.",
+        })()
+        ledger.spend_budget()
+        result = executor(resolved, max_bytes=100000)
+        if result and result.stdout:
+            result.stdout, found_secret = scan_secrets(result.stdout)
+            if found_secret:
+                result.redactions_applied = True
+                ledger.redactions_applied = True
+        ledger.add_file(resolved, result, len(ledger.commands_run))
+        ledger.add_command("rtk_read", {"path": resolved}, result, len(ledger.commands_run))
+        _record_action_trace(
+            mission,
+            ledger,
+            synthetic_action,
+            _mission_phase(ledger),
+            "runtime_prefetch",
+            f"required source prefetched for obligation {item.get('obligation_id', '')}",
+            deadline,
+            {"path": raw_path},
+            {"path": resolved},
+            [],
+            result=_tool_result_summary(result),
+        )
+        answer_graph = refresh_answer_graph(mission, ledger, reason="runtime_prefetch", persist=True)
+    return answer_graph
+
+
+def _action_addresses_pending_requirement(action: Any, pending_required: list[dict[str, Any]]) -> bool:
+    if not pending_required:
+        return True
+    if not getattr(action, "is_tool_call", False):
+        return False
+    tool_name = str(getattr(action, "tool_name", "") or "")
+    path = str((getattr(action, "arguments", {}) or {}).get("path", "") or "")
+    if tool_name != "rtk_read" or not path:
+        return False
+    pending_paths = {str(item.get("path", "") or "") for item in pending_required if str(item.get("path", "") or "")}
+    return path in pending_paths
+
+
 def min_confidence(a: str, b: str) -> str:
     order = {"HIGH": 3, "MEDIUM": 2, "LOW": 1}
     return a if order.get(a, 0) < order.get(b, 0) else b
@@ -643,6 +896,15 @@ def min_confidence(a: str, b: str) -> str:
 
 def _partial_dict(mission, ledger, reason: str) -> dict:
     from codex_oss.runtime.policy import build_deterministic_partial_report
+    if str(getattr(mission, "objective_style", "") or "") == "open_investigation":
+        from codex_oss.claim_graph import refresh_claim_graph
+        from codex_oss.answer_graph import build_runtime_report_from_answer_graph, refresh_answer_graph
+
+        claim_graph = refresh_claim_graph(mission, ledger, reason="runtime_partial", persist=True)
+        answer_graph = refresh_answer_graph(mission, ledger, claim_graph=claim_graph, reason="runtime_partial", persist=True)
+        report = build_runtime_report_from_answer_graph(mission, ledger, answer_graph, reason=reason, report_source="runtime_answer_graph")
+        _annotate_report_provenance(mission, report, "runtime_answer_graph")
+        return {"status": str(report.get("status", "PARTIAL") or "PARTIAL"), "report": report}
     return {"status": "PARTIAL", "report": build_deterministic_partial_report(mission, ledger, reason)}
 
 
@@ -652,6 +914,7 @@ def _partial(mission, ledger, reason: str, deadline) -> dict:
 
 def _annotate_report_provenance(mission: Any, report: dict, source: str) -> None:
     report.setdefault("report_source", source)
+    report.setdefault("closure_source", source)
     report.setdefault("runtime_model_alias", getattr(mission, "runtime_model_alias", ""))
     report.setdefault("explorer_model", getattr(mission, "last_reasoning_model", ""))
     report.setdefault("finalizer_model", None)
@@ -660,6 +923,9 @@ def _annotate_report_provenance(mission: Any, report: dict, source: str) -> None
 
 def _build_context(mission: Any, ledger: Any, allowed_tool_names: Optional[set] = None) -> list:
     allowed_tool_names = allowed_tool_names or _allowed_tool_names(mission)
+    objective_style = str(getattr(mission, "objective_style", "") or "")
+    answer_obligations = list(getattr(mission, "answer_obligations", []) or [])
+    current_phase = "PLAN" if objective_style == "open_investigation" and not (getattr(ledger, "commands_run", []) or getattr(ledger, "files_inspected", {})) else _mission_phase(ledger)
     tools_list = "\n".join(f"- {t}" for t in sorted(allowed_tool_names))
     allowed_roots = getattr(mission, "allowed_roots", []) or []
     allowed_paths = getattr(mission, "allowed_paths", []) or []
@@ -669,21 +935,24 @@ def _build_context(mission: Any, ledger: Any, allowed_tool_names: Optional[set] 
     objective_contract = json.dumps(objective_spec, sort_keys=True) if isinstance(objective_spec, dict) else "(heuristic objective fallback)"
     return [{"role": "system", "content": 
         f"You are an OSS managed investigation agent. Mission: {mission.objective}\n"
+        f"Objective style: {objective_style or 'deterministic_lookup'}\n"
         f"Objective contract: {objective_contract}\n"
         f"Allowed roots:\n{roots_list}\n"
         f"Allowed exact paths:\n{paths_list}\n"
         f"Use only these roots/paths. Do not guess alternate filenames or read '.'.\n"
         f"Allowed tools:\n{tools_list}\n"
         f"Required outputs: {', '.join(mission.required_outputs)}\n"
+        f"Answer obligations: {json.dumps(answer_obligations[:6], sort_keys=True) if answer_obligations else '[]'}\n"
         f"Budget: {ledger.tool_budget_remaining} tool calls remaining. Adaptive limits: "
         f"max_broad_searches={getattr(mission, 'max_broad_searches', 6)}, "
         f"max_duplicate_actions={getattr(mission, 'max_duplicate_actions', 2)}, "
         f"max_low_information_actions={getattr(mission, 'max_low_information_actions', 3)}.\n"
-        f"Current phase: {_mission_phase(ledger)}. Phases are EXPLORE, NARROW, VERIFY, REPORT.\n"
+        f"Current phase: {current_phase}. Phases are PLAN, EXPLORE, NARROW, VERIFY, REPORT.\n"
         f"Return exactly one JSON action per turn. No markdown, no status text.\n"
+        f"For open investigations, keep every action tied to a hypothesis or target_question, and only keep exploring if the answer/coverage graph still has missing required sources or open obligations.\n"
         f"To inspect evidence, return: "
         f'{{"action_type":"tool_call","tool_name":"rtk_read","arguments":{{"path":"<allowed path>"}},'
-        f'"reason":"...","hypothesis":"...","expected_information_gain":"...",'
+        f'"reason":"...","hypothesis":"...","target_question":"...","expected_information_gain":"...",'
         f'"why_not_report_yet":"..."}}\n'
         f"To finish, return: "
         f'{{"action_type":"final_report","report":{{"oss_report_version":"1.0","mission_id":"{mission.mission_id}",'
@@ -979,6 +1248,7 @@ def _record_action_trace(
             phase=phase,
             action_type=getattr(action, "action_type", ""),
             tool_name=getattr(action, "tool_name", ""),
+            target_question=getattr(action, "target_question", ""),
             raw_arguments=dict(raw_arguments or {}),
             normalized_arguments=dict(normalized_arguments or {}),
             unsupported_arguments=list(unsupported_arguments or []),
@@ -1005,6 +1275,23 @@ def _record_action_trace(
         return
 
 
+def _record_phase_transition(mission: Any, previous_phase: str, current_phase: str, reason: str) -> None:
+    prev = str(previous_phase or "").strip().upper()
+    cur = str(current_phase or "").strip().upper()
+    if not cur or prev == cur:
+        return
+    from codex_oss.decision_trace import append_decision
+    append_decision(
+        mission,
+        decision_type="phase_transition",
+        result=cur,
+        policy="PhasePolicyV1",
+        reason=reason,
+        source_module="codex_oss/runtime/loop.py",
+        input_payload={"from_phase": prev, "to_phase": cur},
+    )
+
+
 def _write_action_trace(mission: Any, entry: Any) -> None:
     root = os.getcwd()
     mission_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(getattr(mission, "mission_id", "unknown")))
@@ -1016,6 +1303,7 @@ def _write_action_trace(mission: Any, entry: Any) -> None:
         "phase": entry.phase,
         "action_type": entry.action_type,
         "tool_name": entry.tool_name,
+        "target_question": getattr(entry, "target_question", ""),
         "raw_arguments": entry.raw_arguments,
         "normalized_arguments": entry.normalized_arguments,
         "unsupported_arguments": entry.unsupported_arguments,

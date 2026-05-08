@@ -40,7 +40,8 @@ def append_decision(
 def write_decision_trace(project_root: str, mission_id: str, mission: Any) -> str | None:
     trace = getattr(mission, "decision_trace", None)
     if not isinstance(trace, list):
-        return None
+        trace = []
+        setattr(mission, "decision_trace", trace)
     artifact_dir = os.path.join(project_root, ".codex-oss", "missions", mission_id)
     os.makedirs(artifact_dir, exist_ok=True)
     path = os.path.join(artifact_dir, "decision_trace.json")
@@ -64,4 +65,3 @@ def read_decision_trace(project_root: str, mission_id: str) -> dict[str, Any] | 
         return None
     with open(path, "r", encoding="utf-8") as handle:
         return json.load(handle)
-

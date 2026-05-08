@@ -315,6 +315,25 @@ def _check_bridge(url: str, report: DoctorReport, root: Path, live_model: bool =
             "Bridge health does not expose source_sha256",
             "Restart a bridge version that reports running source identity")
 
+    running_root = str(health.get("project_root", "") or health.get("cwd", "") or "")
+    if running_root and os.path.abspath(running_root) == os.path.abspath(str(root)):
+        report.add("bridge.project_root", "PASS", "Running bridge project root matches current repo")
+    elif running_root:
+        report.add("bridge.project_root", "FAIL",
+            f"Running bridge project root differs from current repo ({running_root})",
+            "Restart the bridge from this repo root through the supervisor")
+    else:
+        report.add("bridge.project_root", "WARN",
+            "Bridge health does not expose project_root/cwd",
+            "Restart a bridge version that reports its project root")
+
+    if str(health.get("config_fingerprint", "") or ""):
+        report.add("bridge.config_fingerprint", "PASS", "Bridge health exposes a config fingerprint")
+    else:
+        report.add("bridge.config_fingerprint", "WARN",
+            "Bridge health does not expose config_fingerprint",
+            "Restart a bridge version that reports a config fingerprint")
+
     # GPT rejection test
     api_url = f"{url}/v1/responses"
     try:

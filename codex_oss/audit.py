@@ -25,6 +25,12 @@ def audit_mission(project_root: str, mission_id: str) -> dict[str, Any]:
     verification = _read_json_if_exists(os.path.join(mission_dir, "verification.json"))
     certification = _read_json_if_exists(os.path.join(mission_dir, "certification.json"))
     trace_grading = _read_json_if_exists(os.path.join(mission_dir, "trace_grading.json"))
+    decision_trace = _read_json_if_exists(os.path.join(mission_dir, "decision_trace.json"))
+    claim_graph = _read_json_if_exists(os.path.join(mission_dir, "claim_graph.json"))
+    answer_graph = _read_json_if_exists(os.path.join(mission_dir, "answer_graph.json"))
+    coverage_graph = _read_json_if_exists(os.path.join(mission_dir, "coverage_graph.json"))
+    evidence_agenda = _read_json_if_exists(os.path.join(mission_dir, "evidence_agenda.json"))
+    investigation_plan = _read_json_if_exists(os.path.join(mission_dir, "investigation_plan.json"))
     summary_path = os.path.join(mission_dir, "summary.md")
     trace_path = os.path.join(mission_dir, "trace.jsonl")
     patch_path = os.path.join(mission_dir, "patch.diff")
@@ -32,6 +38,7 @@ def audit_mission(project_root: str, mission_id: str) -> dict[str, Any]:
 
     checks.append(_check("mission_json", isinstance(mission, dict), "mission.json present"))
     checks.append(_check("report_json", isinstance(report, dict), "report.json present"))
+    checks.append(_check("decision_trace_json", isinstance(decision_trace, dict), "decision_trace.json present"))
 
     tier = str(mission.get("tier", "") or "") if isinstance(mission, dict) else ""
     implementation_tier = tier in {"A4", "A5", "A6"}
@@ -48,6 +55,12 @@ def audit_mission(project_root: str, mission_id: str) -> dict[str, Any]:
         checks.append(_check("trace_jsonl", os.path.exists(trace_path), "trace.jsonl present"))
         checks.append(_check("summary_md", os.path.exists(summary_path), "summary.md present"))
         checks.append(_check("trace_grading_json", isinstance(trace_grading, dict), "trace_grading.json present"))
+        checks.append(_check("claim_graph_json", isinstance(claim_graph, dict), "claim_graph.json present"))
+        if str((mission or {}).get("objective_style", "") or "") == "open_investigation":
+            checks.append(_check("investigation_plan_json", isinstance(investigation_plan, dict), "investigation_plan.json present"))
+            checks.append(_check("answer_graph_json", isinstance(answer_graph, dict), "answer_graph.json present"))
+            checks.append(_check("coverage_graph_json", isinstance(coverage_graph, dict), "coverage_graph.json present"))
+            checks.append(_check("evidence_agenda_json", isinstance(evidence_agenda, dict), "evidence_agenda.json present"))
 
     if isinstance(report, dict) and isinstance(validation, dict):
         checks.append(_check(
@@ -182,7 +195,7 @@ def audit_mission(project_root: str, mission_id: str) -> dict[str, Any]:
                     bool(certification.get("approved_for_workspace_apply")),
                     "workspace apply certification approved",
                 ))
-    elif isinstance(mission, dict) and isinstance(report, dict) and not implementation_tier:
+    if isinstance(mission, dict) and isinstance(report, dict) and not implementation_tier:
         checks.append(_check(
             "readonly_status_present",
             str(report.get("status", "") or "") != "",
@@ -194,10 +207,51 @@ def audit_mission(project_root: str, mission_id: str) -> dict[str, Any]:
             "read-only trace grading labels recorded",
         ))
         checks.append(_check(
+            "readonly_claim_graph_sufficiency_recorded",
+            isinstance(claim_graph, dict) and isinstance(claim_graph.get("sufficiency"), dict),
+            "read-only claim graph sufficiency recorded",
+        ))
+        checks.append(_check(
             "readonly_files_match_ledger",
             isinstance(ledger, dict) and isinstance(report.get("files_inspected", []), list),
             "read-only report has ledger-backed file evidence structure",
         ))
+        if str(mission.get("objective_style", "") or "") == "open_investigation":
+            checks.append(_check(
+                "open_claim_graph_phase_history_recorded",
+                isinstance(claim_graph, dict) and bool(claim_graph.get("phase_history")),
+                "open-investigation claim graph phase history recorded",
+            ))
+            checks.append(_check(
+                "open_answer_graph_sufficiency_recorded",
+                isinstance(answer_graph, dict) and isinstance(answer_graph.get("sufficiency"), dict),
+                "open-investigation answer graph sufficiency recorded",
+            ))
+            checks.append(_check(
+                "open_answer_graph_obligations_recorded",
+                isinstance(answer_graph, dict) and bool(answer_graph.get("required_obligations")),
+                "open-investigation answer obligations recorded",
+            ))
+            checks.append(_check(
+                "open_closure_source_recorded",
+                str(report.get("closure_source", "") or "") != "",
+                "open-investigation closure source recorded",
+            ))
+            checks.append(_check(
+                "open_coverage_graph_status_recorded",
+                isinstance(coverage_graph, dict) and isinstance(coverage_graph.get("coverage_status"), dict),
+                "open-investigation coverage status recorded",
+            ))
+            checks.append(_check(
+                "open_evidence_agenda_items_recorded",
+                isinstance(evidence_agenda, dict) and isinstance(evidence_agenda.get("items"), list),
+                "open-investigation evidence agenda recorded",
+            ))
+            checks.append(_check(
+                "open_answer_graph_missing_sources_recorded",
+                isinstance(answer_graph, dict) and isinstance((answer_graph.get("sufficiency") or {}).get("missing_required_sources"), list),
+                "open-investigation missing required sources recorded",
+            ))
 
     return {
         "ok": all(bool(item.get("ok")) for item in checks),
@@ -210,8 +264,11 @@ def audit_mission(project_root: str, mission_id: str) -> dict[str, Any]:
 def _read_json_if_exists(path: str) -> Any:
     if not os.path.exists(path):
         return None
-    with open(path, "r", encoding="utf-8") as handle:
-        return json.load(handle)
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return None
 
 
 def _check(name: str, ok: bool, message: str) -> dict[str, Any]:

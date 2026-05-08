@@ -6,11 +6,15 @@ from __future__ import annotations
 import http.server
 import json
 import os
+import socket
 import socketserver
 import subprocess
 import sys
 import tempfile
 import threading
+import time
+import urllib.request
+import hashlib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -21,6 +25,8 @@ REQUESTS = []
 sys.path.insert(0, str(ROOT))
 
 from codex_oss.implementation import apply_patch_in_isolated_worktree
+from codex_oss.ledger import EvidenceLedger
+from codex_oss.managed_bridge import _write_readonly_mission_artifacts
 from codex_oss.mission import _build_mission
 
 
@@ -73,6 +79,12 @@ def run_cmd(args, cwd=None, **kwargs):
         capture_output=True,
         **kwargs,
     )
+
+
+def free_port():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
 
 
 def assert_template_requires_scope():
@@ -157,6 +169,28 @@ def assert_compile_can_emit_canonical_handoff_wrapper():
     assert mission["mission_id"] == "mission_cli_handoff", mission
     assert mission["objective_spec"]["objective_type"] == "function_location", mission
     assert mission["objective_spec"]["target"]["symbol"] == "certify_project", mission
+
+
+def assert_compile_can_emit_open_investigation_mission():
+    result = run_cmd([
+        "mission", "compile",
+        "--mission-id", "mission_cli_open",
+        "--objective", "Investigate how read-only mission artifacts are persisted.",
+        "--tier", "A3",
+        "--allowed-root", "codex_oss/",
+        "--objective-style", "open_investigation",
+        "--sufficiency-min-main-claims", "1",
+        "--sufficiency-must-list-uninspected-areas",
+        "--sufficiency-confidence-cap", "MEDIUM",
+    ])
+    assert result.returncode == 0, result.stdout + result.stderr
+    mission = json.loads(result.stdout)
+    assert mission["objective_style"] == "open_investigation", mission
+    assert mission["sufficiency_policy"]["min_main_claims"] == 1, mission
+    assert mission["sufficiency_policy"]["must_list_uninspected_areas"] is True, mission
+    assert mission["sufficiency_policy"]["confidence_cap_if_partial_extracts"] == "MEDIUM", mission
+    assert len(mission["answer_obligations"]) >= 3, mission
+    assert "must_inspect" in mission, mission
 
 
 def assert_compile_outputs_critical_workspace_certified_mission():
@@ -341,8 +375,110 @@ def assert_audit_mission_reports_runtime_artifacts():
         assert "patch_artifact" in names
         assert "rollback_artifact" in names
         assert "ledger_json" in names
+        assert "decision_trace_json" in names
         assert "trace_jsonl" in names
         assert "summary_md" in names
+
+
+def assert_readonly_artifacts_include_claim_graph():
+    with tempfile.TemporaryDirectory(prefix="oss_cli_claim_graph_") as root:
+        prev_cwd = os.getcwd()
+        try:
+            os.chdir(root)
+            mission = _build_mission({
+                "schema_version": "oss_agent_mission.v1",
+                "mission_id": "mission_cli_open_artifacts",
+                "tier": "A3",
+                "mode": "managed_investigation",
+                "objective": "Investigate how claim graphs are persisted.",
+                "objective_style": "open_investigation",
+                "sufficiency_policy": {
+                    "min_main_claims": 1,
+                    "min_evidence_refs_per_claim": 1,
+                    "must_list_uninspected_areas": True,
+                    "confidence_cap_if_partial_extracts": "MEDIUM",
+                },
+                "answer_obligations": [
+                    {"id": "q1", "question": "Which file persists artifacts?", "required": True, "source_hints": ["codex_oss/managed_bridge.py"]},
+                    {"id": "q2", "question": "What conclusion is justified?", "required": True, "source_hints": ["codex_oss/managed_bridge.py"]},
+                ],
+                "must_inspect": ["codex_oss/managed_bridge.py"],
+                "risk_tier": "low",
+                "write_allowed": False,
+                "allowed_roots": [],
+                "allowed_paths": ["codex_oss/managed_bridge.py"],
+                "allowed_tool_classes": ["read"],
+                "tool_budget": 4,
+                "time_budget_seconds": 60,
+                "stop_conditions": ["valid_report", "deadline_reached"],
+                "report_schema": "managed_investigation_report.v1",
+                "required_outputs": [
+                    "files_inspected",
+                    "commands_run",
+                    "findings",
+                    "uncertainties",
+                    "confidence",
+                    "caveats",
+                    "escalation_recommendation",
+                ],
+            })
+            ledger = EvidenceLedger(mission_id=mission.mission_id, tool_budget_remaining=3)
+            stdout = "def persist_artifacts():\n    return True\n"
+            result = type("DummyResult", (), {
+                "tool": "rtk_read",
+                "args": {"path": "codex_oss/managed_bridge.py"},
+                "exit_code": 0,
+                "stdout": stdout,
+                "stderr": "",
+                "sha256": hashlib.sha256(stdout.encode("utf-8")).hexdigest()[:12],
+                "complete": True,
+                "chars_total": len(stdout),
+                "redactions_applied": False,
+                "risk_flags": [],
+            })()
+            ledger.add_file("codex_oss/managed_bridge.py", result, 0)
+            ledger.add_command("rtk_read", {"path": "codex_oss/managed_bridge.py"}, result, 0)
+            ledger.add_open_question("Which artifact files are persisted for read-only missions?")
+            report = {
+                "oss_report_version": "1.0",
+                "mission_id": mission.mission_id,
+                "status": "COMPLETE",
+                "confidence": "LOW",
+                "report_source": "runtime_finalizer",
+                "closure_source": "runtime_answer_graph",
+                "files_inspected": [{"path": "codex_oss/managed_bridge.py", "complete": True}],
+                "commands_run": [{"tool": "rtk_read", "args": {"path": "codex_oss/managed_bridge.py"}}],
+                "findings": [{
+                    "claim": "persist_artifacts is defined in codex_oss/managed_bridge.py.",
+                    "evidence_refs": ["file:codex_oss/managed_bridge.py#extract:1"],
+                    "confidence": "LOW",
+                }],
+                "uncertainties": [],
+                "caveats": ["Fixture report."],
+                "escalation_recommendation": "GPT-5.5 review recommended",
+                "missing_fields": [],
+            }
+            _write_readonly_mission_artifacts(mission, ledger, report, "COMPLETE")
+            artifact_dir = Path(root) / ".codex-oss" / "missions" / mission.mission_id
+            claim_graph = json.loads((artifact_dir / "claim_graph.json").read_text(encoding="utf-8"))
+            answer_graph = json.loads((artifact_dir / "answer_graph.json").read_text(encoding="utf-8"))
+            investigation_plan = json.loads((artifact_dir / "investigation_plan.json").read_text(encoding="utf-8"))
+            assert claim_graph["objective_style"] == "open_investigation", claim_graph
+            assert claim_graph["sufficiency"]["main_claim_count"] >= 1, claim_graph
+            assert claim_graph["investigation_state"]["enough_evidence_to_report"] is True, claim_graph
+            assert answer_graph["sufficiency"]["required_answered"] >= 1, answer_graph
+            assert investigation_plan["required_obligations"], investigation_plan
+            audited = run_cmd(["audit-mission", mission.mission_id, "--json"], cwd=root)
+            assert audited.returncode == 0, audited.stdout + audited.stderr
+            payload = json.loads(audited.stdout)
+            names = {item["name"] for item in payload["checks"]}
+            assert "claim_graph_json" in names, payload
+            assert "readonly_claim_graph_sufficiency_recorded" in names, payload
+            assert "answer_graph_json" in names, payload
+            assert "investigation_plan_json" in names, payload
+            assert "open_answer_graph_sufficiency_recorded" in names, payload
+        finally:
+            os.chdir(prev_cwd)
 
 
 def assert_mission_metrics_summarize_runtime_evidence():
@@ -438,13 +574,83 @@ def assert_mission_metrics_summarize_runtime_evidence():
         (readonly_dir / "ledger.json").write_text(json.dumps({"evidence": ["command:0"]}, indent=2), encoding="utf-8")
         (readonly_dir / "report.json").write_text(json.dumps({
             "status": "COMPLETE",
-            "report_source": "runtime_finalizer",
+            "report_source": "runtime_answer_graph",
+            "closure_source": "runtime_answer_graph",
             "files_inspected": ["tests/test_config.py"],
         }, indent=2), encoding="utf-8")
         (readonly_dir / "trace_grading.json").write_text(json.dumps({
             "trace_grading_version": "1.0",
             "labels": ["productive_exploration"],
             "reasons": ["Fixture investigation completed."],
+        }, indent=2), encoding="utf-8")
+        (readonly_dir / "decision_trace.json").write_text(json.dumps({
+            "decision_trace_version": "1.0",
+            "mission_id": "mission_cli_metrics_readonly",
+            "decisions": [
+                {
+                    "decision_type": "scope_validation",
+                    "result": "accepted",
+                    "policy": "PathPolicyV1",
+                    "reason": "fixture path is narrow",
+                    "source_module": "codex_oss/runtime/policy.py",
+                }
+            ],
+        }, indent=2), encoding="utf-8")
+        (readonly_dir / "claim_graph.json").write_text(json.dumps({
+            "claim_graph_version": "1.0",
+            "mission_id": "mission_cli_metrics_readonly",
+            "objective_style": "open_investigation",
+            "phase": "REPORT",
+            "claims": [{
+                "claim_id": "claim_fixture",
+                "text": "Fixture read-only claim.",
+                "status": "supported",
+                "evidence_refs": ["file:tests/test_config.py#extract:1"],
+            }],
+            "open_questions": [],
+            "sufficiency": {"enough_evidence_to_report": True, "main_claim_count": 1, "missing_requirements": []},
+            "investigation_state": {"phase": "REPORT", "enough_evidence_to_report": True, "remaining_uncertainties": []},
+            "uninspected_allowed_paths": [],
+        }, indent=2), encoding="utf-8")
+        (readonly_dir / "investigation_plan.json").write_text(json.dumps({
+            "investigation_plan_version": "1.0",
+            "mission_id": "mission_cli_metrics_readonly",
+            "mission_question": "Inspect a file",
+            "required_obligations": [{"id": "q1", "question": "What does the file show?", "required": True}],
+            "optional_obligations": [],
+            "must_inspect": ["tests/test_config.py"],
+            "likely_paths": ["tests/test_config.py"],
+        }, indent=2), encoding="utf-8")
+        (readonly_dir / "answer_graph.json").write_text(json.dumps({
+            "answer_graph_version": "1.0",
+            "mission_id": "mission_cli_metrics_readonly",
+            "mission_question": "Inspect a file",
+            "required_obligations": [{
+                "id": "q1",
+                "question": "What does the file show?",
+                "required": True,
+                "status": "answered",
+                "claims": ["claim_fixture"],
+                "evidence_refs": ["file:tests/test_config.py#extract:1"],
+                "missing_evidence": [],
+                "confidence": "LOW",
+            }],
+            "optional_obligations": [],
+            "must_inspect": ["tests/test_config.py"],
+            "likely_paths": ["tests/test_config.py"],
+            "sufficiency": {
+                "can_close": True,
+                "recommended_status": "COMPLETE",
+                "required_answered": 1,
+                "required_total": 1,
+                "partially_answered": 0,
+                "missing_must_inspect": [],
+                "open_high_priority_questions": [],
+                "confidence_cap": "LOW",
+                "partial_extracts": False,
+                "reason": "fixture",
+            },
+            "investigation_state": {"phase": "REPORT", "enough_evidence_to_report": True, "remaining_uncertainties": []},
         }, indent=2), encoding="utf-8")
         (readonly_dir / "trace.jsonl").write_text("{}\n", encoding="utf-8")
         (readonly_dir / "summary.md").write_text("# Read-only Summary\n", encoding="utf-8")
@@ -458,6 +664,7 @@ def assert_mission_metrics_summarize_runtime_evidence():
         assert payload["implementation"]["count"] == 1, payload
         assert payload["read_only"]["count"] == 1, payload
         assert payload["promotion_evidence"]["runtime_backed_investigation"]["status"] == "SUPPORTED", payload
+        assert payload["promotion_evidence"]["open_investigation_runtime"]["status"] == "UNCONFIRMED", payload
         assert payload["promotion_evidence"]["bounded_implementation"]["status"] == "SUPPORTED", payload
         assert payload["promotion_evidence"]["workspace_apply_evidence"]["status"] == "UNCONFIRMED", payload
 
@@ -470,6 +677,7 @@ def assert_refresh_proofs_generates_supported_claim_surface():
         assert payload["suite"] == "proof", payload
         assert set(payload["generated_missions"]) == {
             "proof_a3_readonly",
+            "proof_a3_open",
             "proof_a4_proposal",
             "proof_a5_workspace",
             "proof_a6_certified",
@@ -478,9 +686,10 @@ def assert_refresh_proofs_generates_supported_claim_surface():
         metrics = run_cmd(["mission-metrics", "--project", root, "--proof-only", "--json"], cwd=root)
         assert metrics.returncode == 0, metrics.stdout + metrics.stderr
         summary = json.loads(metrics.stdout)
-        assert summary["eligible_missions"] == 4, summary
+        assert summary["eligible_missions"] == 5, summary
         assert summary["legacy_or_incomplete_missions"] == 0, summary
         assert summary["promotion_evidence"]["runtime_backed_investigation"]["status"] == "SUPPORTED", summary
+        assert summary["promotion_evidence"]["open_investigation_runtime"]["status"] == "SUPPORTED", summary
         assert summary["promotion_evidence"]["bounded_implementation"]["status"] == "SUPPORTED", summary
         assert summary["promotion_evidence"]["workspace_apply_evidence"]["status"] == "SUPPORTED", summary
         assert summary["promotion_evidence"]["critical_certification_evidence"]["status"] == "SUPPORTED", summary
@@ -490,6 +699,7 @@ def assert_refresh_proofs_generates_supported_claim_surface():
         claim_payload = json.loads(claim.stdout)
         assert claim_payload["claim_status"]["all_supported"] is True, claim_payload
         assert "runtime_backed_investigation" in claim_payload["claim_status"]["supported_claims"], claim_payload
+        assert "open_investigation_runtime" in claim_payload["claim_status"]["supported_claims"], claim_payload
 
         burnin = run_cmd(["burnin", "--project", root, "--suite", "proof", "--json"], cwd=root)
         assert burnin.returncode == 0, burnin.stdout + burnin.stderr
@@ -508,6 +718,7 @@ def assert_operational_burnin_generates_supported_claim_surface():
         assert set(payload["generated_missions"]) == {
             "operational_a3_readme",
             "operational_a3_impl_site",
+            "operational_a3_open_runtime",
             "operational_a4_docs_patch",
             "operational_a5_workspace_docs",
             "operational_a5_multifile_runtime",
@@ -517,9 +728,10 @@ def assert_operational_burnin_generates_supported_claim_surface():
         metrics = run_cmd(["mission-metrics", "--project", root, "--operational-only", "--json"], cwd=root)
         assert metrics.returncode == 0, metrics.stdout + metrics.stderr
         summary = json.loads(metrics.stdout)
-        assert summary["eligible_missions"] == 6, summary
+        assert summary["eligible_missions"] == 7, summary
         assert summary["legacy_or_incomplete_missions"] == 0, summary
         assert summary["promotion_evidence"]["runtime_backed_investigation"]["status"] == "SUPPORTED", summary
+        assert summary["promotion_evidence"]["open_investigation_runtime"]["status"] == "SUPPORTED", summary
         assert summary["promotion_evidence"]["bounded_implementation"]["status"] == "SUPPORTED", summary
         assert summary["promotion_evidence"]["workspace_apply_evidence"]["status"] == "SUPPORTED", summary
         assert summary["promotion_evidence"]["critical_certification_evidence"]["status"] == "SUPPORTED", summary
@@ -549,6 +761,11 @@ def assert_archive_legacy_missions_plans_and_moves_only_legacy_dirs():
         (current / "ledger.json").write_text(json.dumps({"evidence": []}, indent=2), encoding="utf-8")
         (current / "report.json").write_text(json.dumps({"status": "COMPLETE"}, indent=2), encoding="utf-8")
         (current / "trace_grading.json").write_text(json.dumps({"labels": ["productive_exploration"]}, indent=2), encoding="utf-8")
+        (current / "decision_trace.json").write_text(json.dumps({
+            "decision_trace_version": "1.0",
+            "mission_id": "proof_a3_readonly",
+            "decisions": [],
+        }, indent=2), encoding="utf-8")
         (current / "trace.jsonl").write_text("{}\n", encoding="utf-8")
         (current / "summary.md").write_text("# ok\n", encoding="utf-8")
 
@@ -618,6 +835,8 @@ def assert_raw_claim_status_is_fail_closed():
 
 def assert_raw_probe_runner_records_artifacts():
     with tempfile.TemporaryDirectory(prefix="oss_cli_raw_probe_runner_") as root:
+        support_dir = Path(root) / ".codex-oss" / "probe-support"
+        support_dir.mkdir(parents=True, exist_ok=True)
         result = run_cmd([
             "raw-probe",
             "--project", root,
@@ -625,20 +844,32 @@ def assert_raw_probe_runner_records_artifacts():
             "--scope-respected",
             "--verification-recorded",
             "--rollback-recorded",
+            "--allow-change", "owned.txt",
+            "--verification-artifact", ".codex-oss/probe-support/verification.txt",
+            "--rollback-artifact", ".codex-oss/probe-support/rollback.txt",
             "--json",
             "--",
             "python3",
             "-c",
+            "from pathlib import Path; "
+            "Path('owned.txt').write_text('ok\\n', encoding='utf-8'); "
+            "Path('.codex-oss/probe-support/verification.txt').write_text('verified\\n', encoding='utf-8'); "
+            "Path('.codex-oss/probe-support/rollback.txt').write_text('rollback\\n', encoding='utf-8'); "
             "print('OSS_REPORT_BEGIN\\nStatus: COMPLETE\\nOSS_REPORT_END')",
         ], cwd=root)
         assert result.returncode == 0, result.stdout + result.stderr
         payload = json.loads(result.stdout)
         assert payload["structured_report_present"] is True, payload
+        assert payload["changed_files"] == ["owned.txt"], payload
+        assert payload["derived_scope_respected"] is True, payload
+        assert payload["derived_verification_recorded"] is True, payload
+        assert payload["derived_rollback_recorded"] is True, payload
 
         claim = run_cmd(["raw-claim-status", "--project", root, "--json"], cwd=root)
         assert claim.returncode == 0, claim.stdout + claim.stderr
         claim_payload = json.loads(claim.stdout)
         assert claim_payload["claim_status"]["status"] == "SUPPORTED", claim_payload
+        assert claim_payload["smoke_claim_status"]["status"] == "SUPPORTED", claim_payload
 
 
 def assert_certify_reports_runtime_backed_and_raw_statuses():
@@ -650,11 +881,23 @@ def assert_certify_reports_runtime_backed_and_raw_statuses():
         assert runtime_payload["targets"]["runtime_backed"]["status"] == "CERTIFIED", runtime_payload
         assert (Path(root) / ".codex-oss" / "certifications" / "runtime_backed.json").exists()
 
+        open_lane = run_cmd(["certify", "--project", root, "--target", "open_investigation", "--json"], cwd=root)
+        assert open_lane.returncode == 0, open_lane.stdout + open_lane.stderr
+        open_payload = json.loads(open_lane.stdout)
+        assert open_payload["verdict"]["status"] == "CERTIFIED", open_payload
+        assert open_payload["targets"]["open_investigation"]["status"] == "CERTIFIED", open_payload
+
         raw = run_cmd(["certify", "--project", root, "--target", "raw_free_editing", "--no-refresh", "--json"], cwd=root)
         assert raw.returncode == 1, raw.stdout + raw.stderr
         raw_payload = json.loads(raw.stdout)
         assert raw_payload["verdict"]["status"] == "UNCONFIRMED", raw_payload
         assert raw_payload["gates"]["raw_lane_supported"]["ok"] is False, raw_payload
+
+        smoke = run_cmd(["certify", "--project", root, "--target", "raw_free_editing_smoke", "--no-refresh", "--json"], cwd=root)
+        assert smoke.returncode == 1, smoke.stdout + smoke.stderr
+        smoke_payload = json.loads(smoke.stdout)
+        assert smoke_payload["verdict"]["status"] == "UNCONFIRMED", smoke_payload
+        assert smoke_payload["gates"]["raw_lane_smoke_supported"]["ok"] is False, smoke_payload
 
 
 def assert_explain_reads_decision_trace_artifact():
@@ -671,6 +914,20 @@ def assert_explain_reads_decision_trace_artifact():
                     "policy": "BroadScopePolicyV1",
                     "reason": "narrow allowed_path",
                     "source_module": "codex_oss/runtime/policy.py",
+                },
+                {
+                    "decision_type": "phase_transition",
+                    "result": "PLAN",
+                    "policy": "PhasePolicyV1",
+                    "reason": "initial mission phase established",
+                    "source_module": "codex_oss/runtime/loop.py",
+                },
+                {
+                    "decision_type": "phase_transition",
+                    "result": "VERIFY",
+                    "policy": "PhasePolicyV1",
+                    "reason": "phase recomputed after rtk_read",
+                    "source_module": "codex_oss/runtime/loop.py",
                 }
             ],
         }, indent=2), encoding="utf-8")
@@ -679,6 +936,43 @@ def assert_explain_reads_decision_trace_artifact():
         payload = json.loads(result.stdout)
         assert payload["mission_id"] == "mission_explain_test", payload
         assert payload["decisions"][0]["decision_type"] == "scope_validation", payload
+        assert payload["summary"]["phase_path"] == ["PLAN", "VERIFY"], payload
+
+
+def assert_claim_status_tolerates_incomplete_json_artifacts():
+    with tempfile.TemporaryDirectory(prefix="oss_cli_incomplete_json_") as root:
+        mission_dir = Path(root) / ".codex-oss" / "missions" / "broken_mission"
+        mission_dir.mkdir(parents=True, exist_ok=True)
+        (mission_dir / "mission.json").write_text("{", encoding="utf-8")
+        result = run_cmd(["claim-status", "--project", root, "--json"], cwd=root)
+        assert result.returncode == 1, result.stdout + result.stderr
+        payload = json.loads(result.stdout)
+        assert payload["eligible_missions"] == 0, payload
+        assert payload["claim_status"]["all_supported"] is False, payload
+
+
+def assert_up_daemon_allows_missing_upstream():
+    with tempfile.TemporaryDirectory(prefix="oss_cli_up_missing_upstream_") as root:
+        port = free_port()
+        result = run_cmd(["up", "--daemon", "--port", str(port), "--allow-missing-upstream"], cwd=root)
+        assert result.returncode == 0, result.stdout + result.stderr
+        try:
+            for _ in range(20):
+                try:
+                    req = urllib.request.Request(f"http://127.0.0.1:{port}/health")
+                    req.add_header("Authorization", f"Bearer {AUTH}")
+                    with urllib.request.urlopen(req, timeout=2) as resp:
+                        payload = json.loads(resp.read().decode("utf-8"))
+                    assert payload["ok"] is True, payload
+                    assert payload["has_opencode_key"] is False, payload
+                    break
+                except Exception:
+                    time.sleep(0.25)
+            else:
+                raise AssertionError("daemon bridge did not become healthy")
+        finally:
+            stopped = run_cmd(["stop"], cwd=root)
+            assert stopped.returncode == 0, stopped.stdout + stopped.stderr
 
 
 def main() -> int:
@@ -686,9 +980,11 @@ def main() -> int:
     assert_template_outputs_mission_v1()
     assert_compile_outputs_strict_implementation_mission()
     assert_compile_can_emit_canonical_handoff_wrapper()
+    assert_compile_can_emit_open_investigation_mission()
     assert_compile_outputs_critical_workspace_certified_mission()
     assert_run_posts_mission_to_runtime_bridge()
     assert_audit_mission_reports_runtime_artifacts()
+    assert_readonly_artifacts_include_claim_graph()
     assert_mission_metrics_summarize_runtime_evidence()
     assert_refresh_proofs_generates_supported_claim_surface()
     assert_operational_burnin_generates_supported_claim_surface()
@@ -698,6 +994,8 @@ def main() -> int:
     assert_raw_probe_runner_records_artifacts()
     assert_certify_reports_runtime_backed_and_raw_statuses()
     assert_explain_reads_decision_trace_artifact()
+    assert_claim_status_tolerates_incomplete_json_artifacts()
+    assert_up_daemon_allows_missing_upstream()
     print("PASS: MissionV1 CLI delegation suite")
     return 0
 

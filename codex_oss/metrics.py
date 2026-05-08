@@ -46,14 +46,24 @@ def summarize_missions(
         validation = _read_json_if_exists(os.path.join(mission_dir, "validation.json")) or {}
         certification = _read_json_if_exists(os.path.join(mission_dir, "certification.json")) or {}
         trace_grading = _read_json_if_exists(os.path.join(mission_dir, "trace_grading.json")) or {}
+        claim_graph = _read_json_if_exists(os.path.join(mission_dir, "claim_graph.json")) or {}
+        answer_graph = _read_json_if_exists(os.path.join(mission_dir, "answer_graph.json")) or {}
+        decision_trace = _read_json_if_exists(os.path.join(mission_dir, "decision_trace.json")) or {}
+        phase_path = [
+            str(item.get("result", "") or "")
+            for item in (decision_trace.get("decisions", []) or [])
+            if str(item.get("decision_type", "") or "") == "phase_transition"
+        ]
         audited = audit_mission(project_root, mission_id)
         missions.append({
             "mission_id": mission_id,
             "tier": str(mission.get("tier", "") or ""),
+            "objective_style": str(mission.get("objective_style", "") or ""),
             "apply_mode": str(mission.get("apply_mode", "") or ""),
             "report_status": str(report.get("status", "") or ""),
             "validation_status": str(validation.get("status", "") or ""),
             "report_source": str(report.get("report_source", "") or ""),
+            "closure_source": str(report.get("closure_source", report.get("report_source", "")) or ""),
             "proposal_source": str(report.get("proposal_source", "") or validation.get("proposal_source", "") or ""),
             "certification_status": str(certification.get("status", "") or ""),
             "certification_proof_grade": str(certification.get("proof_grade", "") or ""),
@@ -63,6 +73,15 @@ def summarize_missions(
             "verification_plan_score": int(report.get("verification_plan_score", validation.get("verification_plan_score", 0)) or 0),
             "gpt_review_required": bool(report.get("gpt_review_required", True)),
             "trace_labels": list(trace_grading.get("labels", []) or []),
+            "phase_history": list(phase_path or claim_graph.get("phase_history", []) or []),
+            "answer_required_total": int((answer_graph.get("sufficiency", {}) or {}).get("required_total", 0) or 0),
+            "answer_required_answered": int((answer_graph.get("sufficiency", {}) or {}).get("required_answered", 0) or 0),
+            "answer_can_close": bool((answer_graph.get("sufficiency", {}) or {}).get("can_close", False)),
+            "command_tools": [
+                str(item.get("tool", "") or "")
+                for item in (report.get("commands_run", []) or [])
+                if isinstance(item, dict) and str(item.get("tool", "") or "")
+            ],
             "audit_ok": bool(audited.get("ok", False)),
             "promotion_proof": bool(mission.get("promotion_proof")),
             "operational_burnin": bool(mission.get("operational_burnin")),
@@ -125,6 +144,7 @@ def _summarize_rows(project_root: str, missions: list[dict[str, Any]]) -> dict[s
     eligible_rows = [row for row in missions if row["tier"] in eligible_tiers]
     implementation_rows = [row for row in eligible_rows if row["tier"] in {"A4", "A5", "A6"}]
     readonly_rows = [row for row in eligible_rows if row["tier"] in {"A2", "A3"}]
+    open_readonly_rows = [row for row in readonly_rows if row["objective_style"] == "open_investigation"]
     legacy_rows = [row for row in missions if row["tier"] not in eligible_tiers]
 
     for row in missions:
@@ -135,6 +155,8 @@ def _summarize_rows(project_root: str, missions: list[dict[str, Any]]) -> dict[s
         entry["validation_statuses"][row["validation_status"]] += 1
         entry["apply_modes"][row["apply_mode"]] += 1
         report_sources[row["report_source"]] += 1
+        if row["closure_source"]:
+            report_sources[f"closure:{row['closure_source']}"] += 1
         proposal_sources[row["proposal_source"]] += 1
         if row["certification_status"]:
             certification_statuses[row["certification_status"]] += 1
@@ -188,6 +210,33 @@ def _summarize_rows(project_root: str, missions: list[dict[str, Any]]) -> dict[s
             "audit_ok_count": sum(1 for row in readonly_rows if row["audit_ok"]),
             "complete_count": sum(1 for row in readonly_rows if row["report_status"] == "COMPLETE"),
             "productive_exploration_count": sum(1 for row in readonly_rows if "productive_exploration" in row["trace_labels"]),
+            "open_investigation_count": len(open_readonly_rows),
+            "open_investigation_audit_ok_count": sum(1 for row in open_readonly_rows if row["audit_ok"]),
+            "open_investigation_complete_count": sum(1 for row in open_readonly_rows if row["report_status"] == "COMPLETE"),
+            "open_investigation_model_closed_count": sum(1 for row in open_readonly_rows if row["report_source"] == "model_report"),
+            "open_investigation_runtime_finalized_count": sum(1 for row in open_readonly_rows if row["report_source"] == "runtime_finalizer"),
+            "open_investigation_runtime_answer_graph_closed_count": sum(1 for row in open_readonly_rows if row["report_source"] == "runtime_answer_graph"),
+            "open_investigation_productive_count": sum(1 for row in open_readonly_rows if "productive_exploration" in row["trace_labels"]),
+            "open_investigation_search_backed_count": sum(1 for row in open_readonly_rows if "rtk_grep" in row["command_tools"]),
+            "open_investigation_phaseful_count": sum(
+                1
+                for row in open_readonly_rows
+                if (
+                    "PLAN" in set(row["phase_history"])
+                    and "REPORT" in set(row["phase_history"])
+                    and ("VERIFY" in set(row["phase_history"]) or "NARROW" in set(row["phase_history"]))
+                ) or (
+                    row["report_source"] == "runtime_answer_graph"
+                    and row["answer_required_total"] > 0
+                    and row["answer_required_total"] == row["answer_required_answered"]
+                    and "rtk_grep" in row["command_tools"]
+                )
+            ),
+            "open_investigation_answer_obligation_complete_count": sum(
+                1
+                for row in open_readonly_rows
+                if row["answer_required_total"] > 0 and row["answer_required_total"] == row["answer_required_answered"]
+            ),
         },
     }
 
@@ -210,6 +259,24 @@ def _promotion_evidence(summary: dict[str, Any]) -> dict[str, Any]:
             "runtime_backed_investigation",
             bool(readonly.get("count")) and readonly.get("audit_ok_count", 0) == readonly.get("count", 0),
             f"eligible_read_only_count={readonly.get('count', 0)} audit_ok={readonly.get('audit_ok_count', 0)} legacy_or_incomplete={legacy}",
+        ),
+        "open_investigation_runtime": claim(
+            "open_investigation_runtime",
+            bool(readonly.get("open_investigation_count"))
+            and readonly.get("open_investigation_audit_ok_count", 0) == readonly.get("open_investigation_count", 0)
+            and readonly.get("open_investigation_runtime_finalized_count", 0) == 0
+            and readonly.get("open_investigation_search_backed_count", 0) >= 1
+            and readonly.get("open_investigation_phaseful_count", 0) == readonly.get("open_investigation_count", 0),
+            (
+                f"open_investigation_count={readonly.get('open_investigation_count', 0)} "
+                f"audit_ok={readonly.get('open_investigation_audit_ok_count', 0)} "
+                f"productive={readonly.get('open_investigation_productive_count', 0)} "
+                f"runtime_finalized={readonly.get('open_investigation_runtime_finalized_count', 0)} "
+                f"runtime_answer_graph_closed={readonly.get('open_investigation_runtime_answer_graph_closed_count', 0)} "
+                f"search_backed={readonly.get('open_investigation_search_backed_count', 0)} "
+                f"phaseful={readonly.get('open_investigation_phaseful_count', 0)} "
+                f"obligation_complete={readonly.get('open_investigation_answer_obligation_complete_count', 0)}"
+            ),
         ),
         "bounded_implementation": claim(
             "bounded_implementation",
@@ -241,5 +308,8 @@ def _read_json_if_exists(path: str) -> Any:
         return None
     import json
 
-    with open(path, "r", encoding="utf-8") as handle:
-        return json.load(handle)
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return None
