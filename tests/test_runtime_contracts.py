@@ -31,6 +31,7 @@ from codex_oss.runtime.loop import (
 from codex_oss.runtime.policy import detect_critical_finality, is_broad_root
 from codex_oss.runtime.objectives import classify_objective, synthesize_objective_finding
 from codex_oss.validation import validate_report
+from codex_oss.runtime.policy import acquire_mission_slot, release_mission_slot
 
 
 def mission(**overrides):
@@ -109,6 +110,62 @@ def assert_model_text_extraction_handles_provider_variants():
     ]
     for response in variants:
         assert _extract_model_text(response) == text, response
+
+
+def assert_deterministic_fast_path_handles_single_file_function_location_without_model_call():
+    body = {
+        "input": [
+            {
+                "role": "user",
+                "content": (
+                    "<OSS_HANDOFF_JSON>\n"
+                    '{"schema_version":"oss_agent_mission.v1","mission_id":"mission_fast_path_test",'
+                    '"tier":"A3","mode":"managed_investigation","objective":"Locate certify_project.",'
+                    '"risk_tier":"low","write_allowed":false,"allowed_roots":[],"allowed_paths":["codex_oss/certify.py"],'
+                    '"tool_budget":3,"time_budget_seconds":30,"allowed_tool_classes":["read"],'
+                    '"stop_conditions":["valid_report"],"report_schema":"managed_investigation_report.v1",'
+                    '"required_outputs":["files_inspected","commands_run","findings","uncertainties","confidence","caveats","escalation_recommendation"],'
+                    '"objective_spec":{"schema_version":"objective_spec.v1","objective_type":"function_location","target":{"symbol":"certify_project"},'
+                    '"required_outputs":["file_path","function_definition"],"required_evidence_shapes":["function_definition"],'
+                    '"completion_criteria":["function_definition_present"]}}'
+                    "\n</OSS_HANDOFF_JSON>"
+                ),
+            }
+        ]
+    }
+
+    def should_not_call_model(payload, timeout):
+        raise AssertionError("deterministic fast path should not call the model")
+
+    result = run_managed_mission_from_body(
+        body,
+        "mission-a3-kimi",
+        lambda *args, **kwargs: None,
+        should_not_call_model,
+        lambda model: model,
+        request_deadline=30,
+    )
+    assert result.handled, result
+    assert result.status == "COMPLETE", result
+    assert "deterministic_fast_path" in result.report_text, result.report_text
+    assert "certify_project" in result.report_text, result.report_text
+
+
+def assert_read_pool_scheduler_allows_multiple_low_risk_missions():
+    missions = [
+        mission(mission_id="slot_read_1", allowed_roots=[], allowed_paths=["README.md"]),
+        mission(mission_id="slot_read_2", allowed_roots=[], allowed_paths=["README.md"]),
+        mission(mission_id="slot_read_3", allowed_roots=[], allowed_paths=["README.md"]),
+    ]
+    acquired_ids = []
+    try:
+        for item in missions:
+            acquired, reason = acquire_mission_slot(item)
+            assert acquired, reason
+            acquired_ids.append(item.mission_id)
+    finally:
+        for mission_id in acquired_ids:
+            release_mission_slot(mission_id)
 
 
 def assert_mission_requires_scope_and_tool_contract():
@@ -1998,24 +2055,94 @@ def assert_concurrency_policy_serializes_with_small_queue():
     from codex_oss.runtime import policy
 
     with policy._active_missions_lock:
-        policy._active_missions.clear()
-        policy._waiting_missions = 0
+        policy._mission_lane_by_id.clear()
+        for lane in list(policy._active_missions_by_lane):
+            policy._active_missions_by_lane[lane].clear()
+            policy._waiting_missions_by_lane[lane] = 0
 
-    acquired, reason = policy.acquire_mission_slot("mission_first")
+    first = mission(mission_id="mission_first", allowed_roots=[], allowed_paths=["README.md"])
+    second = mission(mission_id="mission_second", allowed_roots=[], allowed_paths=["README.md"])
+
+    acquired, reason = policy.acquire_mission_slot(first)
     assert acquired, reason
     result = {}
 
     def acquire_second():
-        result["value"] = policy.acquire_mission_slot("mission_second")
+        result["value"] = policy.acquire_mission_slot(second)
+
+    thread = threading.Thread(target=acquire_second)
+    thread.start()
+    thread.join(timeout=0.5)
+    assert result.get("value", (False, "missing"))[0] is True, result
+    policy.release_mission_slot("mission_first")
+    policy.release_mission_slot("mission_second")
+
+
+def assert_workspace_apply_scheduler_stays_serialized():
+    from codex_oss.runtime import policy
+
+    with policy._active_missions_lock:
+        policy._mission_lane_by_id.clear()
+        for lane in list(policy._active_missions_by_lane):
+            policy._active_missions_by_lane[lane].clear()
+            policy._waiting_missions_by_lane[lane] = 0
+
+    first = mission(
+        mission_id="mission_workspace_first",
+        tier="A5",
+        mode="bounded_implementation",
+        write_allowed=True,
+        allowed_roots=[],
+        allowed_paths=["tests/test_config.py"],
+        owned_paths=["tests/test_config.py"],
+        read_only_paths=["tests/test_config.py"],
+        apply_mode="workspace_low_risk",
+        verification_policy={"allowed_commands": [], "max_commands": 0, "timeout_seconds": 10},
+        objective_spec={
+            "schema_version": "objective_spec.v1",
+            "objective_type": "implementation_test_only",
+            "target": {"test_file": "tests/test_config.py", "required_test_names": ["test_example"], "source_files": []},
+            "required_outputs": ["changed_test_file"],
+            "required_evidence_shapes": ["test_definition"],
+            "completion_criteria": ["required_test_present"],
+        },
+    )
+    second = mission(
+        mission_id="mission_workspace_second",
+        tier="A5",
+        mode="bounded_implementation",
+        write_allowed=True,
+        allowed_roots=[],
+        allowed_paths=["tests/test_config.py"],
+        owned_paths=["tests/test_config.py"],
+        read_only_paths=["tests/test_config.py"],
+        apply_mode="workspace_low_risk",
+        verification_policy={"allowed_commands": [], "max_commands": 0, "timeout_seconds": 10},
+        objective_spec={
+            "schema_version": "objective_spec.v1",
+            "objective_type": "implementation_test_only",
+            "target": {"test_file": "tests/test_config.py", "required_test_names": ["test_example"], "source_files": []},
+            "required_outputs": ["changed_test_file"],
+            "required_evidence_shapes": ["test_definition"],
+            "completion_criteria": ["required_test_present"],
+        },
+    )
+
+    acquired, reason = policy.acquire_mission_slot(first)
+    assert acquired, reason
+    result = {}
+
+    def acquire_second():
+        result["value"] = policy.acquire_mission_slot(second)
 
     thread = threading.Thread(target=acquire_second)
     thread.start()
     time.sleep(0.2)
     assert "value" not in result, result
-    policy.release_mission_slot("mission_first")
+    policy.release_mission_slot("mission_workspace_first")
     thread.join(timeout=2)
     assert result.get("value", (False, "missing"))[0] is True, result
-    policy.release_mission_slot("mission_second")
+    policy.release_mission_slot("mission_workspace_second")
 
 
 def assert_adaptive_autonomy_budget_redirects_excess_broad_searches():
@@ -2623,6 +2750,8 @@ def assert_health_exposes_source_identity():
 def main():
     assert_run_loop_accepts_valid_final_report()
     assert_model_text_extraction_handles_provider_variants()
+    assert_deterministic_fast_path_handles_single_file_function_location_without_model_call()
+    assert_read_pool_scheduler_allows_multiple_low_risk_missions()
     assert_mission_requires_scope_and_tool_contract()
     assert_path_policy_blocks_empty_scope_and_denied_symlink()
     assert_broad_roots_are_exactly_broad()
@@ -2662,6 +2791,7 @@ def main():
     assert_deterministic_finalizer_can_complete_explicit_rtk_grep_function_location()
     assert_model_reports_are_annotated_with_runtime_provenance()
     assert_concurrency_policy_serializes_with_small_queue()
+    assert_workspace_apply_scheduler_stays_serialized()
     assert_adaptive_autonomy_budget_redirects_excess_broad_searches()
     assert_adaptive_autonomy_budget_allows_post_evidence_verification_with_rationale()
     assert_complete_alias_report_must_name_mapped_model()

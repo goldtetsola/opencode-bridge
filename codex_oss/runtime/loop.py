@@ -132,6 +132,7 @@ def run_loop(mission: Any, ledger: Any, call_model_fn, tools, emitter,
         critical_read_allowed_for_path, objective_coverage_errors,
     )
     from codex_oss.runtime.autonomy import assess_action_progress
+    from codex_oss.decision_trace import append_decision
 
     start = _time.time()
     deadline = DeadlinePolicy(request_deadline=request_deadline)
@@ -140,24 +141,69 @@ def run_loop(mission: Any, ledger: Any, call_model_fn, tools, emitter,
     forced_final_requested = False
 
     # Concurrency
-    acquired, slot_reason = acquire_mission_slot(mission.mission_id)
+    acquired, slot_reason = acquire_mission_slot(mission)
     if not acquired:
+        append_decision(
+            mission,
+            decision_type="scheduler",
+            result="rejected",
+            policy="ConcurrencyPolicyV1",
+            reason=slot_reason,
+            source_module="codex_oss/runtime/policy.py",
+            input_payload={"tier": getattr(mission, "tier", ""), "apply_mode": getattr(mission, "apply_mode", "")},
+        )
         report = _partial(mission, ledger, f"capacity_timeout:{slot_reason}", deadline)["report"]
         report["status"] = "FAILED"
         return {"status": "FAILED", "reason": f"concurrency: {slot_reason}", "report": report}
+    append_decision(
+        mission,
+        decision_type="scheduler",
+        result="accepted",
+        policy="ConcurrencyPolicyV1",
+        reason="mission acquired a scheduler slot",
+        source_module="codex_oss/runtime/policy.py",
+        input_payload={"tier": getattr(mission, "tier", ""), "apply_mode": getattr(mission, "apply_mode", "")},
+    )
 
     try:
         # Risk tier check
         allowed, risk_reason = risk_tier_allows_autonomy(mission.risk_tier, mission.tier)
         if not allowed:
+            append_decision(
+                mission,
+                decision_type="risk_tier",
+                result="rejected",
+                policy="RiskTierPolicyV1",
+                reason=risk_reason,
+                source_module="codex_oss/runtime/policy.py",
+                input_payload={"risk_tier": mission.risk_tier, "tier": mission.tier},
+            )
             return {"status": "ESCALATE", "reason": risk_reason,
                     "report": _partial_dict(mission, ledger, risk_reason)}
 
         # Broad scope check
         scope_error = validate_broad_scope(mission)
         if scope_error:
+            append_decision(
+                mission,
+                decision_type="scope_validation",
+                result="rejected",
+                policy="BroadScopePolicyV1",
+                reason=scope_error,
+                source_module="codex_oss/runtime/policy.py",
+                input_payload={"allowed_roots": list(getattr(mission, "allowed_roots", []) or [])},
+            )
             return {"status": "ESCALATE", "reason": scope_error,
                     "report": _partial_dict(mission, ledger, scope_error)}
+        append_decision(
+            mission,
+            decision_type="scope_validation",
+            result="accepted",
+            policy="BroadScopePolicyV1",
+            reason="mission scope passed broad-root validation",
+            source_module="codex_oss/runtime/policy.py",
+            input_payload={"allowed_roots": list(getattr(mission, "allowed_roots", []) or []), "allowed_paths": list(getattr(mission, "allowed_paths", []) or [])},
+        )
 
         # Build initial context — no native tools for A2/A3
         if model_call_uses_internal_tools_only(mission.tier):

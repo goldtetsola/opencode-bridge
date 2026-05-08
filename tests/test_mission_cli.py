@@ -138,6 +138,27 @@ def assert_compile_outputs_strict_implementation_mission():
     assert mission["verification_policy"]["allowed_commands"] == [["python3", "-m", "py_compile", "tests/test_config.py"]]
 
 
+def assert_compile_can_emit_canonical_handoff_wrapper():
+    result = run_cmd([
+        "mission", "compile",
+        "--mission-id", "mission_cli_handoff",
+        "--objective", "Locate certify_project.",
+        "--tier", "A3",
+        "--allowed-path", "codex_oss/certify.py",
+        "--objective-type", "function_location",
+        "--target-symbol", "certify_project",
+        "--handoff",
+    ])
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.startswith("<OSS_HANDOFF_JSON>\n"), result.stdout
+    assert result.stdout.strip().endswith("</OSS_HANDOFF_JSON>"), result.stdout
+    mission_text = result.stdout.split("\n", 1)[1].rsplit("\n</OSS_HANDOFF_JSON>", 1)[0]
+    mission = json.loads(mission_text)
+    assert mission["mission_id"] == "mission_cli_handoff", mission
+    assert mission["objective_spec"]["objective_type"] == "function_location", mission
+    assert mission["objective_spec"]["target"]["symbol"] == "certify_project", mission
+
+
 def assert_compile_outputs_critical_workspace_certified_mission():
     result = run_cmd([
         "mission", "compile",
@@ -636,10 +657,35 @@ def assert_certify_reports_runtime_backed_and_raw_statuses():
         assert raw_payload["gates"]["raw_lane_supported"]["ok"] is False, raw_payload
 
 
+def assert_explain_reads_decision_trace_artifact():
+    with tempfile.TemporaryDirectory(prefix="oss_cli_explain_") as root:
+        mission_dir = Path(root) / ".codex-oss" / "missions" / "mission_explain_test"
+        mission_dir.mkdir(parents=True, exist_ok=True)
+        (mission_dir / "decision_trace.json").write_text(json.dumps({
+            "decision_trace_version": "1.0",
+            "mission_id": "mission_explain_test",
+            "decisions": [
+                {
+                    "decision_type": "scope_validation",
+                    "result": "accepted",
+                    "policy": "BroadScopePolicyV1",
+                    "reason": "narrow allowed_path",
+                    "source_module": "codex_oss/runtime/policy.py",
+                }
+            ],
+        }, indent=2), encoding="utf-8")
+        result = run_cmd(["explain", "mission_explain_test", "--project", root, "--json"], cwd=root)
+        assert result.returncode == 0, result.stdout + result.stderr
+        payload = json.loads(result.stdout)
+        assert payload["mission_id"] == "mission_explain_test", payload
+        assert payload["decisions"][0]["decision_type"] == "scope_validation", payload
+
+
 def main() -> int:
     assert_template_requires_scope()
     assert_template_outputs_mission_v1()
     assert_compile_outputs_strict_implementation_mission()
+    assert_compile_can_emit_canonical_handoff_wrapper()
     assert_compile_outputs_critical_workspace_certified_mission()
     assert_run_posts_mission_to_runtime_bridge()
     assert_audit_mission_reports_runtime_artifacts()
@@ -651,6 +697,7 @@ def main() -> int:
     assert_raw_claim_status_is_fail_closed()
     assert_raw_probe_runner_records_artifacts()
     assert_certify_reports_runtime_backed_and_raw_statuses()
+    assert_explain_reads_decision_trace_artifact()
     print("PASS: MissionV1 CLI delegation suite")
     return 0
 

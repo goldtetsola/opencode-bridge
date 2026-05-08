@@ -16,6 +16,10 @@ def compile_mission_v1(
     owned_paths: list[str],
     read_only_paths: list[str],
     objective_type: str,
+    target_symbol: str,
+    target_key: str,
+    target_pattern: str,
+    required_values: list[str],
     required_test_names: list[str],
     required_changed_files: list[str],
     required_source_files: list[str],
@@ -96,6 +100,10 @@ def compile_mission_v1(
     if objective_type:
         mission["objective_spec"] = _objective_spec(
             objective_type=objective_type,
+            target_symbol=target_symbol,
+            target_key=target_key,
+            target_pattern=target_pattern,
+            required_values=required_values,
             required_test_names=required_test_names,
             required_changed_files=required_changed_files,
             required_source_files=required_source_files,
@@ -105,15 +113,57 @@ def compile_mission_v1(
     return mission
 
 
+def compile_handoff_v1(mission: dict[str, Any]) -> str:
+    import json
+
+    return "<OSS_HANDOFF_JSON>\n" + json.dumps(mission, indent=2, sort_keys=True) + "\n</OSS_HANDOFF_JSON>\n"
+
+
 def _objective_spec(
     *,
     objective_type: str,
+    target_symbol: str,
+    target_key: str,
+    target_pattern: str,
+    required_values: list[str],
     required_test_names: list[str],
     required_changed_files: list[str],
     required_source_files: list[str],
     required_test_files: list[str],
     required_symbols: list[str],
 ) -> dict[str, Any]:
+    if objective_type == "mapping_lookup":
+        key = target_key or target_symbol or (required_symbols[0] if required_symbols else "")
+        return {
+            "schema_version": "objective_spec.v1",
+            "objective_type": "mapping_lookup",
+            "target": {"key": key},
+            "required_outputs": ["mapped_value", "mapping_file"],
+            "required_evidence_shapes": ["mapping_assignment"],
+            "completion_criteria": ["key_value_mapping_present"],
+        }
+    if objective_type == "config_value_extraction":
+        key = target_key or ""
+        symbol = target_symbol or ""
+        return {
+            "schema_version": "objective_spec.v1",
+            "objective_type": "config_value_extraction",
+            "target": {"key": key, "symbol": symbol},
+            "required_outputs": ["file_path"] + list(required_values),
+            "required_evidence_shapes": ["dictionary_entry", "literal_value"],
+            "required_values": list(required_values),
+            "completion_criteria": ["required_values_present"],
+        }
+    if objective_type == "zero_match_evidence":
+        pattern = target_pattern or target_symbol or target_key
+        return {
+            "schema_version": "objective_spec.v1",
+            "objective_type": "zero_match_evidence",
+            "target": {"pattern": pattern},
+            "required_outputs": ["searched_paths", "zero_match_result"],
+            "required_evidence_shapes": ["grep_zero_match"],
+            "completion_criteria": ["grep_executed", "matches_count_zero"],
+        }
     if objective_type == "implementation_test_only":
         test_file = required_test_files[0] if required_test_files else (required_changed_files[0] if required_changed_files else "")
         return {
@@ -157,7 +207,7 @@ def _objective_spec(
             "completion_criteria": ["required_symbols_present", "verification_required"],
         }
     if objective_type == "function_location":
-        symbol = required_symbols[0] if required_symbols else ""
+        symbol = target_symbol or (required_symbols[0] if required_symbols else "")
         return {
             "schema_version": "objective_spec.v1",
             "objective_type": "function_location",

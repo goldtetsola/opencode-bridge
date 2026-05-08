@@ -12,11 +12,18 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict
 
+from codex_oss.decision_trace import append_decision, write_decision_trace
+from codex_oss.fast_path import run_deterministic_fast_path
 from codex_oss.implementation import run_implementation_mission
 from codex_oss.ledger import EvidenceLedger
 from codex_oss.mission import InvalidHandoffError, _build_mission
 from codex_oss.runtime.loop import run_loop
-from codex_oss.runtime.policy import build_deterministic_partial_report, extract_single_handoff_block
+from codex_oss.runtime.policy import (
+    acquire_mission_slot,
+    build_deterministic_partial_report,
+    extract_single_handoff_block,
+    release_mission_slot,
+)
 from codex_oss.validation import render_report
 
 JSON = Dict[str, Any]
@@ -139,7 +146,17 @@ def run_managed_mission_from_body(
         raw = json.loads(mission_block)
         mission = _build_mission(raw)
         mission_id = mission.mission_id
+        mission.decision_trace = []
         mission.runtime_model_alias = raw_model_alias
+        append_decision(
+            mission,
+            decision_type="entry_validation",
+            result="accepted",
+            policy="EntryPointExtractionPolicyV1",
+            reason="MissionV1 handoff parsed and validated",
+            source_module="codex_oss/managed_bridge.py",
+            input_payload={"tier": mission.tier, "mode": mission.mode, "runtime_alias": raw_model_alias},
+        )
         effective_deadline = _managed_runtime_deadline(mission, request_deadline)
         _apply_runtime_autonomy_profile(mission, raw_model_alias, effective_deadline)
         log_fn("mission_dispatch", tier=mission.tier, mode=mission.mode, mission_id=mission.mission_id)
@@ -202,19 +219,71 @@ def run_managed_mission_from_body(
             raise RuntimeError("no runtime reasoning model candidates")
 
         if mission.tier in ("A4", "A5", "A6"):
-            result = run_implementation_mission(
-                mission=mission,
-                raw_model_alias=raw_model_alias,
-                handoff=handoff,
-                call_model=call_model,
-                timeout=effective_deadline,
-                project_root=os.getcwd(),
+            acquired, slot_reason = acquire_mission_slot(mission)
+            if not acquired:
+                append_decision(
+                    mission,
+                    decision_type="scheduler",
+                    result="rejected",
+                    policy="ConcurrencyPolicyV1",
+                    reason=slot_reason,
+                    source_module="codex_oss/runtime/policy.py",
+                    input_payload={"tier": mission.tier, "apply_mode": getattr(mission, "apply_mode", "")},
+                )
+                report = build_deterministic_partial_report(mission, ledger, f"capacity_timeout:{slot_reason}")
+                report["status"] = "FAILED"
+                return ManagedMissionResult(
+                    handled=True,
+                    status="FAILED",
+                    mission_id=mission.mission_id,
+                    report_text=render_report(report),
+                )
+            append_decision(
+                mission,
+                decision_type="scheduler",
+                result="accepted",
+                policy="ConcurrencyPolicyV1",
+                reason="mission acquired a scheduler slot",
+                source_module="codex_oss/runtime/policy.py",
+                input_payload={"tier": mission.tier, "apply_mode": getattr(mission, "apply_mode", "")},
             )
+            try:
+                result = run_implementation_mission(
+                    mission=mission,
+                    raw_model_alias=raw_model_alias,
+                    handoff=handoff,
+                    call_model=call_model,
+                    timeout=effective_deadline,
+                    project_root=os.getcwd(),
+                )
+            finally:
+                release_mission_slot(mission.mission_id)
             return ManagedMissionResult(
                 handled=True,
                 status=str(result.get("status", "FAILED")),
                 mission_id=mission.mission_id,
                 report_text=str(result.get("text", "")),
+            )
+
+        fast_path_result = run_deterministic_fast_path(mission, ledger)
+        if fast_path_result is not None:
+            append_decision(
+                mission,
+                decision_type="fast_path",
+                result="used",
+                policy="DeterministicFastPathV1",
+                reason=f"Objective satisfied by deterministic {fast_path_result.get('fast_path', 'fast_path')}",
+                source_module="codex_oss/fast_path.py",
+                input_payload={"objective_type": fast_path_result.get("fast_path", "")},
+            )
+            report = fast_path_result.get("report", {})
+            if isinstance(report, dict):
+                _write_readonly_mission_artifacts(mission, ledger, report, str(fast_path_result.get("status", "PARTIAL")))
+            return ManagedMissionResult(
+                handled=True,
+                status=str(fast_path_result.get("status", "PARTIAL")),
+                mission_id=mission.mission_id,
+                report_text=render_report(report),
             )
 
         result = run_loop(
@@ -294,6 +363,7 @@ def _write_readonly_mission_artifacts(mission: Any, ledger: Any, report: dict, s
     mission_id = str(getattr(mission, "mission_id", "mission_unknown"))
     artifact_dir = os.path.join(root, ".codex-oss", "missions", mission_id)
     os.makedirs(artifact_dir, exist_ok=True)
+    write_decision_trace(root, mission_id, mission)
 
     mission_payload = {
         "mission_id": mission_id,

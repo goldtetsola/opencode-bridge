@@ -19,6 +19,7 @@ import copy
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
+from codex_oss.decision_trace import append_decision, write_decision_trace
 from codex_oss.runtime import resolve_path
 from codex_oss.runtime.loop import _extract_model_text
 from codex_oss.runtime.policy import is_critical_path, scan_secrets
@@ -48,6 +49,15 @@ def run_implementation_mission(
     """Run A4/A5 patch-mediated implementation without raw write tools."""
     mission.runtime_model_alias = raw_model_alias
     mission.model_repair_count = 0
+    append_decision(
+        mission,
+        decision_type="implementation_entry",
+        result="accepted",
+        policy="ImplementationMissionV1",
+        reason="Implementation mission entered the patch-mediated runtime lane",
+        source_module="codex_oss/implementation.py",
+        input_payload={"tier": getattr(mission, "tier", ""), "apply_mode": getattr(mission, "apply_mode", "")},
+    )
     _write_mission_artifact(mission, project_root)
     proposal, parse_error = _proposal_from_handoff(handoff)
     if proposal is None:
@@ -222,6 +232,8 @@ def _persist_implementation_runtime_artifacts(
     certification: JSON | None = None,
 ) -> None:
     _write_json(os.path.join(artifact_dir, "report.json"), report)
+    project_root = os.path.dirname(os.path.dirname(os.path.dirname(artifact_dir)))
+    write_decision_trace(project_root, getattr(mission, "mission_id", "mission_unknown"), mission)
     _write_json(
         os.path.join(artifact_dir, "ledger.json"),
         _implementation_ledger(mission, proposal, validation, verification, report, certification),

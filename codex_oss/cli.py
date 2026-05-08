@@ -13,7 +13,8 @@ from .audit import audit_mission
 from .certify import certify_project
 from .legacy import archive_legacy_missions
 from .metrics import broad_low_risk_runtime_status, summarize_missions
-from .mission_compiler import compile_mission_v1
+from .mission_compiler import compile_handoff_v1, compile_mission_v1
+from .decision_trace import read_decision_trace
 from .proofs import refresh_claim_proofs
 from .raw_lane import run_raw_probe, summarize_raw_probes
 
@@ -83,6 +84,10 @@ def main():
     mc.add_argument("--owned-path", action="append", default=[])
     mc.add_argument("--read-only-path", action="append", default=[])
     mc.add_argument("--objective-type", default="")
+    mc.add_argument("--target-symbol", default="")
+    mc.add_argument("--target-key", default="")
+    mc.add_argument("--target-pattern", default="")
+    mc.add_argument("--required-value", action="append", default=[])
     mc.add_argument("--required-test-name", action="append", default=[])
     mc.add_argument("--required-changed-file", action="append", default=[])
     mc.add_argument("--required-source-file", action="append", default=[])
@@ -105,6 +110,7 @@ def main():
     mc.add_argument("--critical-path-reason", default=None)
     mc.add_argument("--critical-path-write-allowed", action="store_true")
     mc.add_argument("--allow-broad-read-scope", action="store_true")
+    mc.add_argument("--handoff", action="store_true", help="Emit canonical <OSS_HANDOFF_JSON> wrapper instead of raw mission JSON")
 
     mr = mission_sub.add_parser("run", help="Run a MissionV1 through the local OSS Agent Runtime bridge")
     mr.add_argument("file", help="Mission JSON file, handoff file containing <OSS_HANDOFF_JSON>, or '-' for stdin")
@@ -119,6 +125,11 @@ def main():
     audit.add_argument("mission_id", help="Mission id to audit")
     audit.add_argument("--project", type=str, default=None, help="Project root path")
     audit.add_argument("--json", action="store_true", help="Machine-readable output")
+
+    explain = sub.add_parser("explain", help="Explain mission policy/runtime decisions from the decision trace artifact")
+    explain.add_argument("mission_id", help="Mission id to explain")
+    explain.add_argument("--project", type=str, default=None, help="Project root path")
+    explain.add_argument("--json", action="store_true", help="Machine-readable output")
 
     metrics = sub.add_parser("mission-metrics", help="Summarize runtime mission artifacts and claim-supporting evidence")
     metrics.add_argument("--project", type=str, default=None, help="Project root path")
@@ -231,6 +242,23 @@ def main():
                 status = "PASS" if item.get("ok") else "FAIL"
                 print(f"- {status} {item.get('name')}: {item.get('message')}")
         sys.exit(0 if report.get("ok") else 1)
+
+    elif args.command == "explain":
+        project_root = args.project or os.getcwd()
+        trace = read_decision_trace(project_root, args.mission_id)
+        if trace is None:
+            print(f"Decision trace missing for mission {args.mission_id}", file=sys.stderr)
+            sys.exit(1)
+        if args.json:
+            print(json_dumps_safe(trace))
+        else:
+            print(f"Mission: {args.mission_id}")
+            for idx, item in enumerate(trace.get("decisions", []) or [], start=1):
+                print(f"{idx}. {item.get('decision_type')} -> {item.get('result')}")
+                print(f"   policy: {item.get('policy')}")
+                print(f"   reason: {item.get('reason')}")
+                print(f"   source: {item.get('source_module')}")
+        sys.exit(0)
 
     elif args.command == "mission-metrics":
         project_root = args.project or os.getcwd()
@@ -557,6 +585,10 @@ def _mission_compile(args) -> int:
             owned_paths=owned_paths,
             read_only_paths=read_only_paths,
             objective_type=args.objective_type,
+            target_symbol=args.target_symbol,
+            target_key=args.target_key,
+            target_pattern=args.target_pattern,
+            required_values=args.required_value or [],
             required_test_names=args.required_test_name or [],
             required_changed_files=args.required_changed_file or [],
             required_source_files=args.required_source_file or [],
@@ -585,7 +617,10 @@ def _mission_compile(args) -> int:
     except ValueError as exc:
         print(f"Mission compile failed: {exc}", file=sys.stderr)
         return 1
-    print(json.dumps(mission, indent=2))
+    if args.handoff:
+        print(compile_handoff_v1(mission), end="")
+    else:
+        print(json.dumps(mission, indent=2))
     return 0
 
 

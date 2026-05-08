@@ -297,56 +297,96 @@ RESPONSE_TTL_SECONDS = 86400
 # ConcurrencyPolicyV1
 # ═════════════════════════════════════════════
 
-GLOBAL_MAX_ACTIVE_MISSIONS = 1
-GLOBAL_MAX_ACTIVE_A3_MISSIONS = GLOBAL_MAX_ACTIVE_MISSIONS
-A3_QUEUE_MAX = 2
-A3_QUEUE_TIMEOUT_SECONDS = 5
+LANE_CAPACITY = {
+    "read_pool": 3,
+    "patch_pool": 2,
+    "isolated_apply": 1,
+    "workspace_apply": 1,
+    "critical_lane": 1,
+}
+LANE_QUEUE_MAX = {
+    "read_pool": 4,
+    "patch_pool": 2,
+    "isolated_apply": 1,
+    "workspace_apply": 1,
+    "critical_lane": 1,
+}
+LANE_QUEUE_TIMEOUT_SECONDS = {
+    "read_pool": 15,
+    "patch_pool": 10,
+    "isolated_apply": 10,
+    "workspace_apply": 5,
+    "critical_lane": 5,
+}
 MISSION_SLOT_STALE_SECONDS = float(os.getenv("MISSION_SLOT_STALE_SECONDS", "120"))
 
-_active_missions: Dict[str, float] = {}
+_active_missions_by_lane: Dict[str, Dict[str, float]] = {lane: {} for lane in LANE_CAPACITY}
+_mission_lane_by_id: Dict[str, str] = {}
 _active_missions_lock = threading.Lock()
-_waiting_missions = 0
+_waiting_missions_by_lane: Dict[str, int] = {lane: 0 for lane in LANE_CAPACITY}
 
 
-def acquire_mission_slot(mission_id: str) -> Tuple[bool, str]:
+def _mission_lane(mission: Any) -> str:
+    tier = str(getattr(mission, "tier", "") or "")
+    apply_mode = str(getattr(mission, "apply_mode", "") or "")
+    if tier in {"A2", "A3"}:
+        return "read_pool"
+    if tier == "A4":
+        return "patch_pool"
+    if tier == "A5" and apply_mode in {"workspace", "workspace_low_risk", "workspace_explicit"}:
+        return "workspace_apply"
+    if tier == "A6" or apply_mode == "critical_workspace_certified":
+        return "critical_lane"
+    return "isolated_apply"
+
+
+def acquire_mission_slot(mission: Any) -> Tuple[bool, str]:
     """Try to acquire a concurrency slot. Returns (acquired, reason)."""
-    global _active_missions, _waiting_missions
-    deadline = time.time() + A3_QUEUE_TIMEOUT_SECONDS
+    global _active_missions_by_lane, _waiting_missions_by_lane, _mission_lane_by_id
+    mission_id = str(getattr(mission, "mission_id", "") or "unknown")
+    lane = _mission_lane(mission)
+    deadline = time.time() + float(LANE_QUEUE_TIMEOUT_SECONDS.get(lane, 5))
     registered_waiter = False
     try:
         while True:
             with _active_missions_lock:
                 # Clean stale slots
                 now = time.time()
-                _active_missions = {k: v for k, v in _active_missions.items() if now - v < MISSION_SLOT_STALE_SECONDS}
+                for current_lane, active in list(_active_missions_by_lane.items()):
+                    _active_missions_by_lane[current_lane] = {
+                        k: v for k, v in active.items() if now - v < MISSION_SLOT_STALE_SECONDS
+                    }
 
-                if len(_active_missions) < GLOBAL_MAX_ACTIVE_MISSIONS:
-                    _active_missions[mission_id] = now
+                if len(_active_missions_by_lane[lane]) < int(LANE_CAPACITY.get(lane, 1)):
+                    _active_missions_by_lane[lane][mission_id] = now
+                    _mission_lane_by_id[mission_id] = lane
                     if registered_waiter:
-                        _waiting_missions = max(0, _waiting_missions - 1)
+                        _waiting_missions_by_lane[lane] = max(0, _waiting_missions_by_lane.get(lane, 0) - 1)
                     return True, ""
 
                 if not registered_waiter:
-                    if _waiting_missions >= A3_QUEUE_MAX:
-                        return False, f"mission queue limit reached ({A3_QUEUE_MAX})"
-                    _waiting_missions += 1
+                    if _waiting_missions_by_lane.get(lane, 0) >= int(LANE_QUEUE_MAX.get(lane, 1)):
+                        return False, f"{lane} queue limit reached ({LANE_QUEUE_MAX.get(lane, 1)})"
+                    _waiting_missions_by_lane[lane] = _waiting_missions_by_lane.get(lane, 0) + 1
                     registered_waiter = True
 
                 if now >= deadline:
-                    _waiting_missions = max(0, _waiting_missions - 1)
-                    return False, f"mission queue timeout after {A3_QUEUE_TIMEOUT_SECONDS}s"
+                    _waiting_missions_by_lane[lane] = max(0, _waiting_missions_by_lane.get(lane, 0) - 1)
+                    return False, f"{lane} queue timeout after {LANE_QUEUE_TIMEOUT_SECONDS.get(lane, 5)}s"
 
             time.sleep(0.1)
     except Exception:
         if registered_waiter:
             with _active_missions_lock:
-                _waiting_missions = max(0, _waiting_missions - 1)
+                _waiting_missions_by_lane[lane] = max(0, _waiting_missions_by_lane.get(lane, 0) - 1)
         raise
 
 
 def release_mission_slot(mission_id: str):
     with _active_missions_lock:
-        _active_missions.pop(mission_id, None)
+        lane = _mission_lane_by_id.pop(mission_id, "")
+        if lane:
+            _active_missions_by_lane.get(lane, {}).pop(mission_id, None)
 
 
 # ═════════════════════════════════════════════
