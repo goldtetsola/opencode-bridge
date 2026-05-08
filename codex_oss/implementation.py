@@ -21,6 +21,7 @@ from typing import Any, Callable, Optional
 
 from codex_oss.decision_trace import append_decision, write_decision_trace
 from codex_oss.implementation_graph import build_implementation_readiness_graph
+from codex_oss.implementation_coverage import build_implementation_coverage_graph
 from codex_oss.runtime import resolve_path
 from codex_oss.runtime.loop import _extract_model_text
 from codex_oss.runtime.policy import is_critical_path, scan_secrets
@@ -236,6 +237,9 @@ def _persist_implementation_runtime_artifacts(
     readiness_graph = validation.get("implementation_readiness_graph")
     if isinstance(readiness_graph, dict):
         _write_json(os.path.join(artifact_dir, "implementation_readiness_graph.json"), readiness_graph)
+    coverage_graph = validation.get("implementation_coverage_graph")
+    if isinstance(coverage_graph, dict):
+        _write_json(os.path.join(artifact_dir, "implementation_coverage_graph.json"), coverage_graph)
     project_root = os.path.dirname(os.path.dirname(os.path.dirname(artifact_dir)))
     if not isinstance(getattr(mission, "decision_trace", None), list):
         mission.decision_trace = []
@@ -1644,11 +1648,17 @@ def validate_patch_proposal(proposal: JSON, mission: Any, project_root: str) -> 
             reasons.append("patch does not apply cleanly")
 
     readiness_graph = build_implementation_readiness_graph(proposal, files, mission, checks)
+    coverage_graph = build_implementation_coverage_graph(proposal, files, mission, checks, readiness_graph)
     readiness_status = str((readiness_graph.get("coverage_status", {}) or {}).get("recommended_status", "") or "")
     readiness_reason = str((readiness_graph.get("coverage_status", {}) or {}).get("reason", "") or "")
     checks["implementation_readiness_ok"] = readiness_status == "VALID"
+    checks["implementation_coverage_ok"] = bool(coverage_graph.get("can_propose", False))
     if readiness_reason and readiness_status in {"INVALID", "ESCALATE"} and readiness_reason not in reasons:
         reasons.append(readiness_reason)
+    coverage_reasons = [m.get("reason", "") for m in (coverage_graph.get("missing_coverage", []) or []) if m.get("reason")]
+    for cr in coverage_reasons:
+        if cr and cr not in reasons:
+            reasons.append(cr)
 
     if checks["critical_paths_touched"] and not bool(getattr(mission, "critical_path_write_allowed", False)):
         status = "ESCALATE"
@@ -1674,7 +1684,9 @@ def validate_patch_proposal(proposal: JSON, mission: Any, project_root: str) -> 
         status = "VALID"
     else:
         status = "INVALID"
-    return _validation_report(status, checks, reasons, changed_paths, proposal, mission, readiness_graph)
+    if status == "VALID" and not checks["implementation_coverage_ok"] and _coverage_violation_is_critical(coverage_graph):
+        status = coverage_graph.get("recommended_status", "INVALID")
+    return _validation_report(status, checks, reasons, changed_paths, proposal, mission, readiness_graph, coverage_graph)
 
 
 def apply_patch_in_isolated_worktree(proposal: JSON, mission: Any, project_root: str) -> JSON:
@@ -2467,6 +2479,7 @@ def _validation_report(
     proposal: JSON | None = None,
     mission: Any | None = None,
     readiness_graph: JSON | None = None,
+    coverage_graph: JSON | None = None,
 ) -> JSON:
     proposal = proposal or {}
     proposal_source = str(proposal.get("proposal_source", "") or "raw_patch_proposal_v1")
@@ -2486,7 +2499,25 @@ def _validation_report(
         "changed_files": sorted(set(changed_paths)),
         "reasons": reasons,
         "implementation_readiness_graph": readiness_graph if isinstance(readiness_graph, dict) else {},
+        "implementation_coverage_graph": coverage_graph if isinstance(coverage_graph, dict) else {},
     }
+
+
+def _coverage_violation_is_critical(coverage_graph: JSON) -> bool:
+    """Coverage gaps only block validation when they are critical (risk, source, semantic)."""
+    if not isinstance(coverage_graph, dict):
+        return False
+    critical_violations = list(coverage_graph.get("critical_violations", []) or [])
+    category_statuses = coverage_graph.get("category_statuses", {}) or {}
+    if "semantic_quality" in critical_violations:
+        return True
+    if "risk_assessment" in critical_violations:
+        return True
+    if category_statuses.get("source_evidence") == "missing":
+        return True
+    if category_statuses.get("target_knowledge") == "missing":
+        return True
+    return False
 
 
 def _implementation_report(

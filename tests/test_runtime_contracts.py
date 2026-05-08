@@ -3567,6 +3567,208 @@ def assert_exploration_policy_contradiction_blocks_closure():
         assert result["status"] == "COMPLETE", result
 
 
+def assert_evidence_kind_satisfied_when_all_shapes_present():
+    with tempfile.TemporaryDirectory(dir=ROOT) as td:
+        from pathlib import Path
+
+        sample = Path(td) / "all_shapes_present.py"
+        sample.write_text("def find_target():\n    return 'found'\n\nclass Target:\n    pass\n\nMAPPING = {}\n", encoding="utf-8")
+        sample_rel = os.path.relpath(sample, ROOT)
+        m = mission(
+            mission_id="mission_evidence_kind_all_shapes",
+            objective="Investigate whether all required shapes exist in the source.",
+            objective_style="open_investigation",
+            allowed_roots=[],
+            allowed_paths=[sample_rel],
+            allowed_tool_classes=["read"],
+            tool_budget=4,
+            answer_obligations=[
+                {
+                    "id": "q1",
+                    "question": "Does the source contain all required evidence shapes?",
+                    "required": True,
+                    "source_hints": [sample_rel],
+                    "source_requirements": [{
+                        "path": sample_rel,
+                        "evidence_kind": "multi_shape_verification",
+                        "required": True,
+                        "prefetch": False,
+                        "required_shapes": ["function_definition", "class_definition", "mapping_assignment"],
+                    }],
+                }
+            ],
+            must_inspect=[sample_rel],
+        )
+        ledger = EvidenceLedger(mission_id=m.mission_id, tool_budget_remaining=m.tool_budget)
+        calls = {"n": 0}
+
+        def fake_model(messages, tools, timeout):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return {
+                    "choices": [{
+                        "message": {
+                            "content": (
+                                '{"action_type":"tool_call","phase":"NARROW","tool_name":"rtk_read",'
+                                f'"arguments":{{"path":"{sample_rel}"}},'
+                                '"reason":"Inspect the required file for all shapes.","hypothesis":"The file has function, class, and mapping.",'
+                                '"target_question":"Does the source contain all required evidence shapes?",'
+                                '"expected_information_gain":"Determine whether all three shapes exist.",'
+                                '"why_not_report_yet":"Need to inspect the file first."}'
+                            )
+                        }
+                    }]
+                }
+            if calls["n"] == 2:
+                return {
+                    "choices": [{
+                        "message": {
+                            "content": json.dumps({
+                                "action_type": "final_report",
+                                "report": {
+                                    "status": "COMPLETE",
+                                    "files_inspected": [{"path": sample_rel, "complete": True}],
+                                    "commands_run": [{"tool": "rtk_read", "args": {"path": sample_rel}}],
+                                    "findings": [{"claim": "The source contains function_definition, class_definition, and mapping_assignment.", "evidence_refs": ["file:" + sample_rel, "command:0"]}],
+                                    "uncertainties": [],
+                                    "confidence": "HIGH",
+                                    "caveats": ["all shapes present"],
+                                    "escalation_recommendation": "GPT-5.5 review",
+                                    "missing_fields": [],
+                                },
+                            })
+                        }
+                    }]
+                }
+            raise TimeoutError("simulated close timeout")
+
+        result = run_loop(m, ledger, fake_model, [], None, m.allowed_roots, m.allowed_paths, request_deadline=90)
+        assert result["status"] == "COMPLETE", f"All shapes present should yield COMPLETE, got {result['status']}"
+        insufficient = list(result.get("report", {}).get("insufficient_evidence_obligations", []) or [])
+        assert len(insufficient) == 0, f"Expected 0 insufficient obligations, got {insufficient}"
+
+
+def assert_evidence_kind_insufficient_when_some_shapes_missing():
+    with tempfile.TemporaryDirectory(dir=ROOT) as td:
+        from pathlib import Path
+
+        sample = Path(td) / "partial_shapes.py"
+        sample.write_text("def find_target():\n    return 'found'\n\nMAPPING = {}\n", encoding="utf-8")
+        sample_rel = os.path.relpath(sample, ROOT)
+        m = mission(
+            mission_id="mission_evidence_kind_partial_shapes",
+            objective="Investigate whether all required shapes exist, some are missing.",
+            objective_style="open_investigation",
+            allowed_roots=[],
+            allowed_paths=[sample_rel],
+            allowed_tool_classes=["read"],
+            tool_budget=4,
+            answer_obligations=[
+                {
+                    "id": "q1",
+                    "question": "Does the source contain all required evidence shapes?",
+                    "required": True,
+                    "source_hints": [sample_rel],
+                    "source_requirements": [{
+                        "path": sample_rel,
+                        "evidence_kind": "multi_shape_verification",
+                        "required": True,
+                        "prefetch": False,
+                        "required_shapes": ["function_definition", "class_definition", "mapping_assignment"],
+                    }],
+                }
+            ],
+            must_inspect=[sample_rel],
+        )
+        ledger = EvidenceLedger(mission_id=m.mission_id, tool_budget_remaining=m.tool_budget)
+        calls = {"n": 0}
+
+        def fake_model(messages, tools, timeout):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return {
+                    "choices": [{
+                        "message": {
+                            "content": (
+                                '{"action_type":"tool_call","phase":"NARROW","tool_name":"rtk_read",'
+                                f'"arguments":{{"path":"{sample_rel}"}},'
+                                '"reason":"Inspect the required file.","hypothesis":"The file may be missing some shapes.",'
+                                '"target_question":"Does the source contain all required evidence shapes?",'
+                                '"expected_information_gain":"Determine which shapes exist and which are missing.",'
+                                '"why_not_report_yet":"Need to inspect the file first."}'
+                            )
+                        }
+                    }]
+                }
+            raise TimeoutError("simulated close timeout")
+
+        result = run_loop(m, ledger, fake_model, [], None, m.allowed_roots, m.allowed_paths, request_deadline=30)
+        assert result["status"] == "PARTIAL", f"Missing class_definition should yield PARTIAL, got {result['status']}"
+        insufficient = list(result.get("report", {}).get("insufficient_evidence_obligations", []) or [])
+        assert "q1" in insufficient, f"Expected q1 in insufficient_evidence_obligations, got {insufficient}"
+
+
+def assert_evidence_kind_multiple_shapes_with_contradiction():
+    with tempfile.TemporaryDirectory(dir=ROOT) as td:
+        from pathlib import Path
+
+        sample = Path(td) / "shape_with_contradiction.py"
+        sample.write_text("def find_target():\n    return 'found'\n\nSECRET_OVERRIDE = True\n", encoding="utf-8")
+        sample_rel = os.path.relpath(sample, ROOT)
+        m = mission(
+            mission_id="mission_evidence_kind_shape_contradiction",
+            objective="Investigate shapes with contradiction markers.",
+            objective_style="open_investigation",
+            allowed_roots=[],
+            allowed_paths=[sample_rel],
+            allowed_tool_classes=["read"],
+            tool_budget=4,
+            answer_obligations=[
+                {
+                    "id": "q1",
+                    "question": "Does the source contain the required shape and is free of contradiction markers?",
+                    "required": True,
+                    "source_hints": [sample_rel],
+                    "source_requirements": [{
+                        "path": sample_rel,
+                        "evidence_kind": "shape_and_contradiction",
+                        "required": True,
+                        "prefetch": False,
+                        "required_shapes": ["function_definition"],
+                        "contradiction_markers": ["SECRET_OVERRIDE"],
+                    }],
+                }
+            ],
+            must_inspect=[sample_rel],
+        )
+        ledger = EvidenceLedger(mission_id=m.mission_id, tool_budget_remaining=m.tool_budget)
+        calls = {"n": 0}
+
+        def fake_model(messages, tools, timeout):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return {
+                    "choices": [{
+                        "message": {
+                            "content": (
+                                '{"action_type":"tool_call","phase":"NARROW","tool_name":"rtk_read",'
+                                f'"arguments":{{"path":"{sample_rel}"}},'
+                                '"reason":"Inspect the file for shapes and contradiction markers.","hypothesis":"The file may contain SECRET_OVERRIDE.",'
+                                '"target_question":"Does the source contain SECRET_OVERRIDE?",'
+                                '"expected_information_gain":"Determine whether contradiction blocks completion.",'
+                                '"why_not_report_yet":"Need to inspect the file first."}'
+                            )
+                        }
+                    }]
+                }
+            raise TimeoutError("simulated close timeout")
+
+        result = run_loop(m, ledger, fake_model, [], None, m.allowed_roots, m.allowed_paths, request_deadline=30)
+        assert result["status"] == "ESCALATE", f"Contradiction marker should yield ESCALATE, got {result['status']}"
+        contradicted = list(result.get("report", {}).get("contradicted_obligations", []) or [])
+        assert "q1" in contradicted, f"Expected q1 in contradicted_obligations, got {contradicted}"
+
+
 def main():
     assert_run_loop_accepts_valid_final_report()
     assert_model_text_extraction_handles_provider_variants()
@@ -3633,6 +3835,9 @@ def main():
     assert_exploration_policy_close_immediately_blocks_further_tool_calls()
     assert_exploration_policy_min_optional_redirects_early_complete()
     assert_exploration_policy_contradiction_blocks_closure()
+    assert_evidence_kind_satisfied_when_all_shapes_present()
+    assert_evidence_kind_insufficient_when_some_shapes_missing()
+    assert_evidence_kind_multiple_shapes_with_contradiction()
     print("PASS: runtime contract suite")
 
 

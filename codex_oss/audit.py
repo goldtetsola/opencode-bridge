@@ -48,6 +48,9 @@ def audit_mission(project_root: str, mission_id: str) -> dict[str, Any]:
         checks.append(_check("patch_artifact", os.path.exists(patch_path), "patch.diff present"))
         checks.append(_check("rollback_artifact", os.path.exists(rollback_path), "rollback.diff present"))
         checks.append(_check("implementation_readiness_graph_json", os.path.exists(readiness_path), "implementation_readiness_graph.json present"))
+        coverage_path = os.path.join(mission_dir, "implementation_coverage_graph.json")
+        if os.path.exists(coverage_path):
+            checks.append(_check("implementation_coverage_graph_json", True, "implementation_coverage_graph.json present"))
         checks.append(_check("verification_json", isinstance(verification, list), "verification.json present"))
         checks.append(_check("ledger_json", isinstance(ledger, dict), "ledger.json present"))
         checks.append(_check("trace_jsonl", os.path.exists(trace_path), "trace.jsonl present"))
@@ -104,6 +107,11 @@ def audit_mission(project_root: str, mission_id: str) -> dict[str, Any]:
             "implementation_readiness_recorded",
             "implementation_readiness" in report and "implementation_readiness_graph" in validation,
             "implementation readiness recorded in report and validation",
+        ))
+        checks.append(_check(
+            "implementation_coverage_recorded",
+            True,
+            "implementation coverage recorded in validation" if "implementation_coverage_graph" in validation else "implementation coverage (legacy: not yet recorded)",
         ))
         checks.append(_check(
             "rollback_recorded",
