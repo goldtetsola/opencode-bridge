@@ -41,6 +41,7 @@ def build_health_status(app: Any, bridge_version: str, bridge_path: str, start_t
         "source_sha256": source_sha,
         "project_root": project_root,
         "cwd": project_root,
+        "runtime_identity": _build_runtime_identity(project_root),
         "supervisor": {
             "mode": supervisor_mode,
             "durable": supervisor_mode != "",
@@ -58,6 +59,14 @@ def build_health_status(app: Any, bridge_version: str, bridge_path: str, start_t
             "stream_terminal_guarantee": True,
         },
     }
+
+
+def _build_runtime_identity(project_root: str) -> dict:
+    from codex_oss.runtime_manifest import runtime_identity as _identity
+    try:
+        return _identity(project_root)
+    except Exception:
+        return {"runtime_identity_version": "1.0", "error": "failed to compute runtime identity"}
 
 
 def sha256_file(path: str) -> str:

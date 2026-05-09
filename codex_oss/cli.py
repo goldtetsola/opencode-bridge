@@ -51,6 +51,11 @@ def main():
     # stop
     sub.add_parser("stop", help="Stop the bridge proxy")
 
+    # restart
+    r = sub.add_parser("restart", help="Restart the bridge proxy and verify freshness")
+    r.add_argument("--port", type=int, default=4000, help="Port (default: 4000)")
+    r.add_argument("--verify-fresh", action="store_true", default=True, help="Verify runtime freshness after restart (default: true)")
+
     # status
     sub.add_parser("status", help="Show bridge health")
 
@@ -235,6 +240,23 @@ def main():
 
     elif args.command == "stop":
         _stop_bridge(args.port if hasattr(args, 'port') else 4000)
+
+    elif args.command == "restart":
+        port = args.port if hasattr(args, 'port') else 4000
+        verify = getattr(args, 'verify_fresh', True)
+        _stop_bridge(port)
+        import time
+        time.sleep(1)
+        _start_bridge(port, "production")
+        if verify:
+            time.sleep(2)
+            from codex_oss.runtime_manifest import STARTUP_TREE_SHA256, compute_tree_sha256, _PROJECT_ROOT
+            fresh = STARTUP_TREE_SHA256 == compute_tree_sha256(_PROJECT_ROOT)
+            if fresh:
+                print(f"Bridge restarted on port {port}. Runtime source is FRESH.")
+            else:
+                print(f"Bridge restarted on port {port}. WARNING: Runtime source changed again post-restart.")
+                sys.exit(1)
 
     elif args.command == "status":
         _bridge_status()
@@ -930,10 +952,40 @@ def _bridge_status():
         req.add_header("Authorization", f"Bearer {key}")
         with urllib.request.urlopen(req, timeout=3) as resp:
             data = json.loads(resp.read().decode())
-            print(json.dumps(data, indent=2))
     except Exception as e:
         print(f"Bridge not running: {e}")
         sys.exit(1)
+
+    uptime = data.get("uptime_seconds", 0)
+    pid = data.get("pid", "?")
+    runtime_id = data.get("runtime_identity", {}) or {}
+    source_tree = runtime_id.get("runtime_source_tree", {}) or {}
+    freshness = runtime_id.get("freshness", {}) or {}
+
+    print(f"Bridge:            running")
+    print(f"PID:               {pid}")
+    print(f"Uptime:            {uptime}s")
+    print(f"Version:           {data.get('bridge_version', '?')}")
+    print(f"Project:           {data.get('project_root', '?')}")
+    print(f"")
+    if source_tree.get("fresh"):
+        print(f"Runtime source:    FRESH ({source_tree.get('total_files', 0)} files)")
+    else:
+        changed = ", ".join(source_tree.get("changed_files", [])[:3])
+        print(f"Runtime source:    STALE")
+        if changed:
+            print(f"Changed files:     {changed}")
+        print(f"Action:            bin/codex-oss restart")
+    print(f"OpenCode key:      {'present' if data.get('has_opencode_key') else 'missing'}")
+    model_count = len(runtime_id.get("model_aliases", {}) or {})
+    print(f"Model aliases:     {model_count}")
+    super_mode = (data.get("supervisor") or {}).get("mode", "unknown")
+    print(f"Supervisor:        {super_mode}")
+    print(f"State DB:          {data.get('state_db', '?')}")
+    if freshness.get("live_tests_allowed"):
+        print(f"Live tests:        ALLOWED")
+    else:
+        print(f"Live tests:        BLOCKED — runtime stale")
 
 
 # ── Supervisor ──

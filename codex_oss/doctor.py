@@ -337,6 +337,30 @@ def _check_bridge(url: str, report: DoctorReport, root: Path, live_model: bool =
             "Bridge health does not expose config_fingerprint",
             "Restart a bridge version that reports a config fingerprint")
 
+    runtime_id = health.get("runtime_identity", {}) or {}
+    source_tree = runtime_id.get("runtime_source_tree", {}) or {}
+    if source_tree.get("fresh"):
+        report.add("runtime.identity", "PASS", f"Runtime module tree is fresh ({source_tree.get('total_files', 0)} files)")
+    elif source_tree.get("changed_files"):
+        changed = ", ".join(source_tree["changed_files"][:5])
+        report.add("runtime.identity", "FAIL",
+            f"Runtime module tree is stale. Changed: {changed}",
+            "Restart the bridge: `codex-oss restart`")
+    elif source_tree.get("startup_sha256"):
+        report.add("runtime.identity", "FAIL",
+            "Runtime module tree hash changed since bridge start",
+            "Restart the bridge: `codex-oss restart`")
+    else:
+        report.add("runtime.identity", "WARN",
+            "Bridge health does not expose runtime identity",
+            "Restart a bridge version that reports runtime_source_tree freshness")
+
+    if live_model and not source_tree.get("fresh"):
+        report.add("runtime.live_tests_blocked", "FAIL",
+            "Live OSS inference tests blocked because runtime module tree is stale",
+            "Restart the bridge: `codex-oss restart`")
+    elif live_model:
+        report.add("runtime.live_tests_blocked", "PASS", "Runtime fresh — live tests allowed")
     # GPT rejection test
     api_url = f"{url}/v1/responses"
     try:

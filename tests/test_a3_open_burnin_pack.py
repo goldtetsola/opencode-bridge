@@ -856,11 +856,38 @@ def _pct(part: int, total: int) -> str:
     return f"{part / total * 100:.0f}%"
 
 
+def _check_runtime_freshness():
+    """Check that the bridge runtime is fresh before running live burn-in."""
+    import urllib.request, json
+    health_url = BASE_URL.rstrip("/v1").rstrip("/responses").rstrip("/") + "/health"
+    try:
+        req = urllib.request.Request(health_url, headers={"Authorization": f"Bearer {AUTH}"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            health = json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        print(f"Bridge health unreachable: {e}")
+        sys.exit(1)
+    runtime_id = health.get("runtime_identity", {}) or {}
+    source_tree = runtime_id.get("runtime_source_tree", {}) or {}
+    if not source_tree.get("fresh", True):
+        print("\nERROR: Bridge runtime is stale. Restart the bridge before running live burn-in.")
+        changed = source_tree.get("changed_files", [])
+        if changed:
+            print(f"  Changed files: {', '.join(changed[:5])}")
+        print("\n  Run: bin/codex-oss restart")
+        print("  Or: LIVE_BURNIN_ALLOW_STALE_RUNTIME=1 python3 tests/test_a3_open_burnin_pack.py")
+        sys.exit(1)
+    print(f"Runtime source: FRESH ({source_tree.get('total_files', 0)} files)")
+
+
 def main():
     if not os.getenv("LIVE_BURNIN"):
         print("Skipping live burn-in (set LIVE_BURNIN=1 to run).")
         print("Run: set -a; source .codex-oss/env/opencode-go.env; set +a; LIVE_BURNIN=1 python3 tests/test_a3_open_burnin_pack.py")
         return 0
+
+    if not os.getenv("LIVE_BURNIN_ALLOW_STALE_RUNTIME"):
+        _check_runtime_freshness()
 
     cases = build_burnin_cases()
     limit = int(os.getenv("OSS_LIVE_BURNIN_LIMIT", "25"))
