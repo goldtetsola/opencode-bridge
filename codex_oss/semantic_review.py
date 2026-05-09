@@ -84,6 +84,67 @@ NON_BLOCKING_CODES = frozenset({
 ALL_CODES = BLOCKING_CODES | REPAIRABLE_CODES | NON_BLOCKING_CODES
 
 
+def classify_file_role(path: str) -> str:
+    """Classify a file path into a role for semantic review.
+
+    Roles:
+      production_source  — main codebase file (src/, codex_oss/, lib/, etc.)
+      test_code          — test framework files under tests/ (not fixtures)
+      test_fixture       — fixture/test data files (tests/fixtures/* or test_data/*)
+      docs               — documentation (docs/, *.md, *.rst)
+      config             — configuration (pyproject.toml, *.cfg, *.ini, .env, etc.)
+      generated          — auto-generated files
+      unknown            — unclassifiable
+    """
+    p = str(path)
+    base = os.path.basename(p)
+
+    # Docs
+    if p.startswith("docs/") or base.endswith((".md", ".rst", ".txt")) and not p.startswith("src/"):
+        return "docs"
+
+    # Config
+    if base in {"pyproject.toml", "setup.cfg", "setup.py", "Makefile", "Dockerfile"}:
+        return "config"
+    if base.endswith((".cfg", ".ini", ".toml", ".yaml", ".yml")) and not p.startswith("tests/"):
+        return "config"
+
+    # Test fixture
+    if "fixture" in p.lower() or p.startswith("test_data/"):
+        return "test_fixture"
+    if p.startswith("tests/fixtures/"):
+        # Under tests/fixtures but NOT a test file → fixture
+        if not (base.startswith("test_") or base.endswith("_test.py")):
+            return "test_fixture"
+
+    # Test code
+    if p.startswith("tests/") or "/test_" in p or base.startswith("test_") or base.endswith("_test.py"):
+        return "test_code"
+
+    # Generated
+    if "generated" in p.lower() or "__pycache__" in p:
+        return "generated"
+
+    # Production source
+    if any(p.startswith(prefix) for prefix in ("src/", "lib/", "codex_oss/", "app/", "pkg/")):
+        return "production_source"
+
+    # Heuristic: if it's a .py file not in tests/ and not a fixture, treat as source
+    if base.endswith(".py"):
+        return "production_source"
+
+    return "unknown"
+
+
+def classify_files_by_role(files: list[Any]) -> dict[str, list[str]]:
+    roles: dict[str, list[str]] = {}
+    for file in files:
+        path = str(getattr(file, "path", "") or "")
+        role = classify_file_role(path)
+        roles.setdefault(role, []).append(path)
+    return roles
+
+
 def review_removed_tests(removed_text: str) -> list[JSON]:
     findings = []
     for match in re.finditer(r"^\s*def\s+(test_[A-Za-z0-9_]*)\s*\(", removed_text, re.MULTILINE):
@@ -188,17 +249,18 @@ def review_source_change_without_test(
     objective_type = str(spec.get("objective_type", "") or "") if isinstance(spec, dict) else ""
     if objective_type in {"critical_path_patch", "documentation_patch"}:
         return findings
-    changed_paths = {str(getattr(file, "path", "") or "") for file in files}
-    source_changed = [p for p in changed_paths if not _looks_like_test_path(p)]
-    test_changed = [p for p in changed_paths if _looks_like_test_path(p)]
-    if source_changed and not test_changed:
+    file_roles = classify_files_by_role(files)
+    production_changed = file_roles.get("production_source", [])
+    test_code_changed = file_roles.get("test_code", [])
+
+    if production_changed and not test_code_changed:
         findings.append({
             "code": "source_change_without_test",
-            "severity": "non_blocking",
-            "detail": "Source implementation change requires an accompanying test change.",
-            "location": {"source_files": source_changed},
+            "severity": "repairable" if tier == "A5" else "blocking",
+            "detail": f"Source implementation change requires an accompanying test or verification caveat. Production files changed: {production_changed[:3]}.",
+            "location": {"source_files": production_changed},
             "repairable": True,
-            "repair_hint": "Add a test file change alongside the source change.",
+            "repair_hint": "Add a test file change alongside the source change, or add a verification caveat.",
         })
     return findings
 
@@ -289,6 +351,7 @@ def build_semantic_review_report(
         "repairable_findings": repairable_findings,
         "non_blocking_findings": non_blocking_findings,
         "objective_alignment": alignment,
+        "file_roles": classify_files_by_role(files),
         "recommended_repair": _suggested_repair(findings) if repairable else None,
     }
 
@@ -310,13 +373,6 @@ def _is_dependency_manifest(path: str) -> bool:
         "package.json", "pnpm-lock.yaml", "package-lock.json",
         "requirements.txt", "pyproject.toml", "poetry.lock",
     }
-
-
-def _looks_like_test_path(path: str) -> bool:
-    base = os.path.basename(path)
-    if path.startswith("tests/fixtures/"):
-        return base.startswith("test_") or base.endswith("_test.py")
-    return path.startswith("tests/") or base.startswith("test_") or base.endswith("_test.py")
 
 
 def _added_symbol_present(added_text: str, symbol: dict) -> bool:

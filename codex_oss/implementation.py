@@ -1628,11 +1628,26 @@ def validate_patch_proposal(proposal: JSON, mission: Any, project_root: str) -> 
     checks["objective_satisfied"] = objective_ok
     reasons.extend(objective_reasons)
 
-    semantic_ok, semantic_reasons = _semantic_review_patch(proposal, files, mission)
     semantic_review = build_semantic_review_report(proposal, files, mission)
+    decision = str(semantic_review.get("decision", "VALID") or "VALID")
+    blocking_findings = list(semantic_review.get("blocking_findings", []) or [])
+    repairable_findings = list(semantic_review.get("repairable_findings", []) or [])
+    non_blocking = list(semantic_review.get("non_blocking_findings", []) or [])
+
+    semantic_ok = decision in ("VALID",)
     checks["semantic_review_ok"] = semantic_ok
-    checks["semantic_review_score"] = _score_from_reasons(semantic_reasons)
-    reasons.extend(semantic_reasons)
+    checks["semantic_review_score"] = _semantic_score_from_decision(decision, len(blocking_findings), len(repairable_findings))
+    checks["semantic_review_decision"] = decision
+    checks["semantic_review_repairable"] = bool(semantic_review.get("repairable", False))
+
+    for f in blocking_findings:
+        detail = str(f.get("detail", "") or str(f.get("code", "")))
+        if detail and detail not in reasons:
+            reasons.append(detail)
+    for f in repairable_findings:
+        detail = str(f.get("detail", "") or str(f.get("code", "")))
+        if detail and detail not in reasons:
+            reasons.append(f"[repairable] {detail}")
 
     verification_ok, verification_reasons = _validate_verification_plan(proposal, mission)
     checks["verification_plan_ok"] = verification_ok
@@ -1657,13 +1672,9 @@ def validate_patch_proposal(proposal: JSON, mission: Any, project_root: str) -> 
     readiness_status = str((readiness_graph.get("coverage_status", {}) or {}).get("recommended_status", "") or "")
     readiness_reason = str((readiness_graph.get("coverage_status", {}) or {}).get("reason", "") or "")
     checks["implementation_readiness_ok"] = readiness_status == "VALID"
-    checks["implementation_coverage_ok"] = bool(coverage_graph.get("can_propose", False))
+    checks["implementation_coverage_ok"] = not _coverage_violation_is_critical(coverage_graph)
     if readiness_reason and readiness_status in {"INVALID", "ESCALATE"} and readiness_reason not in reasons:
         reasons.append(readiness_reason)
-    coverage_reasons = [m.get("reason", "") for m in (coverage_graph.get("missing_coverage", []) or []) if m.get("reason")]
-    for cr in coverage_reasons:
-        if cr and cr not in reasons:
-            reasons.append(cr)
 
     if checks["critical_paths_touched"] and not bool(getattr(mission, "critical_path_write_allowed", False)):
         status = "ESCALATE"
@@ -2361,6 +2372,16 @@ def _score_from_reasons(reasons: list[str]) -> int:
     return max(0, 100 - (len(reasons) * 25))
 
 
+def _semantic_score_from_decision(decision: str, blocking_count: int, repairable_count: int) -> int:
+    if decision == "VALID":
+        return 100
+    if decision == "WARN":
+        return max(80, 100 - (repairable_count * 10))
+    if decision == "REPAIRABLE":
+        return max(50, 100 - (repairable_count * 15) - (blocking_count * 25))
+    return max(10, 100 - (blocking_count * 30) - (repairable_count * 20))
+
+
 def _git_apply_check(diff: str, project_root: str) -> bool:
     try:
         proc = subprocess.run(
@@ -2506,6 +2527,7 @@ def _validation_report(
         "reasons": reasons,
         "implementation_readiness_graph": readiness_graph if isinstance(readiness_graph, dict) else {},
         "implementation_coverage_graph": coverage_graph if isinstance(coverage_graph, dict) else {},
+        "implementation_coverage_advisories": _coverage_advisories(coverage_graph),
         "semantic_review": semantic_review if isinstance(semantic_review, dict) else {},
     }
 
@@ -2525,6 +2547,21 @@ def _coverage_violation_is_critical(coverage_graph: JSON) -> bool:
     if category_statuses.get("target_knowledge") == "missing":
         return True
     return False
+
+
+def _coverage_advisories(coverage_graph: JSON) -> list[str]:
+    """Extract non-critical advisory gaps from the coverage graph."""
+    if not isinstance(coverage_graph, dict):
+        return []
+    advisories = []
+    missing = list(coverage_graph.get("missing_coverage", []) or [])
+    critical_violations = set(coverage_graph.get("critical_violations", []) or [])
+    for item in missing:
+        cat = str(item.get("category", "") or "")
+        reason = str(item.get("reason", "") or "")
+        if cat not in critical_violations and reason:
+            advisories.append(f"[{cat}] {reason}")
+    return advisories
 
 
 def _implementation_report(
