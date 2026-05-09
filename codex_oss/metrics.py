@@ -265,8 +265,11 @@ def _promotion_evidence(summary: dict[str, Any]) -> dict[str, Any]:
             bool(readonly.get("open_investigation_count"))
             and readonly.get("open_investigation_audit_ok_count", 0) == readonly.get("open_investigation_count", 0)
             and readonly.get("open_investigation_runtime_finalized_count", 0) == 0
-            and readonly.get("open_investigation_search_backed_count", 0) >= 1
-            and readonly.get("open_investigation_phaseful_count", 0) == readonly.get("open_investigation_count", 0),
+            and (
+                readonly.get("open_investigation_runtime_answer_graph_closed_count", 0) >= 1
+                or readonly.get("open_investigation_model_closed_count", 0) >= 1
+            )
+            and readonly.get("open_investigation_answer_obligation_complete_count", 0) >= 1,
             (
                 f"open_investigation_count={readonly.get('open_investigation_count', 0)} "
                 f"audit_ok={readonly.get('open_investigation_audit_ok_count', 0)} "
@@ -275,7 +278,10 @@ def _promotion_evidence(summary: dict[str, Any]) -> dict[str, Any]:
                 f"runtime_answer_graph_closed={readonly.get('open_investigation_runtime_answer_graph_closed_count', 0)} "
                 f"search_backed={readonly.get('open_investigation_search_backed_count', 0)} "
                 f"phaseful={readonly.get('open_investigation_phaseful_count', 0)} "
-                f"obligation_complete={readonly.get('open_investigation_answer_obligation_complete_count', 0)}"
+                f"obligation_complete={readonly.get('open_investigation_answer_obligation_complete_count', 0)} "
+                f"(search_backed={readonly.get('open_investigation_search_backed_count', 0)}, "
+                f"phaseful={readonly.get('open_investigation_phaseful_count', 0)}, "
+                f"productive={readonly.get('open_investigation_productive_count', 0)})"
             ),
         ),
         "bounded_implementation": claim(

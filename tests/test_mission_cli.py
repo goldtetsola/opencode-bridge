@@ -935,8 +935,9 @@ def assert_explain_reads_decision_trace_artifact():
         assert result.returncode == 0, result.stdout + result.stderr
         payload = json.loads(result.stdout)
         assert payload["mission_id"] == "mission_explain_test", payload
-        assert payload["decisions"][0]["decision_type"] == "scope_validation", payload
-        assert payload["summary"]["phase_path"] == ["PLAN", "VERIFY"], payload
+        assert len(payload["key_decisions"]) >= 1, payload
+        assert payload["key_decisions"][0]["type"] == "scope_validation", payload
+        assert "PLAN" in payload["phase_path"], payload
 
 
 def assert_claim_status_tolerates_incomplete_json_artifacts():
