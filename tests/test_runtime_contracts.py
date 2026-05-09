@@ -2760,6 +2760,7 @@ def assert_open_investigation_runtime_answer_graph_can_complete_after_model_time
             {"id": "q2", "question": "What conclusion is justified from the inspected evidence?", "required": True, "source_hints": ["codex_oss/managed_bridge.py"]},
         ],
         must_inspect=["codex_oss/managed_bridge.py"],
+        exploration_policy={"after_required_floor": "close_immediately", "min_optional_actions_after_floor": 0, "max_optional_actions_after_floor": 0, "require_contradiction_search": False},
         objective_spec={
             "schema_version": "objective_spec.v1",
             "objective_type": "function_location",
@@ -2882,6 +2883,7 @@ def assert_open_investigation_prefetch_reads_required_sources_before_model_loop(
             },
         ],
         must_inspect=["codex_oss/managed_bridge.py", "codex_oss/audit.py"],
+        exploration_policy={"after_required_floor": "close_immediately", "min_optional_actions_after_floor": 0, "max_optional_actions_after_floor": 0, "require_contradiction_search": False},
     )
     ledger = EvidenceLedger(mission_id=m.mission_id, tool_budget_remaining=m.tool_budget)
 
@@ -3158,6 +3160,7 @@ def assert_agenda_guided_redirects_then_prefetches_after_model_ignores_required_
                 }
             ],
             must_inspect=[required_rel],
+            exploration_policy={"after_required_floor": "close_immediately", "min_optional_actions_after_floor": 0, "max_optional_actions_after_floor": 0, "require_contradiction_search": False},
         )
         ledger = EvidenceLedger(mission_id=m.mission_id, tool_budget_remaining=m.tool_budget)
         calls = {"n": 0}
@@ -3261,6 +3264,7 @@ def assert_agenda_guided_does_not_prefetch_upfront_lets_model_cooperate():
                 }
             ],
             must_inspect=[sample_rel],
+            exploration_policy={"after_required_floor": "close_immediately", "min_optional_actions_after_floor": 0, "max_optional_actions_after_floor": 0, "require_contradiction_search": False},
         )
         ledger = EvidenceLedger(mission_id=m.mission_id, tool_budget_remaining=m.tool_budget)
         calls = {"n": 0}
@@ -3333,7 +3337,7 @@ def assert_exploration_policy_close_immediately_blocks_further_tool_calls():
             objective="Investigate the target function.",
             objective_style="open_investigation",
             evidence_collection_mode="agenda_guided",
-            exploration_policy={"after_required_floor": "close_immediately"},
+            exploration_policy={"after_required_floor": "close_immediately", "require_contradiction_search": False},
             allowed_roots=[],
             allowed_paths=[required_rel],
             allowed_tool_classes=["read"],
@@ -3567,6 +3571,68 @@ def assert_exploration_policy_contradiction_blocks_closure():
         assert result["status"] == "COMPLETE", result
 
 
+def assert_exploration_partial_dict_caps_complete_when_exploration_unmet():
+    with tempfile.TemporaryDirectory(dir=ROOT) as td:
+        from pathlib import Path
+
+        required = Path(td) / "partial_cap_target.py"
+        required.write_text("def find_target():\n    return 'found'\n", encoding="utf-8")
+        required_rel = os.path.relpath(required, ROOT)
+        m = mission(
+            mission_id="mission_exploration_partial_cap",
+            objective="Investigate the target function.",
+            objective_style="open_investigation",
+            evidence_collection_mode="agenda_guided",
+            exploration_policy={
+                "after_required_floor": "allow_model_exploration",
+                "min_optional_actions_after_floor": 2,
+                "max_optional_actions_after_floor": 3,
+                "require_contradiction_search": True,
+            },
+            allowed_roots=[],
+            allowed_paths=[required_rel],
+            allowed_tool_classes=["read"],
+            tool_budget=5,
+            answer_obligations=[
+                {
+                    "id": "q1",
+                    "question": "Does the target file contain find_target()?",
+                    "required": True,
+                    "source_hints": [required_rel],
+                    "source_requirements": [{"path": required_rel, "evidence_kind": "function_presence", "required": True}],
+                }
+            ],
+            must_inspect=[required_rel],
+        )
+        ledger = EvidenceLedger(mission_id=m.mission_id, tool_budget_remaining=m.tool_budget)
+        calls = {"n": 0}
+
+        def fake_model(messages, tools, timeout):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return {
+                    "choices": [{
+                        "message": {
+                            "content": (
+                                '{"action_type":"tool_call","phase":"NARROW","tool_name":"rtk_read",'
+                                f'"arguments":{{"path":"{required_rel}"}},'
+                                '"reason":"Inspect the target.","hypothesis":"The file may contain find_target.",'
+                                '"target_question":"Does the file contain find_target?",'
+                                '"expected_information_gain":"Confirm the function exists.",'
+                                '"why_not_report_yet":"Need to inspect first."}'
+                            )
+                        }
+                    }]
+                }
+            raise TimeoutError("simulated model timeout before completing exploration")
+
+        result = run_loop(m, ledger, fake_model, [], None, m.allowed_roots, m.allowed_paths, request_deadline=30)
+        assert result["status"] == "PARTIAL", f"Runtime closure should be capped at PARTIAL when exploration unmet, got {result['status']}"
+        report = result.get("report", {}) or {}
+        caveats = " ".join(report.get("caveats", []) or [])
+        assert "exploration policy" in caveats.lower(), f"Caveats should mention exploration policy cap, got: {caveats[:200]}"
+
+
 def assert_evidence_kind_satisfied_when_all_shapes_present():
     with tempfile.TemporaryDirectory(dir=ROOT) as td:
         from pathlib import Path
@@ -3598,6 +3664,7 @@ def assert_evidence_kind_satisfied_when_all_shapes_present():
                 }
             ],
             must_inspect=[sample_rel],
+            exploration_policy={"after_required_floor": "close_immediately", "min_optional_actions_after_floor": 0, "max_optional_actions_after_floor": 0, "require_contradiction_search": False},
         )
         ledger = EvidenceLedger(mission_id=m.mission_id, tool_budget_remaining=m.tool_budget)
         calls = {"n": 0}
@@ -3835,6 +3902,7 @@ def main():
     assert_exploration_policy_close_immediately_blocks_further_tool_calls()
     assert_exploration_policy_min_optional_redirects_early_complete()
     assert_exploration_policy_contradiction_blocks_closure()
+    assert_exploration_partial_dict_caps_complete_when_exploration_unmet()
     assert_evidence_kind_satisfied_when_all_shapes_present()
     assert_evidence_kind_insufficient_when_some_shapes_missing()
     assert_evidence_kind_multiple_shapes_with_contradiction()

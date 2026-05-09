@@ -1056,6 +1056,27 @@ def _partial_dict(mission, ledger, reason: str) -> dict:
             )
         report = build_runtime_report_from_answer_graph(mission, ledger, answer_graph, reason=reason, report_source="runtime_answer_graph")
         _annotate_report_provenance(mission, report, "runtime_answer_graph")
+        exploration_policy = _exploration_policy(mission)
+        after_floor = str(exploration_policy.get("after_required_floor", "") or "")
+        min_optional = int(exploration_policy.get("min_optional_actions_after_floor", 0) or 0)
+        optional_count = getattr(ledger, "optional_exploration_actions", 0)
+        require_contradiction = bool(exploration_policy.get("require_contradiction_search", False))
+        contradiction_done = bool(getattr(ledger, "contradiction_search_done", False))
+        exploration_unmet = (
+            after_floor == "allow_model_exploration"
+            and report.get("status") == "COMPLETE"
+            and ((min_optional > 0 and optional_count < min_optional) or (require_contradiction and not contradiction_done))
+        )
+        if exploration_unmet:
+            report["status"] = "PARTIAL"
+            unmet = []
+            if min_optional > 0 and optional_count < min_optional:
+                unmet.append(f"optional exploration ({optional_count}/{min_optional})")
+            if require_contradiction and not contradiction_done:
+                unmet.append("contradiction search")
+            report.setdefault("caveats", []).append(
+                f"Runtime closure cap: exploration policy requires {', '.join(unmet)} but model terminated before completion."
+            )
         return {"status": str(report.get("status", "PARTIAL") or "PARTIAL"), "report": report}
     return {"status": "PARTIAL", "report": build_deterministic_partial_report(mission, ledger, reason)}
 

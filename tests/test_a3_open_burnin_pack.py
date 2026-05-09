@@ -567,6 +567,15 @@ def run_burnin(cases: list[BurninCase], limit: int = 25, start: int = 1):
         cat_passed = len([r for r in cat_results if r.passed])
         print(f"  {cat}: {cat_passed}/{len(cat_results)}")
 
+    runtime_closures = len([r for r in results if r.runtime_finalized])
+    complete_useful = len([r for r in results if r.status == "COMPLETE" and not r.false_complete])
+    partial_truthful = len([r for r in results if r.status in ("PARTIAL", "ESCALATE") and not r.false_complete])
+    print(f"\nGPT effort-saving estimate:")
+    print(f"  Runtime closures (no GPT synthesis needed): {runtime_closures}/{len(results)} ({_pct(runtime_closures, len(results))})")
+    print(f"  Useful COMPLETE reports: {complete_useful}/{len(results)}")
+    print(f"  Truthful PARTIAL/ESCALATE: {partial_truthful}/{len(results)}")
+    print(f"  GPT cleanup: {'minor' if false_completes == 0 and raw_dumps == 0 else ('moderate' if false_completes <= 1 else 'major')}")
+
     return results
 
 

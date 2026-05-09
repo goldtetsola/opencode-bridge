@@ -118,6 +118,7 @@ def run_doctor(
     network: bool = False,
     live_model: bool = False,
     dev: bool = False,
+    runtime_models: bool = False,
 ) -> DoctorReport:
     report = DoctorReport()
     root = project_root or find_project_root()
@@ -130,6 +131,8 @@ def run_doctor(
     if not offline:
         bridge_url = os.getenv("BRIDGE_URL", "http://127.0.0.1:4000")
         _check_bridge(bridge_url, report, root, live_model=live_model, dev=dev)
+        if runtime_models:
+            _check_runtime_models(bridge_url, report)
 
     report.metadata = {"project_root": str(root)}
     return report
@@ -405,6 +408,71 @@ def _check_live_model(api_url: str, auth: str, report: DoctorReport):
         report.add("bridge.oss_inference", "FAIL",
             f"OSS inference failed: {e}",
             "Check OPENCODE_GO_API_KEY is set")
+
+
+def _check_runtime_models(bridge_url: str, report: DoctorReport):
+    """Check that runtime model aliases (mission-a2 through mission-a6) are accepted by the bridge."""
+    from urllib.request import Request, urlopen
+
+    aliases = [
+        "mission-a2-flash", "mission-a2-deepseek", "mission-a2-kimi",
+        "mission-a3-flash", "mission-a3-deepseek", "mission-a3-kimi",
+        "mission-a4-flash", "mission-a4-deepseek", "mission-a4-kimi",
+        "mission-a5-flash", "mission-a5-deepseek", "mission-a5-kimi",
+        "mission-a6-flash", "mission-a6-deepseek", "mission-a6-kimi",
+    ]
+    auth = os.getenv("PROXY_API_KEY") or os.getenv("LITELLM_MASTER_KEY") or "sk-local-codex-bridge"
+
+    # Check models endpoint
+    try:
+        req = Request(f"{bridge_url}/v1/models")
+        req.add_header("Authorization", f"Bearer {auth}")
+        with urlopen(req, timeout=5) as resp:
+            body = json.loads(resp.read().decode())
+            model_ids = {m.get("id", "") for m in body.get("data", [])}
+            
+            ocg_models = [m for m in model_ids if m.startswith("ocg-")]
+            report.add("runtime_models.ocg_count", "PASS" if ocg_models else "WARN",
+                       f"{len(ocg_models)} ocg- models available" if ocg_models else "No ocg- models found")
+    except Exception as e:
+        report.add("runtime_models.endpoint", "FAIL", f"Cannot query /v1/models: {e}")
+        return
+
+    # Test each alias by submitting a minimal responses request
+    from codex_oss.managed_bridge import RUNTIME_MODEL_ALIASES
+    resolved_aliases = {a: RUNTIME_MODEL_ALIASES.get(a, "unknown") for a in aliases}
+    
+    # Group by upstream model
+    by_upstream: dict[str, list[str]] = {}
+    for alias, upstream in resolved_aliases.items():
+        by_upstream.setdefault(upstream, []).append(alias)
+    
+    available_upstream = set()
+    for upstream, mapped_aliases in sorted(by_upstream.items()):
+        in_map = any(upstream in model_ids or f"ocg-{upstream}" in model_ids or 
+                     upstream.replace("ocg-", "") in model_ids for _ in [1])
+        if in_map:
+            available_upstream.add(upstream)
+    
+    accepted = 0
+    missing = 0
+    for alias in aliases:
+        upstream = resolved_aliases[alias]
+        if upstream in available_upstream or any(
+            upstream in model_ids or upstream.replace("ocg-", "") in model_ids
+            for _ in [1]
+        ):
+            accepted += 1
+        else:
+            missing += 1
+    
+    report.add("runtime_models.aliases_resolved", "PASS" if accepted == len(aliases) else "WARN",
+               f"{accepted}/{len(aliases)} runtime aliases map to available upstream models")
+    
+    if missing:
+        missing_aliases = [a for a in aliases if resolved_aliases[a] not in available_upstream]
+        report.add("runtime_models.missing", "WARN",
+                   f"Missing upstream models for: {', '.join(missing_aliases[:5])}")
 
 
 def _sha256_path(path: Path) -> str:

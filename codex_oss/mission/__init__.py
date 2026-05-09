@@ -503,7 +503,8 @@ def _validate_exploration_policy(raw: Any, objective_style: str) -> dict:
     mode = str(policy.get("after_required_floor", "allow_model_exploration") or "allow_model_exploration")
     if mode not in {"allow_model_exploration", "close_immediately"}:
         raise InvalidHandoffError("exploration_policy.after_required_floor must be allow_model_exploration or close_immediately")
-    min_optional = int(policy.get("min_optional_actions_after_floor", 1) or 0)
+    default_min = 0 if mode == "close_immediately" else 1
+    min_optional = int(policy.get("min_optional_actions_after_floor", default_min) or 0)
     max_optional = int(policy.get("max_optional_actions_after_floor", 4) or 0)
     if min_optional < 0 or max_optional < 0 or min_optional > max_optional:
         raise InvalidHandoffError("exploration_policy optional action bounds are invalid")
@@ -511,7 +512,7 @@ def _validate_exploration_policy(raw: Any, objective_style: str) -> dict:
         "after_required_floor": mode,
         "min_optional_actions_after_floor": min_optional,
         "max_optional_actions_after_floor": max_optional,
-        "require_contradiction_search": bool(policy.get("require_contradiction_search", True)),
+        "require_contradiction_search": bool(policy.get("require_contradiction_search", mode != "close_immediately")),
     }
 
 

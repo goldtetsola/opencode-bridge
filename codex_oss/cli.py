@@ -35,6 +35,7 @@ def main():
     d.add_argument("--network", action="store_true", help="Include bridge health and network checks")
     d.add_argument("--live-model", action="store_true", help="Run a tiny live OSS model inference smoke")
     d.add_argument("--dev", action="store_true", help="Allow foreground supervisor warnings for development use")
+    d.add_argument("--runtime-models", action="store_true", help="Check runtime model aliases (A2-A6) are accepted by bridge")
 
     # install
     i = sub.add_parser("install", help="Install OSS bridge config into current project")
@@ -219,6 +220,7 @@ def main():
             network=args.network or args.live_model,
             live_model=args.live_model,
             dev=args.dev,
+            runtime_models=args.runtime_models,
         )
         report.print(json_output=args.json)
         sys.exit(0 if report.healthy else 1)
