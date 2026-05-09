@@ -574,7 +574,9 @@ def run_burnin(cases: list[BurninCase], limit: int = 25, start: int = 1):
     print(f"  Runtime closures (no GPT synthesis needed): {runtime_closures}/{len(results)} ({_pct(runtime_closures, len(results))})")
     print(f"  Useful COMPLETE reports: {complete_useful}/{len(results)}")
     print(f"  Truthful PARTIAL/ESCALATE: {partial_truthful}/{len(results)}")
-    print(f"  GPT cleanup: {'minor' if false_completes == 0 and raw_dumps == 0 else ('moderate' if false_completes <= 1 else 'major')}")
+    n_false = len(false_completes)
+    n_raw = len(raw_dumps)
+    print(f"  GPT cleanup: {'minor' if n_false == 0 and n_raw == 0 else ('moderate' if n_false <= 1 else 'major')}")
 
     return results
 
