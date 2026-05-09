@@ -114,6 +114,11 @@ def audit_mission(project_root: str, mission_id: str) -> dict[str, Any]:
             "implementation coverage recorded in validation" if "implementation_coverage_graph" in validation else "implementation coverage (legacy: not yet recorded)",
         ))
         checks.append(_check(
+            "semantic_review_recorded",
+            True,
+            "semantic review recorded in validation" if "semantic_review" in validation else "semantic review (legacy: not yet recorded)",
+        ))
+        checks.append(_check(
             "rollback_recorded",
             isinstance(report.get("rollback"), dict) and bool(report.get("rollback", {}).get("artifact")),
             "rollback artifact recorded in report",

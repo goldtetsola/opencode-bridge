@@ -22,6 +22,7 @@ from typing import Any, Callable, Optional
 from codex_oss.decision_trace import append_decision, write_decision_trace
 from codex_oss.implementation_graph import build_implementation_readiness_graph
 from codex_oss.implementation_coverage import build_implementation_coverage_graph
+from codex_oss.semantic_review import build_semantic_review_report
 from codex_oss.runtime import resolve_path
 from codex_oss.runtime.loop import _extract_model_text
 from codex_oss.runtime.policy import is_critical_path, scan_secrets
@@ -240,6 +241,9 @@ def _persist_implementation_runtime_artifacts(
     coverage_graph = validation.get("implementation_coverage_graph")
     if isinstance(coverage_graph, dict):
         _write_json(os.path.join(artifact_dir, "implementation_coverage_graph.json"), coverage_graph)
+    semantic_review = validation.get("semantic_review")
+    if isinstance(semantic_review, dict):
+        _write_json(os.path.join(artifact_dir, "semantic_review.json"), semantic_review)
     project_root = os.path.dirname(os.path.dirname(os.path.dirname(artifact_dir)))
     if not isinstance(getattr(mission, "decision_trace", None), list):
         mission.decision_trace = []
@@ -1625,6 +1629,7 @@ def validate_patch_proposal(proposal: JSON, mission: Any, project_root: str) -> 
     reasons.extend(objective_reasons)
 
     semantic_ok, semantic_reasons = _semantic_review_patch(proposal, files, mission)
+    semantic_review = build_semantic_review_report(proposal, files, mission)
     checks["semantic_review_ok"] = semantic_ok
     checks["semantic_review_score"] = _score_from_reasons(semantic_reasons)
     reasons.extend(semantic_reasons)
@@ -1686,7 +1691,7 @@ def validate_patch_proposal(proposal: JSON, mission: Any, project_root: str) -> 
         status = "INVALID"
     if status == "VALID" and not checks["implementation_coverage_ok"] and _coverage_violation_is_critical(coverage_graph):
         status = coverage_graph.get("recommended_status", "INVALID")
-    return _validation_report(status, checks, reasons, changed_paths, proposal, mission, readiness_graph, coverage_graph)
+    return _validation_report(status, checks, reasons, changed_paths, proposal, mission, readiness_graph, coverage_graph, semantic_review)
 
 
 def apply_patch_in_isolated_worktree(proposal: JSON, mission: Any, project_root: str) -> JSON:
@@ -2480,6 +2485,7 @@ def _validation_report(
     mission: Any | None = None,
     readiness_graph: JSON | None = None,
     coverage_graph: JSON | None = None,
+    semantic_review: JSON | None = None,
 ) -> JSON:
     proposal = proposal or {}
     proposal_source = str(proposal.get("proposal_source", "") or "raw_patch_proposal_v1")
@@ -2500,6 +2506,7 @@ def _validation_report(
         "reasons": reasons,
         "implementation_readiness_graph": readiness_graph if isinstance(readiness_graph, dict) else {},
         "implementation_coverage_graph": coverage_graph if isinstance(coverage_graph, dict) else {},
+        "semantic_review": semantic_review if isinstance(semantic_review, dict) else {},
     }
 
 
