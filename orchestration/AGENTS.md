@@ -134,7 +134,7 @@ Single file/module change. Tests exist for target code. Requirements clear.
 | `oss_kimi_rapid` | kimi-k2.6 (raw experimental) | Manual repo nav baseline | read-only |
 | `oss_flash_support` | deepseek-v4-flash (raw experimental) | Manual docs/support baseline | read-only |
 
-Runtime-controlled agents require: `fork_turns: "none"`, explicit MissionV1 handoff, `model_provider = "oss_runtime"`.
+Runtime-controlled agents require: `fork_turns: "none"`, explicit MissionV1 handoff, `model_provider = "opencode_bridge"`.
 
 ---
 
