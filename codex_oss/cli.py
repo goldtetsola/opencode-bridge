@@ -259,37 +259,46 @@ def main():
         sys.exit(0 if report.get("ok") else 1)
 
     elif args.command == "explain":
+        from codex_oss.explain import build_explanation
         project_root = args.project or os.getcwd()
-        trace = read_decision_trace(project_root, args.mission_id)
-        if trace is None:
-            print(f"Decision trace missing for mission {args.mission_id}", file=sys.stderr)
+        explanation = build_explanation(project_root, args.mission_id)
+        if explanation is None:
+            print(f"No explainable artifacts found for mission {args.mission_id}", file=sys.stderr)
             sys.exit(1)
-        phase_path = [
-            str(item.get("result", "") or "")
-            for item in (trace.get("decisions", []) or [])
-            if str(item.get("decision_type", "") or "") == "phase_transition"
-        ]
-        decision_counts: dict[str, int] = {}
-        for item in (trace.get("decisions", []) or []):
-            key = str(item.get("decision_type", "") or "unknown")
-            decision_counts[key] = decision_counts.get(key, 0) + 1
-        explained = dict(trace)
-        explained["summary"] = {
-            "decision_count": len(trace.get("decisions", []) or []),
-            "decision_type_counts": decision_counts,
-            "phase_path": phase_path,
-        }
         if args.json:
-            print(json_dumps_safe(explained))
+            print(json_dumps_safe(explanation))
         else:
-            print(f"Mission: {args.mission_id}")
-            if phase_path:
-                print(f"Phase path: {' -> '.join(phase_path)}")
-            for idx, item in enumerate(trace.get("decisions", []) or [], start=1):
-                print(f"{idx}. {item.get('decision_type')} -> {item.get('result')}")
-                print(f"   policy: {item.get('policy')}")
-                print(f"   reason: {item.get('reason')}")
-                print(f"   source: {item.get('source_module')}")
+            print(f"Mission: {explanation['mission_id']}")
+            print(f"Status: {explanation['status']}")
+            print(f"Closure: {explanation.get('closure_source', 'unknown')}")
+            print(f"Phase path: {explanation.get('phase_path', '')}")
+            print(f"Confidence: {explanation.get('confidence', 'unknown')}")
+            print(f"\nEvidence:")
+            if explanation.get('required_sources'):
+                print(f"  Required sources: {explanation['required_sources']['covered']}/{explanation['required_sources']['total']} covered")
+            if explanation.get('evidence_shapes'):
+                print(f"  Evidence shapes: {explanation['evidence_shapes']}")
+            if explanation.get('contradictions'):
+                print(f"  Contradictions: {explanation['contradictions']}")
+            if explanation.get('missing_evidence'):
+                print(f"  Missing evidence: {explanation['missing_evidence']}")
+            if explanation.get('blocked_obligations'):
+                print(f"  Blocked: {explanation['blocked_obligations']}")
+            print(f"\nDecisions ({explanation.get('decision_count', 0)} total):")
+            for d in (explanation.get('key_decisions', []) or [])[:10]:
+                print(f"  {d.get('type', '')}: {d.get('result', '')} ({d.get('reason', '')[:100]})")
+            if explanation.get('caveats'):
+                print(f"\nCaveats:")
+                for c in explanation.get('caveats', [])[:5]:
+                    print(f"  - {c[:120]}")
+            if explanation.get('coverage_gaps'):
+                print(f"\nCoverage gaps:")
+                for g in explanation.get('coverage_gaps', [])[:5]:
+                    print(f"  - [{g.get('category', '')}] {g.get('reason', '')[:120]}")
+            if explanation.get('semantic_review'):
+                print(f"\nSemantic review: {explanation['semantic_review'].get('decision', '')} "
+                      f"(blocking: {explanation['semantic_review'].get('blocking_count', 0)}, "
+                      f"repairable: {explanation['semantic_review'].get('repairable_count', 0)})")
         sys.exit(0)
 
     elif args.command == "mission-metrics":

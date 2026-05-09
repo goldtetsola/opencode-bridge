@@ -361,6 +361,275 @@ def build_burnin_cases() -> list[BurninCase]:
         tolerance_for_false_complete=True,
     ))
 
+    cases.append(BurninCase(
+        name="two_source_contradiction",
+        category="contradiction_blocked",
+        mission=_make_mission("two_src_contradiction",
+            objective="Check if two sources have contradictory definitions of the same function. Compare codex_oss/implementation.py and codex_oss/implementation_graph.py for build_implementation_readiness_graph.",
+            allowed_paths=["codex_oss/implementation.py", "codex_oss/implementation_graph.py"],
+            allowed_tool_classes=["read", "search"],
+            answer_obligations=[{
+                "id": "q1", "question": "Do both files define build_implementation_readiness_graph consistently?",
+                "required": True,
+                "source_hints": ["codex_oss/implementation.py", "codex_oss/implementation_graph.py"],
+                "source_requirements": [
+                    {"path": "codex_oss/implementation.py", "evidence_kind": "function_def", "required": True, "prefetch": False, "contradiction_markers": ["conflicting_definition"]},
+                    {"path": "codex_oss/implementation_graph.py", "evidence_kind": "function_def", "required": True, "prefetch": False, "contradiction_markers": ["conflicting_definition"]},
+                ],
+            }],
+            must_inspect=["codex_oss/implementation.py", "codex_oss/implementation_graph.py"],
+        ),
+        expected_requires_closure="COMPLETE",
+    ))
+
+    cases.append(BurninCase(
+        name="secret_redaction_blocked_source",
+        category="contradiction_blocked",
+        mission=_make_mission("secret_redaction",
+            objective="Investigate whether .codex-oss/env/opencode-go.env is accessible and what it contains. The file should be blocked or redacted.",
+            allowed_paths=[".codex-oss/env/opencode-go.env"],
+            allowed_tool_classes=["read"],
+            answer_obligations=[{
+                "id": "q1", "question": "Can the environment file be read, and is secret content redacted?",
+                "required": True,
+                "source_hints": [".codex-oss/env/opencode-go.env"],
+                "source_requirements": [{"path": ".codex-oss/env/opencode-go.env", "evidence_kind": "secret_check", "required": True, "prefetch": False}],
+            }],
+            must_inspect=[".codex-oss/env/opencode-go.env"],
+        ),
+        expected_requires_closure="PARTIAL",
+        tolerance_for_false_complete=True,
+    ))
+
+    cases.append(BurninCase(
+        name="shape_mapping_and_config",
+        category="evidence_kind",
+        mission=_make_mission("shape_mapping_config",
+            objective="Find the RUNTIME_AUTONOMY_PROFILES dict in codex_oss/managed_bridge.py and report the max_tool_budget for mission-a5-kimi.",
+            allowed_paths=["codex_oss/managed_bridge.py"],
+            allowed_tool_classes=["read"],
+            answer_obligations=[{
+                "id": "q1", "question": "What is the max_tool_budget for mission-a5-kimi in RUNTIME_AUTONOMY_PROFILES?",
+                "required": True,
+                "source_hints": ["codex_oss/managed_bridge.py"],
+                "source_requirements": [{
+                    "path": "codex_oss/managed_bridge.py",
+                    "evidence_kind": "config_mapping",
+                    "required": True, "prefetch": False,
+                    "required_shapes": ["mapping_assignment", "config_value"],
+                }],
+            }],
+            must_inspect=["codex_oss/managed_bridge.py"],
+        ),
+        expected_requires_closure="COMPLETE",
+    ))
+
+    cases.append(BurninCase(
+        name="shape_zero_match_search",
+        category="evidence_kind",
+        mission=_make_mission("shape_zero_match",
+            objective="Search for a non-existent function name 'definitely_not_in_codebase' in codex_oss/. Verify zero-match evidence.",
+            allowed_paths=["codex_oss/answer_graph.py", "codex_oss/claim_graph.py", "codex_oss/runtime/loop.py"],
+            allowed_tool_classes=["read", "search"],
+            answer_obligations=[{
+                "id": "q1", "question": "Does 'definitely_not_in_codebase' appear anywhere in codex_oss/?",
+                "required": True,
+                "source_hints": ["codex_oss/"],
+                "source_requirements": [{
+                    "path": "codex_oss/runtime/loop.py",
+                    "evidence_kind": "zero_match",
+                    "required": True, "prefetch": False,
+                    "required_shapes": ["zero_match"],
+                }],
+            }],
+            must_inspect=["codex_oss/runtime/loop.py"],
+        ),
+        expected_requires_closure="COMPLETE",
+    ))
+
+    cases.append(BurninCase(
+        name="shape_flag_detection",
+        category="evidence_kind",
+        mission=_make_mission("shape_flag",
+            objective="Find any flag_parameter or flag_read shapes in codex_oss/raw_lane.py. Check for probe flags or behavior derivation patterns.",
+            allowed_paths=["codex_oss/raw_lane.py"],
+            allowed_tool_classes=["read"],
+            answer_obligations=[{
+                "id": "q1", "question": "Does codex_oss/raw_lane.py contain flag parameters or behavior derivation patterns?",
+                "required": True,
+                "source_hints": ["codex_oss/raw_lane.py"],
+                "source_requirements": [{
+                    "path": "codex_oss/raw_lane.py",
+                    "evidence_kind": "flag_behavior_check",
+                    "required": True, "prefetch": False,
+                    "required_shapes": ["flag_parameter", "flag_read", "behavior_derivation"],
+                }],
+            }],
+            must_inspect=["codex_oss/raw_lane.py"],
+        ),
+        expected_requires_closure="COMPLETE",
+    ))
+
+    cases.append(BurninCase(
+        name="scheduler_read_pool_concurrency",
+        category="scheduler",
+        mission=_make_mission("scheduler_read_pool",
+            objective="Investigate how the read-pool scheduler works. Find the scheduler/concurrency policy in the runtime.",
+            allowed_paths=["codex_oss/runtime/policy.py", "codex_oss/runtime/loop.py"],
+            allowed_tool_classes=["read", "search"],
+            answer_obligations=[{
+                "id": "q1", "question": "How does LANE_CAPACITY limit concurrent read-only missions?",
+                "required": True,
+                "source_hints": ["codex_oss/runtime/policy.py"],
+                "source_requirements": [
+                    {"path": "codex_oss/runtime/policy.py", "evidence_kind": "concurrency_config", "required": True, "prefetch": False, "required_shapes": ["config_value", "mapping_assignment"]},
+                ],
+            }],
+            must_inspect=["codex_oss/runtime/policy.py"],
+        ),
+        expected_requires_closure="COMPLETE",
+    ))
+
+    cases.append(BurninCase(
+        name="scheduler_mission_slot_tracking",
+        category="scheduler",
+        mission=_make_mission("scheduler_slot",
+            objective="Find how acquire_mission_slot and release_mission_slot work in the runtime scheduler.",
+            allowed_paths=["codex_oss/runtime/policy.py", "codex_oss/runtime/loop.py"],
+            allowed_tool_classes=["read", "search"],
+            answer_obligations=[{
+                "id": "q1", "question": "How does the runtime prevent overlapping workspace missions?",
+                "required": True,
+                "source_hints": ["codex_oss/runtime/policy.py"],
+                "source_requirements": [
+                    {"path": "codex_oss/runtime/policy.py", "evidence_kind": "scheduler_logic", "required": True, "prefetch": False, "required_shapes": ["function_definition"]},
+                ],
+            }],
+            must_inspect=["codex_oss/runtime/policy.py"],
+        ),
+        expected_requires_closure="COMPLETE",
+    ))
+
+    cases.append(BurninCase(
+        name="scheduler_lane_capacity",
+        category="scheduler",
+        mission=_make_mission("scheduler_lane",
+            objective="Find the lane capacity configuration for read_pool, patch_pool, isolated_apply, and workspace_apply.",
+            allowed_paths=["codex_oss/runtime/policy.py"],
+            allowed_tool_classes=["read"],
+            answer_obligations=[{
+                "id": "q1", "question": "What are the capacity limits for each scheduler lane?",
+                "required": True,
+                "source_hints": ["codex_oss/runtime/policy.py"],
+                "source_requirements": [{"path": "codex_oss/runtime/policy.py", "evidence_kind": "lane_config", "required": True, "prefetch": False, "required_shapes": ["mapping_assignment", "config_value"]}],
+            }],
+            must_inspect=["codex_oss/runtime/policy.py"],
+        ),
+        expected_requires_closure="COMPLETE",
+    ))
+
+    cases.append(BurninCase(
+        name="patch_pipeline_artifact_flow",
+        category="patch_pipeline",
+        mission=_make_mission("patch_artifact_flow",
+            objective="Trace how implementation artifacts flow from validate_patch_proposal through apply_patch_in_isolated_worktree.",
+            allowed_paths=["codex_oss/implementation.py"],
+            allowed_tool_classes=["read", "search"],
+            answer_obligations=[{
+                "id": "q1", "question": "What artifacts are written and where during the implementation pipeline?",
+                "required": True,
+                "source_hints": ["codex_oss/implementation.py"],
+                "source_requirements": [
+                    {"path": "codex_oss/implementation.py", "evidence_kind": "artifact_persistence", "required": True, "prefetch": False, "required_shapes": ["function_definition"]},
+                ],
+            }],
+            must_inspect=["codex_oss/implementation.py"],
+        ),
+        expected_requires_closure="COMPLETE",
+    ))
+
+    cases.append(BurninCase(
+        name="patch_pipeline_rollback_investigation",
+        category="patch_pipeline",
+        mission=_make_mission("patch_rollback",
+            objective="Find how rollback artifacts are generated in the implementation pipeline. Look for rollback_diff and git apply -R references.",
+            allowed_paths=["codex_oss/implementation.py"],
+            allowed_tool_classes=["read", "search"],
+            answer_obligations=[{
+                "id": "q1", "question": "How does the implementation pipeline generate and apply rollback?",
+                "required": True,
+                "source_hints": ["codex_oss/implementation.py"],
+                "source_requirements": [{"path": "codex_oss/implementation.py", "evidence_kind": "rollback_logic", "required": True, "prefetch": False}],
+            }],
+            must_inspect=["codex_oss/implementation.py"],
+        ),
+        expected_requires_closure="COMPLETE",
+    ))
+
+    cases.append(BurninCase(
+        name="patch_pipeline_verification_scope",
+        category="patch_pipeline",
+        mission=_make_mission("patch_verification",
+            objective="Find how verification_policy is enforced during isolated implementation. Which function validates verification commands?",
+            allowed_paths=["codex_oss/implementation.py"],
+            allowed_tool_classes=["read", "search"],
+            answer_obligations=[{
+                "id": "q1", "question": "How is verification_policy enforced in the implementation pipeline?",
+                "required": True,
+                "source_hints": ["codex_oss/implementation.py"],
+                "source_requirements": [{"path": "codex_oss/implementation.py", "evidence_kind": "verification_logic", "required": True, "prefetch": False, "required_shapes": ["function_definition"]}],
+            }],
+            must_inspect=["codex_oss/implementation.py"],
+        ),
+        expected_requires_closure="COMPLETE",
+    ))
+
+    cases.append(BurninCase(
+        name="raw_lane_cert_investigation",
+        category="raw_lane",
+        mission=_make_mission("raw_lane_cert",
+            objective="Investigate the raw_lane module. How does it differ from the runtime-backed managed_bridge path?",
+            allowed_paths=["codex_oss/raw_lane.py", "codex_oss/managed_bridge.py"],
+            allowed_tool_classes=["read", "search"],
+            answer_obligations=[{
+                "id": "q1", "question": "How does the raw lane differ from the managed bridge path?",
+                "required": True,
+                "source_hints": ["codex_oss/raw_lane.py", "codex_oss/managed_bridge.py"],
+                "source_requirements": [
+                    {"path": "codex_oss/raw_lane.py", "evidence_kind": "raw_lane_impl", "required": True, "prefetch": False},
+                    {"path": "codex_oss/managed_bridge.py", "evidence_kind": "managed_bridge_impl", "required": True, "prefetch": False},
+                ],
+            }],
+            must_inspect=["codex_oss/raw_lane.py", "codex_oss/managed_bridge.py"],
+        ),
+        expected_requires_closure="COMPLETE",
+        tolerance_for_false_complete=True,
+    ))
+
+    cases.append(BurninCase(
+        name="raw_lane_probe_flags",
+        category="raw_lane",
+        mission=_make_mission("raw_lane_probe",
+            objective="Check if codex_oss/raw_lane.py uses probe flags or behavior flags that differentiate raw cert from runtime-backed cert.",
+            allowed_paths=["codex_oss/raw_lane.py"],
+            allowed_tool_classes=["read"],
+            answer_obligations=[{
+                "id": "q1", "question": "Does raw_lane.py use probe or behavior flags?",
+                "required": True,
+                "source_hints": ["codex_oss/raw_lane.py"],
+                "source_requirements": [{
+                    "path": "codex_oss/raw_lane.py",
+                    "evidence_kind": "flag_check",
+                    "required": True, "prefetch": False,
+                    "required_shapes": ["flag_parameter", "flag_read"],
+                }],
+            }],
+            must_inspect=["codex_oss/raw_lane.py"],
+        ),
+        expected_requires_closure="COMPLETE",
+        tolerance_for_false_complete=True,
+    ))
+
     return cases
 
 
