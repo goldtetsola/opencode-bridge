@@ -141,6 +141,92 @@ def refresh_answer_graph(
     return graph
 
 
+def check_partial_evidence_entitlement(obligation: dict[str, Any], ledger: Any) -> dict[str, Any]:
+    """Evaluate whether partial evidence entitles this obligation to COMPLETE.
+
+    Returns a dict with:
+      complete_allowed: bool
+      reason: str
+      confidence_cap: str
+      partial_sources: list of paths with partial evidence
+    """
+    source_requirements = list(obligation.get("source_requirements", []) or [])
+    if not source_requirements:
+        return {"complete_allowed": True, "reason": "No source requirements — obligation status alone determines entitlement.",
+                "confidence_cap": "HIGH", "partial_sources": []}
+
+    partial_sources = []
+    for req in source_requirements:
+        path = str(req.get("path", "") or "")
+        if not path:
+            continue
+        file_entry = (getattr(ledger, "files_inspected", {}) or {}).get(path)
+        if file_entry is None:
+            continue
+        if not getattr(file_entry, "complete", False):
+            partial_sources.append({
+                "path": path,
+                "completeness_policy": str(req.get("completeness_policy", "shape_sufficient") or "shape_sufficient"),
+                "required_shapes_found": list(req.get("detected_shapes", []) or []),
+                "missing_shapes": list(req.get("missing_shapes", []) or []),
+                "status": str(req.get("status", "") or ""),
+            })
+
+    if not partial_sources:
+        return {"complete_allowed": True, "reason": "All source files were fully extracted.",
+                "confidence_cap": "HIGH", "partial_sources": []}
+
+    # Evaluate each partial source
+    blocked = False
+    for ps in partial_sources:
+        policy = ps.get("completeness_policy", "shape_sufficient")
+        if policy == "whole_file_required":
+            # Partial extract is never enough
+            return {
+                "complete_allowed": False,
+                "reason": f"File {ps['path']} requires whole_file_required completeness but was partially extracted.",
+                "confidence_cap": "LOW",
+                "partial_sources": [{"path": p["path"], "policy": p["completeness_policy"]} for p in partial_sources],
+            }
+        if policy == "negative_proof_required":
+            return {
+                "complete_allowed": False,
+                "reason": f"Negative proof requires full scope search; partial extract of {ps['path']} is insufficient.",
+                "confidence_cap": "LOW",
+                "partial_sources": [{"path": p["path"], "policy": p["completeness_policy"]} for p in partial_sources],
+            }
+        if policy == "scope_search_required":
+            return {
+                "complete_allowed": False,
+                "reason": f"Scope search required but file {ps['path']} was only partially extracted.",
+                "confidence_cap": "LOW",
+                "partial_sources": [{"path": p["path"], "policy": p["completeness_policy"]} for p in partial_sources],
+            }
+        if policy == "shape_sufficient" or policy == "range_sufficient":
+            if ps.get("missing_shapes"):
+                # Required shapes not found in partial extract — insufficient
+                return {
+                    "complete_allowed": False,
+                    "reason": f"File {ps['path']} was partially extracted and missing required shapes: {ps['missing_shapes']}.",
+                    "confidence_cap": "LOW",
+                    "partial_sources": [{"path": p["path"], "policy": p["completeness_policy"]} for p in partial_sources],
+                }
+            # Shape is present — partial is sufficient but cap confidence
+            continue
+
+    if blocked:
+        return {"complete_allowed": False, "reason": "Partial evidence not sufficient.",
+                "confidence_cap": "LOW", "partial_sources": partial_sources}
+
+    # All partial sources are entitled
+    return {
+        "complete_allowed": True,
+        "reason": f"Partial evidence is entitled under shape_sufficient/range_sufficient policy (sources: {[p['path'] for p in partial_sources]}).",
+        "confidence_cap": "MEDIUM",
+        "partial_sources": partial_sources,
+    }
+
+
 def evaluate_answer_sufficiency(
     mission: Any,
     obligations: list[dict[str, Any]],
@@ -180,6 +266,19 @@ def evaluate_answer_sufficiency(
         or getattr(ledger, "commands_run", [])
     )
     can_close = not open_required and not pending_required_sources and not contradicted and not blocked and not insufficient and has_useful_evidence
+    partial_entitlement = None
+    if can_close and partial_extracts:
+        # Check partial evidence entitlement for answered obligations
+        partial_entitlement = {}
+        for obl in answered:
+            entitlement = check_partial_evidence_entitlement(obl, ledger)
+            if not entitlement["complete_allowed"]:
+                can_close = False
+                partial_entitlement = entitlement
+                break
+            partial_entitlement = entitlement
+        if not partial_entitlement:
+            partial_entitlement = {"complete_allowed": True, "reason": "No partial extracts affecting answered obligations."}
     if contradicted or blocked:
         recommended_status = "ESCALATE"
     elif can_close:
@@ -212,8 +311,9 @@ def evaluate_answer_sufficiency(
         "blocked_obligations": [str(item.get("id", "") or "") for item in blocked],
         "insufficient_evidence_obligations": [str(item.get("id", "") or "") for item in insufficient],
         "open_high_priority_questions": open_questions,
-        "confidence_cap": confidence_cap,
+        "confidence_cap": partial_entitlement.get("confidence_cap", confidence_cap) if partial_entitlement else confidence_cap,
         "partial_extracts": partial_extracts,
+        "partial_evidence_entitlement": partial_entitlement,
         "reason": reason,
         "next_required_actions": _next_required_actions(agenda_items),
     }
@@ -259,6 +359,12 @@ def build_runtime_report_from_answer_graph(
         caveats.append("At least one required evidence source was blocked or unreadable.")
     if insufficient:
         caveats.append("At least one required evidence source was read but did not satisfy the required evidence shape.")
+    if sufficiency.get("partial_extracts"):
+        entitlement = sufficiency.get("partial_evidence_entitlement") or {}
+        if entitlement.get("complete_allowed"):
+            caveats.append("Some evidence sources were partially extracted but required evidence shapes were present.")
+        else:
+            caveats.append("Some evidence sources were partially extracted and did not satisfy completeness requirements.")
     if str(getattr(mission, "objective_style", "") or "") == "open_investigation":
         caveats.append("Report rendered from runtime answer graph.")
     report = {
@@ -285,10 +391,11 @@ def build_runtime_report_from_answer_graph(
         "report_source": report_source,
         "closure_source": report_source,
         "answer_graph_summary": {
-            "required_answered": int(sufficiency.get("required_answered", 0) or 0),
-            "required_total": int(sufficiency.get("required_total", 0) or 0),
-            "can_close": bool(sufficiency.get("can_close")),
-            "reason": str(sufficiency.get("reason", "") or ""),
+            "required_answered": sufficiency.get("required_answered", 0),
+            "required_total": sufficiency.get("required_total", 0),
+            "can_close": sufficiency.get("can_close", False),
+            "reason": sufficiency.get("reason", ""),
+            "partial_evidence_entitlement": sufficiency.get("partial_evidence_entitlement"),
         },
     }
     return report
@@ -348,6 +455,7 @@ def _normalize_obligation(raw: dict[str, Any]) -> dict[str, Any]:
                 "prefetch": bool(item.get("prefetch", True)),
                 "required_shapes": [str(shape) for shape in (item.get("required_shapes", []) or []) if str(shape)],
                 "contradiction_markers": [str(marker) for marker in (item.get("contradiction_markers", []) or []) if str(marker)],
+                "completeness_policy": str(item.get("completeness_policy", "") or "") or "shape_sufficient",
             })
     return {
         "id": str(raw.get("id", "q")),
@@ -410,6 +518,7 @@ def _source_requirement_view(requirement: dict[str, Any], inspected_paths: set[s
         status = "insufficient_evidence"
     else:
         status = "satisfied"
+    completeness_policy = str(requirement.get("completeness_policy", "") or "") or "shape_sufficient"
     return {
         "path": path,
         "evidence_kind": str(requirement.get("evidence_kind", "source_read") or "source_read"),
@@ -420,6 +529,7 @@ def _source_requirement_view(requirement: dict[str, Any], inspected_paths: set[s
         "missing_shapes": missing_shapes,
         "contradiction_markers": contradiction_markers,
         "matched_contradictions": matched_contradictions,
+        "completeness_policy": completeness_policy,
         "status": status,
         "evidence_refs": list(dict.fromkeys(evidence_refs + failed_reads)),
     }

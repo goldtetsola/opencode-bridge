@@ -549,8 +549,48 @@ def _validate_source_requirements(raw: Any, *, field_name: str) -> List[dict]:
             "prefetch": bool(item.get("prefetch", True)),
             "required_shapes": [str(shape) for shape in (item.get("required_shapes", []) or []) if str(shape)],
             "contradiction_markers": [str(marker) for marker in (item.get("contradiction_markers", []) or []) if str(marker)],
+            "completeness_policy": _validate_completeness_policy(item.get("completeness_policy"), evidence_kind),
         })
     return requirements
+
+
+def _validate_completeness_policy(raw: Any, evidence_kind: str) -> str:
+    valid = {"shape_sufficient", "whole_file_required", "scope_search_required", "range_sufficient", "negative_proof_required"}
+    policy = str(raw or "").strip()
+    if policy and policy not in valid:
+        raise InvalidHandoffError(f"completeness_policy must be one of {sorted(valid)}, got: {policy}")
+    if policy:
+        return policy
+    return _default_completeness_policy(evidence_kind)
+
+
+def _default_completeness_policy(evidence_kind: str) -> str:
+    defaults = {
+        "function_definition": "shape_sufficient",
+        "function_presence": "shape_sufficient",
+        "function_location": "shape_sufficient",
+        "class_definition": "shape_sufficient",
+        "mapping_assignment": "shape_sufficient",
+        "config_value": "shape_sufficient",
+        "config_mapping": "shape_sufficient",
+        "flag_parameter": "shape_sufficient",
+        "flag_read": "shape_sufficient",
+        "flag_check": "shape_sufficient",
+        "integration_usage": "shape_sufficient",
+        "artifact_persistence": "shape_sufficient",
+        "implementation_logic": "shape_sufficient",
+        "audit_enforcement": "shape_sufficient",
+        "behavior_derivation": "whole_file_required",
+        "broad_policy_audit": "whole_file_required",
+        "security_review": "whole_file_required",
+        "negative_proof": "negative_proof_required",
+        "scope_search": "scope_search_required",
+        "contradiction_check": "shape_sufficient",
+        "secret_check": "shape_sufficient",
+        "source_access": "shape_sufficient",
+        "zero_match": "shape_sufficient",
+    }
+    return defaults.get(evidence_kind, "shape_sufficient")
 
 
 def _validate_verification_policy(raw: Any) -> dict:
