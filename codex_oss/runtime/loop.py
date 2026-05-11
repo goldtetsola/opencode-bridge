@@ -394,6 +394,21 @@ def run_loop(mission: Any, ledger: Any, call_model_fn, tools, emitter,
                         if answer_sufficiency is not None:
                             if not bool(answer_sufficiency.get("can_close", False)):
                                 coverage_errors = list(coverage_errors) + list(answer_sufficiency.get("open_high_priority_questions", []) or []) + list(answer_sufficiency.get("missing_must_inspect", []) or [])
+                                if str(report.get("status", "") or "").upper() == "COMPLETE":
+                                    entitlement = answer_sufficiency.get("closure_entitlement", {}) or {}
+                                    reason_code = answer_sufficiency.get("reason_code", "")
+                                    report["status"] = answer_sufficiency.get("recommended_status", "PARTIAL")
+                                    cap = answer_sufficiency.get("confidence_cap", "LOW")
+                                    report["confidence"] = min_confidence(report.get("confidence", "LOW"), cap)
+                                    report.setdefault("caveats", []).append(
+                                        f"Runtime downgraded model COMPLETE to {report['status']}: {entitlement.get('reason', reason_code)}"
+                                    )
+                                    _annotate_report_provenance(mission, report, "model_report_downgraded")
+                                    _record_action_trace(
+                                        mission, ledger, action, _mission_phase(ledger), "downgraded",
+                                        f"model COMPLETE downgraded: {reason_code}",
+                                        deadline, {}, action.arguments if isinstance(action.arguments, dict) else {}, [],
+                                    )
                         elif not bool(sufficiency.get("enough_evidence_to_report", False)):
                             coverage_errors = list(coverage_errors) + list(sufficiency.get("missing_requirements", []) or [])
                         if coverage_errors:
