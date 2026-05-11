@@ -2051,6 +2051,13 @@ class ProxyApp:
         self.upstream_models_url = f"{self.upstream_base}/models"
         self.upstream_key = os.getenv("UPSTREAM_API_KEY") or os.getenv("OPENCODE_GO_API_KEY", "")
         self.proxy_key = os.getenv("PROXY_API_KEY") or os.getenv("LITELLM_MASTER_KEY") or ""
+        if self.proxy_key and self.upstream_key and self.proxy_key == self.upstream_key:
+            print("FATAL: Local proxy token (PROXY_API_KEY/LITELLM_MASTER_KEY) must not equal the upstream OpenCode Go key.", file=sys.stderr)
+            print("Use a separate local bearer token for Codex-to-bridge auth. Set CODEX_OSS_LOCAL_TOKEN.", file=sys.stderr)
+            sys.exit(1)
+        if self.proxy_key and self.upstream_key and len(self.proxy_key) > 30 and self.proxy_key.startswith("sk-"):
+            if self.proxy_key[:8] == self.upstream_key[:8]:
+                print("WARNING: Local proxy token shares prefix with upstream key. Verify they are different.", file=sys.stderr)
         self.gpt_model_strategy = os.getenv("GPT_MODEL_STRATEGY", "error").strip().lower()
         self.gpt_oss_fallback = os.getenv("GPT_MODEL_OSS_FALLBACK", "deepseek-v4-pro").strip()
         self.openai_key = os.getenv("OPENAI_API_KEY", "")

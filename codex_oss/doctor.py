@@ -396,6 +396,29 @@ def _check_bridge(url: str, report: DoctorReport, root: Path, live_model: bool =
     else:
         _check_live_model(api_url, auth, report)
 
+    # Auth separation — local proxy token must not equal upstream key
+    upstream_key = os.getenv("UPSTREAM_API_KEY") or os.getenv("OPENCODE_GO_API_KEY", "")
+    proxy_key = os.getenv("PROXY_API_KEY") or os.getenv("LITELLM_MASTER_KEY") or ""
+    if proxy_key and upstream_key and proxy_key == upstream_key:
+        report.add("bridge.auth_separation", "FAIL",
+            "PROXY_API_KEY equals OPENCODE_GO_API_KEY — auth crossover risk. Codex-to-bridge requests would fail.",
+            "Set CODEX_OSS_LOCAL_TOKEN to a simple local bearer token (e.g. sk-local-codex-bridge) instead of reusing the upstream key")
+    elif proxy_key and upstream_key and proxy_key.startswith("sk-") and upstream_key.startswith("sk-") and proxy_key[:8] == upstream_key[:8]:
+        report.add("bridge.auth_separation", "WARN",
+            "Local proxy token shares prefix with upstream key — verify they are different tokens",
+            "Ensure PROXY_API_KEY is a separate bearer token, not the upstream API key")
+    elif proxy_key and proxy_key.startswith("sk-ocg") or (upstream_key and proxy_key.startswith("sk-ocg")):
+        report.add("bridge.auth_separation", "WARN",
+            "Local proxy token appears to be an OpenCode Go key. Use a simple local token like sk-local-codex-bridge.",
+            "")
+    elif proxy_key:
+        report.add("bridge.auth_separation", "PASS" if not upstream_key or proxy_key != upstream_key else "WARN",
+            "Local proxy token is configured")
+    else:
+        report.add("bridge.auth_separation", "WARN",
+            "No explicit local proxy token set — using default sk-local-codex-bridge",
+            "Set PROXY_API_KEY for production use")
+
     # State DB persistence — read from health endpoint
     state_db = health.get("state_db", "")
     if not state_db or state_db == "unknown":

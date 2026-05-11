@@ -287,16 +287,23 @@ def evaluate_answer_sufficiency(
         recommended_status = "PARTIAL"
     else:
         recommended_status = "FAILED"
-    open_questions = [item.get("question", "") for item in open_required if item.get("question")]
     reason = "All required obligations and required sources are satisfied." if can_close else (
         "Required evidence contradicts itself." if contradicted else
         "A required evidence source is blocked or unreadable." if blocked else
+        "Partial evidence does not satisfy completeness requirements." if partial_entitlement and not partial_entitlement.get("complete_allowed", True) else
         "Required evidence was read but the required evidence shape was not found." if insufficient else
         "Required evidence sources remain uninspected."
         if pending_required_sources
         else "Required answer obligations remain unanswered."
         if open_required
         else "No useful evidence gathered yet."
+    )
+    open_questions: list[str] = []
+    reason_code = _sufficiency_reason_code(
+        contradicted=contradicted, blocked=blocked, insufficient=insufficient,
+        pending_required=pending_required_sources, open_required=open_required,
+        partial_unentitled=partial_entitlement and not partial_entitlement.get("complete_allowed", True),
+        can_close=can_close,
     )
     return {
         "sufficiency_version": "2.0",
@@ -315,6 +322,13 @@ def evaluate_answer_sufficiency(
         "partial_extracts": partial_extracts,
         "partial_evidence_entitlement": partial_entitlement,
         "reason": reason,
+        "reason_code": reason_code,
+        "closure_entitlement": {
+            "can_return_complete": can_close and recommended_status == "COMPLETE",
+            "reason": reason,
+            "reason_code": reason_code,
+            "partial_evidence_entitled": partial_entitlement.get("complete_allowed", True) if partial_entitlement else True,
+        },
         "next_required_actions": _next_required_actions(agenda_items),
     }
 
@@ -675,10 +689,10 @@ def _coverage_status(obligations: list[dict[str, Any]], agenda_items: list[dict[
         for item in agenda_items
         if item.get("kind") == "required_read" and item.get("status") != "done"
     ]
-    can_complete = len(answered) == len(required) and not missing_sources and not contradicted and not blocked and not insufficient
+    coverage_complete = len(answered) == len(required) and not missing_sources and not contradicted and not blocked and not insufficient
     if contradicted or blocked:
         recommended_status = "ESCALATE"
-    elif can_complete:
+    elif coverage_complete:
         recommended_status = "COMPLETE"
     elif answered or missing_sources or insufficient:
         recommended_status = "PARTIAL"
@@ -691,9 +705,37 @@ def _coverage_status(obligations: list[dict[str, Any]], agenda_items: list[dict[
         "contradicted_obligations": contradicted,
         "blocked_obligations": blocked,
         "insufficient_evidence_obligations": insufficient,
-        "can_complete": can_complete,
+        "can_complete": coverage_complete,
+        "coverage_complete": coverage_complete,
         "recommended_status": recommended_status,
     }
+
+
+def _sufficiency_reason_code(
+    *,
+    contradicted: list,
+    blocked: list,
+    insufficient: list,
+    pending_required: list,
+    open_required: list,
+    partial_unentitled: bool,
+    can_close: bool,
+) -> str:
+    if contradicted:
+        return "contradiction_unresolved"
+    if blocked:
+        return "blocked_source"
+    if insufficient:
+        return "missing_required_shape"
+    if pending_required:
+        return "missing_required_source"
+    if open_required:
+        return "unanswered_obligation"
+    if partial_unentitled:
+        return "partial_evidence_not_entitled"
+    if can_close:
+        return "all_satisfied"
+    return "no_evidence"
 
 
 def _next_required_actions(agenda_items: list[dict[str, Any]]) -> list[dict[str, Any]]:
