@@ -1103,6 +1103,22 @@ def min_confidence(a: str, b: str) -> str:
     return a if order.get(a, 0) < order.get(b, 0) else b
 
 
+def _sanitize_fallback_reason(raw_reason: str) -> str:
+    """Replace raw model validation errors with clean user-facing messages."""
+    r = str(raw_reason or "")
+    if r.startswith("report_validation_failed:"):
+        return "The model's final report did not pass validation, so the runtime closed from the answer graph."
+    if r.startswith("model_call_failed:") and "timed out" in r.lower():
+        return "The model call timed out, so the runtime closed from the answer graph."
+    if r.startswith("model_call_failed:"):
+        return "The model call failed, so the runtime closed from the answer graph."
+    if r.startswith("deadline_final_report_ignored"):
+        return "The model ignored the deadline final-report request, so the runtime closed from the answer graph."
+    if r.startswith("closer_budget_exhausted"):
+        return "Insufficient time for model closure, so the runtime closed from the answer graph."
+    return r
+
+
 def _partial_dict(mission, ledger, reason: str) -> dict:
     from codex_oss.runtime.policy import build_deterministic_partial_report
     if str(getattr(mission, "objective_style", "") or "") == "open_investigation":
@@ -1120,7 +1136,7 @@ def _partial_dict(mission, ledger, reason: str) -> dict:
             answer_graph = _runtime_prefetch_required_sources(
                 mission, ledger, answer_graph, _allowed_tool_names(mission), _NoDeadline(),
             )
-        report = build_runtime_report_from_answer_graph(mission, ledger, answer_graph, reason=reason, report_source="runtime_answer_graph")
+        report = build_runtime_report_from_answer_graph(mission, ledger, answer_graph, reason=_sanitize_fallback_reason(reason), report_source="runtime_answer_graph")
         _annotate_report_provenance(mission, report, "runtime_answer_graph")
         exploration_policy = _exploration_policy(mission)
         after_floor = str(exploration_policy.get("after_required_floor", "") or "")

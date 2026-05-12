@@ -178,8 +178,17 @@ class BurninHarness:
         self.summary.summary_complete = True
         if result:
             self.summary.result = result
-        self._update_summary()
         self._write_summary()
+        # Delegate to the authoritative finalizer for reconciled summary
+        try:
+            from codex_oss.burnin.finalizer import finalize_burnin_run
+            reconciled = finalize_burnin_run(self.project_root, self.run_id)
+            if isinstance(reconciled, dict) and "error" not in reconciled:
+                self.summary = BurninSummary(**{k: v for k, v in reconciled.items() if hasattr(BurninSummary, k)})
+                self.summary.summary_type = "reconciled"
+                self._write_summary()
+        except Exception:
+            pass
 
     def run_preflight(self) -> PreflightResult:
         preflight = run_burnin_preflight(

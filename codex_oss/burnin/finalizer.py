@@ -217,6 +217,8 @@ def finalize_burnin_run(project_root: str, run_id: str) -> JSON:
         "suspicious_complete_count": suspicious,
         "evidence_ref_failures": evidence_failures,
     }
+    result_dict["summary_type"] = "reconciled"
+    result_dict["summary_complete"] = True
     result_dict["native_feeling"] = {
         "pass": native_feeling_ok,
         "model_self_close_rate": round(summary.model_self_close_rate, 2),
