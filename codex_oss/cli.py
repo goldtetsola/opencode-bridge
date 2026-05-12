@@ -56,6 +56,16 @@ def main():
     r.add_argument("--port", type=int, default=4000, help="Port (default: 4000)")
     r.add_argument("--verify-fresh", action="store_true", default=True, help="Verify runtime freshness after restart (default: true)")
 
+    # show-trace / show-summary
+    st = sub.add_parser("show-trace", help="Display visible commentary trace for a mission")
+    st.add_argument("mission_id", help="Mission ID")
+    st.add_argument("--project", type=str, help="Project root path", default=None)
+    st.add_argument("--json", action="store_true", help="Machine-readable output")
+
+    ss = sub.add_parser("show-summary", help="Display summary.md for a mission")
+    ss.add_argument("mission_id", help="Mission ID")
+    ss.add_argument("--project", type=str, help="Project root path", default=None)
+
     # status
     sub.add_parser("status", help="Show bridge health")
 
@@ -263,6 +273,14 @@ def main():
 
     elif args.command == "validate-handoff":
         sys.exit(_validate_handoff(args.file))
+
+    elif args.command == "show-trace":
+        project_root = args.project or os.getcwd()
+        sys.exit(_show_trace(project_root, args.mission_id, json_output=args.json))
+
+    elif args.command == "show-summary":
+        project_root = args.project or os.getcwd()
+        sys.exit(_show_summary(project_root, args.mission_id))
 
     elif args.command == "mission":
         sys.exit(_mission(args))
@@ -937,6 +955,47 @@ def _stop_bridge(port: int = 4000):
                     pass
         else:
             print(f"No bridge found on port {port}")
+
+
+def _show_trace(project_root: str, mission_id: str, *, json_output: bool = False) -> int:
+    """Display visible commentary trace for a mission."""
+    import json as _json
+    path = os.path.join(project_root, ".codex-oss", "missions", mission_id, "visible_commentary.jsonl")
+    if not os.path.exists(path):
+        print(f"No visible trace found for mission {mission_id}", file=sys.stderr)
+        return 1
+    events = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            try:
+                events.append(_json.loads(line.strip()))
+            except _json.JSONDecodeError:
+                pass
+    if json_output:
+        print(_json.dumps(events, indent=2))
+        return 0
+    for e in events:
+        phase = e.get("phase", "")
+        title = e.get("title", "")
+        msg = e.get("message", "")
+        sev = e.get("severity", "info")
+        prefix = f"[{phase}]" if phase else ""
+        symbol = "!" if sev == "warning" else ("*" if sev == "error" else "")
+        print(f"{symbol}{prefix} {title}")
+        if msg and msg != title:
+            print(f"   {msg}")
+    return 0
+
+
+def _show_summary(project_root: str, mission_id: str) -> int:
+    """Display summary.md for a mission."""
+    path = os.path.join(project_root, ".codex-oss", "missions", mission_id, "summary.md")
+    if not os.path.exists(path):
+        print(f"No summary found for mission {mission_id}", file=sys.stderr)
+        return 1
+    with open(path, "r", encoding="utf-8") as f:
+        print(f.read())
+    return 0
 
 
 def _bridge_status():

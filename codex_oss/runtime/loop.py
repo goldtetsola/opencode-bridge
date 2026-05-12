@@ -122,7 +122,8 @@ Valid action_types: tool_call (with tool_name and arguments) or final_report (wi
 
 def run_loop(mission: Any, ledger: Any, call_model_fn, tools, emitter,
              allowed_roots: list, allowed_paths: list,
-             max_repair: int = 1, request_deadline: float = 90) -> dict:
+             max_repair: int = 1, request_deadline: float = 90,
+             commentary: Any | None = None) -> dict:
     """Run the plan-act-observe loop for a managed investigation mission."""
     import time as _time
     from codex_oss.runtime.policy import (
@@ -242,6 +243,17 @@ def run_loop(mission: Any, ledger: Any, call_model_fn, tools, emitter,
             "phase recomputed after runtime prefetch",
         )
         context = _build_context(mission, ledger, allowed_tool_names)
+
+        if commentary is not None:
+            mode = str(getattr(mission, "evidence_collection_mode", "prefetch_floor") or "prefetch_floor")
+            required_count = len(list(getattr(mission, "must_inspect", []) or []))
+            style = str(getattr(mission, "objective_style", "") or "")
+            commentary.emit(
+                "mission_started", "Mission accepted",
+                f"I'm loading the compiled MissionV1 contract{f' ({required_count} required source(s))' if required_count else ''}.",
+                phase="PLAN", source="runtime", model=str(getattr(mission, "runtime_model_alias", "") or ""),
+                metadata={"mode": mode, "objective_style": style, "required_sources": required_count},
+            )
 
         while True:
             elapsed = _time.time() - start
@@ -409,6 +421,13 @@ def run_loop(mission: Any, ledger: Any, call_model_fn, tools, emitter,
                                         f"model COMPLETE downgraded: {reason_code}",
                                         deadline, {}, action.arguments if isinstance(action.arguments, dict) else {}, [],
                                     )
+                                    if commentary is not None:
+                                        commentary.emit(
+                                            "report_downgraded", "Report status downgraded",
+                                            f"Runtime downgraded model COMPLETE to {report['status']}: {entitlement.get('reason', reason_code)}",
+                                            phase="REPORT", source="report_acceptance", severity="warning",
+                                            metadata={"reason_code": reason_code},
+                                        )
                         elif not bool(sufficiency.get("enough_evidence_to_report", False)):
                             coverage_errors = list(coverage_errors) + list(sufficiency.get("missing_requirements", []) or [])
                         if coverage_errors:
@@ -566,6 +585,13 @@ def run_loop(mission: Any, ledger: Any, call_model_fn, tools, emitter,
                             f"for obligation {next_action.get('obligation_id', '')}. "
                             "Do not reread already-covered sources or move to VERIFY/REPORT yet."
                         )})
+                        if commentary is not None:
+                            commentary.emit(
+                                "runtime_redirect", "Redirecting to required evidence",
+                                f"The model strayed from the evidence agenda, so I'm redirecting to the pending required source: {next_action.get('path', '')}.",
+                                phase=_mission_phase(ledger), source="runtime", runtime_decision="redirected",
+                                severity="warning",
+                            )
                         continue
                     if action_phase == "VERIFY" and required_answered == 0:
                         _record_action_trace(
@@ -840,6 +866,16 @@ def run_loop(mission: Any, ledger: Any, call_model_fn, tools, emitter,
                 )})
     finally:
         release_mission_slot(mission.mission_id)
+        if commentary is not None:
+            try:
+                commentary.emit(
+                    "mission_completed", "Mission ended",
+                    "The investigation is complete. Final report and evidence artifacts have been persisted.",
+                    phase="REPORT", source="runtime",
+                )
+                commentary.close()
+            except Exception:
+                pass
 
 
 def _exec_tool(tool_name: str, executor, arguments: dict, path: str):
