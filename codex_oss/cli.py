@@ -186,6 +186,11 @@ def main():
     certify.add_argument("--no-refresh", action="store_true", help="Do not regenerate proof/operational evidence before certification")
     certify.add_argument("--json", action="store_true", help="Machine-readable output")
 
+    bf = sub.add_parser("burnin-finalize", help="Reconstruct burn-in summary from manifest and mission artifacts")
+    bf.add_argument("--run-id", type=str, required=True, help="Burn-in run ID")
+    bf.add_argument("--project", type=str, default=None, help="Project root path")
+    bf.add_argument("--json", action="store_true", help="Machine-readable output")
+
     legacy = sub.add_parser("archive-legacy-missions", help="Plan or archive legacy/incomplete mission artifacts")
     legacy.add_argument("--project", type=str, default=None, help="Project root path")
     legacy.add_argument("--apply", action="store_true", help="Move planned legacy missions into .codex-oss/missions-legacy/")
@@ -484,6 +489,20 @@ def main():
                 status = "PASS" if gate.get("ok") else "FAIL"
                 print(f"- {status} {name}: {gate.get('basis', '')}")
         sys.exit(0 if report["verdict"].get("status") == "CERTIFIED" else 1)
+
+    elif args.command == "burnin-finalize":
+        from codex_oss.burnin.finalizer import finalize_burnin_run
+        project_root = args.project or os.getcwd()
+        result = finalize_burnin_run(project_root, args.run_id)
+        if args.json:
+            print(json_dumps_safe(result))
+        else:
+            print(f"Run: {result.get('run_id', '?')}")
+            print(f"Cases: {result.get('completed_cases', 0)}/{result.get('expected_cases', 0)}")
+            print(f"Truth-safe: {result.get('truth_safe', {}).get('pass', False)}")
+            print(f"Native-feeling: {result.get('native_feeling', {}).get('pass', False)}")
+            print(f"Summary: {result.get('run_dir', '')}/summary.json")
+        sys.exit(0 if result.get("truth_safe", {}).get("pass") else 1)
 
     elif args.command == "archive-legacy-missions":
         project_root = args.project or os.getcwd()
