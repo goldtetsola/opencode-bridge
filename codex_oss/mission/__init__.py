@@ -105,6 +105,8 @@ class MissionV1:
     must_inspect: List[str] = field(default_factory=list)
     evidence_collection_mode: str = "prefetch_floor"
     exploration_policy: dict = field(default_factory=dict)
+    closer_model: str = ""
+    fallback_closer_model: str = ""
 
     # AdaptiveAutonomyBudgetV1
     max_model_calls: int = 25

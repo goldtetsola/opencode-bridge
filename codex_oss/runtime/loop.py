@@ -1158,7 +1158,7 @@ def _record_closer_attempt(mission: Any, closer_type: str, status: str, *, elaps
         record_closure_attempt(
             mission_dir,
             f"close_{int(time.time())}",
-            closer_model=str(getattr(mission, "runtime_model_alias", "") or "unknown"),
+            closer_model=str(getattr(mission, "closer_model", "") or getattr(mission, "runtime_model_alias", "") or "unknown"),
             closure_strategy="model_report" if closer_type == "model" else "runtime_answer_graph",
             elapsed_seconds=elapsed,
             payload_chars=payload_chars,

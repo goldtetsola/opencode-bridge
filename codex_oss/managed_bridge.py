@@ -387,6 +387,8 @@ def _write_readonly_mission_artifacts(mission: Any, ledger: Any, report: dict, s
         "exploration_policy": dict(getattr(mission, "exploration_policy", {}) or {}),
         "source_requirements": list(getattr(mission, "source_requirements", []) or []),
         "closure_policy": dict(getattr(mission, "closure_policy", {}) or {}),
+        "closer_model": str(getattr(mission, "closer_model", "") or ""),
+        "fallback_closer_model": str(getattr(mission, "fallback_closer_model", "") or ""),
     }
     ledger_payload = {
         "mission_id": mission_id,
