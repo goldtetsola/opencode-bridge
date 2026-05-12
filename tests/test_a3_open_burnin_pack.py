@@ -980,7 +980,7 @@ def main():
     results: list[BurninResult] = []
     final_status = "FAIL"
     try:
-        results = run_burnin(selected_cases, mission_ids=mission_ids, limit=limit, start=start)
+        results = run_burnin(selected_cases, mission_ids=mission_ids, limit=limit, start=1)
         harness.scan_missing_artifacts(MISSIONS_ROOT)
 
         for result in results:

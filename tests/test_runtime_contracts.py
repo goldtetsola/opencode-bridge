@@ -3836,6 +3836,48 @@ def assert_evidence_kind_multiple_shapes_with_contradiction():
         assert "q1" in contradicted, f"Expected q1 in contradicted_obligations, got {contradicted}"
 
 
+def assert_semantic_gate_downgrades_hollow_complete():
+    from codex_oss.report_semantics import evaluate_report_semantic_completeness, build_published_answer, apply_semantic_status_cap
+
+    # Simulate a hollow COMPLETE report
+    hollow_report = {
+        "status": "COMPLETE",
+        "findings": [],
+        "missing_fields": ["target value not retrieved"],
+        "uncertainties": ["The target value was not retrieved from the file."],
+        "caveats": ["File was not inspected directly."],
+        "confidence": "HIGH",
+    }
+    mission = _build_mission({"schema_version": "oss_agent_mission.v1", "mission_id": "test_semantic", "tier": "A3", "mode": "managed_investigation", "objective": "test", "risk_tier": "low", "write_allowed": False, "allowed_roots": ["codex_oss/"], "allowed_paths": [], "tool_budget": 3, "time_budget_seconds": 30, "allowed_tool_classes": ["read", "search", "list"], "stop_conditions": ["valid_report", "budget_exhausted", "deadline_reached"], "report_schema": "managed_investigation_report.v1", "required_outputs": ["files_inspected", "commands_run", "findings", "uncertainties", "confidence", "caveats", "escalation_recommendation"], "objective_style": "open_investigation"})
+
+    answer_graph = {"required_obligations": [{"id": "q1", "question": "Where?", "status": "answered", "evidence_refs": ["file:x"]}], "sufficiency": {"required_answered": 1, "required_total": 1, "can_close": True, "recommended_status": "COMPLETE", "confidence_cap": "MEDIUM", "closure_entitlement": {"can_return_complete": True}}}
+    published = build_published_answer(mission, answer_graph, None)
+    result = evaluate_report_semantic_completeness(mission, hollow_report, published, answer_graph, None)
+
+    assert result["ok"] is False, f"Hollow COMPLETE should fail: {result}"
+    assert "complete_with_empty_findings" in result["reason_codes"], result
+    assert "complete_with_missing_fields" in result["reason_codes"], result
+    assert "complete_with_negating_uncertainty" in result["reason_codes"], result
+    assert result["status_cap"] == "PARTIAL", result
+
+    # Apply the cap
+    fixed = apply_semantic_status_cap(dict(hollow_report), result)
+    assert fixed["status"] == "PARTIAL", f"Status should be capped to PARTIAL: {fixed}"
+    assert "status capped" in " ".join(fixed.get("caveats", [])), fixed
+
+    # Valid report should pass
+    valid_report = {
+        "status": "COMPLETE",
+        "findings": [{"claim": "The definition is in codex_oss/runtime/loop.py.", "evidence_refs": ["file:x#extract:1"]}],
+        "missing_fields": [],
+        "uncertainties": ["Only scoped files were inspected."],
+        "caveats": [],
+        "confidence": "MEDIUM",
+    }
+    result2 = evaluate_report_semantic_completeness(mission, valid_report, published, answer_graph, None)
+    assert result2["ok"] is True, f"Valid COMPLETE should pass: {result2}"
+
+
 def main():
     assert_run_loop_accepts_valid_final_report()
     assert_model_text_extraction_handles_provider_variants()
@@ -3906,6 +3948,7 @@ def main():
     assert_evidence_kind_satisfied_when_all_shapes_present()
     assert_evidence_kind_insufficient_when_some_shapes_missing()
     assert_evidence_kind_multiple_shapes_with_contradiction()
+    assert_semantic_gate_downgrades_hollow_complete()
     print("PASS: runtime contract suite")
 
 
