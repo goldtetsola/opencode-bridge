@@ -467,11 +467,14 @@ def run_loop(mission: Any, ledger: Any, call_model_fn, tools, emitter,
                         return {"status": result.status, "report": report}
                     if repair_count < max_repair:
                         repair_count += 1
+                        # Build targeted repair prompt with exact ledger command IDs
+                        cmd_list = _ledger_command_ids(ledger)
                         context.append({"role": "user", "content":
                             REPAIR_PROMPT.format(
                                 reason=(
                                     f"report validation: {result.errors}. "
-                                    f"Use available evidence refs: {_evidence_ref_summary(ledger)}"
+                                    f"Available evidence refs: {_evidence_ref_summary(ledger)}. "
+                                    f"Use these exact ledger command IDs: {cmd_list}"
                                 )
                             )})
                         continue
@@ -1104,6 +1107,37 @@ def min_confidence(a: str, b: str) -> str:
 
 
 def _sanitize_fallback_reason(raw_reason: str) -> str:
+    """Replace raw model validation errors with clean user-facing messages."""
+    r = str(raw_reason or "")
+    if r.startswith("report_validation_failed:"):
+        return "The model's final report did not pass validation, so the runtime closed from the answer graph."
+    if r.startswith("model_call_failed:") and "timed out" in r.lower():
+        return "The model call timed out, so the runtime closed from the answer graph."
+    if r.startswith("model_call_failed:"):
+        return "The model call failed, so the runtime closed from the answer graph."
+    if r.startswith("deadline_final_report_ignored"):
+        return "The model ignored the deadline final-report request, so the runtime closed from the answer graph."
+    if r.startswith("closer_budget_exhausted"):
+        return "Insufficient time for model closure, so the runtime closed from the answer graph."
+    return r
+
+
+def _ledger_command_ids(ledger: Any) -> str:
+    """Build a comma-separated list of ledger command IDs for repair prompts."""
+    commands = getattr(ledger, "commands_run", []) or []
+    ids = []
+    for i, cmd in enumerate(commands[:8]):
+        tool = getattr(cmd, "tool", "unknown")
+        args = dict(getattr(cmd, "args", {}) or {})
+        path = str(args.get("path", "") or "")
+        pattern = str(args.get("pattern", "") or "")
+        if path:
+            ids.append(f"{i}:{tool}:path={path}")
+        elif pattern:
+            ids.append(f"{i}:{tool}:pattern={pattern[:40]}")
+        else:
+            ids.append(f"{i}:{tool}")
+    return ", ".join(ids) if ids else "none"
     """Replace raw model validation errors with clean user-facing messages."""
     r = str(raw_reason or "")
     if r.startswith("report_validation_failed:"):
