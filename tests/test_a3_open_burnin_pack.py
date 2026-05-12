@@ -892,7 +892,63 @@ def main():
     cases = build_burnin_cases()
     limit = int(os.getenv("OSS_LIVE_BURNIN_LIMIT", "25"))
     start = int(os.getenv("OSS_LIVE_BURNIN_START_INDEX", "1"))
+
+    # ── Harness integration ──
+    from datetime import datetime, timezone
+    from codex_oss.burnin.harness import BurninHarness
+
+    run_id = f"burnin_a3_open_{datetime.now(timezone.utc).strftime('%Y_%m_%d_%H%M%S')}"
+    harness = BurninHarness(
+        run_id=run_id, suite="a3_open", project_root=ROOT,
+        required_aliases=["mission-a3-kimi", "mission-a3-deepseek", "mission-a2-flash"],
+        bridge_url=BASE_URL.rstrip("/v1"),
+    )
+
+    # Register cases
+    for i, case in enumerate(cases):
+        harness.register_case(
+            f"case_{i + 1:03d}", case.mission.get("mission_id", f"case_{i + 1}"),
+            model_alias=MODEL, category=case.category,
+        )
+
+    # Preflight
+    preflight = harness.run_preflight()
+    print(f"\nPreflight: {'PASS' if preflight.ok else 'FAIL'}")
+    if preflight.failures:
+        for f in preflight.failures:
+            print(f"  - {f}")
+        return 1
+
     results = run_burnin(cases, limit=limit, start=start)
+
+    # Record results with quality classification
+    for i, r in enumerate(results):
+        try:
+            from codex_oss.burnin.quality import classify_quality_validity
+            mission_json = cases[i].mission if i < len(cases) else {}
+            qv = classify_quality_validity(
+                mission=mission_json,
+                report={"status": r.status, "closure_source": r.closure_source, "caveats": r.caveats},
+                ledger={"commands_run": [{"tool": "rtk_read"} for _ in range(r.optional_exploration + r.required_sources_covered)]},
+                answer_graph={"sufficiency": {"required_answered": r.required_sources_covered, "required_total": r.required_total}},
+                decision_trace=None,
+            )
+            harness.record_case_completion(
+                f"case_{i + 1:03d}",
+                elapsed=r.elapsed if hasattr(r, 'elapsed') else 0,
+                mission_status=r.status,
+                closure_source=r.closure_source,
+                quality_result=qv,
+            )
+        except Exception:
+            harness.record_case_completion(
+                f"case_{i + 1:03d}",
+                mission_status=r.status,
+                closure_source=r.closure_source,
+            )
+
+    harness.finalize("PASS" if (passed := len([r for r in results if r.passed])) / max(len(results), 1) >= 0.8 else "WEAK")
+    print(f"\nBurn-in summary: {harness.output_dir}/summary.json")
 
     false_completes = len([r for r in results if r.false_complete])
     raw_dumps = len([r for r in results if r.raw_dump_incidents > 0])
