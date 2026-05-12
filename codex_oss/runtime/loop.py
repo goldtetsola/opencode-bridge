@@ -443,6 +443,7 @@ def run_loop(mission: Any, ledger: Any, call_model_fn, tools, emitter,
                                 continue
                             return _partial(mission, ledger, f"objective_coverage_failed:{','.join(coverage_errors[:3])}", deadline)
                         _annotate_report_provenance(mission, report, "model_report")
+                        _record_closer_attempt(mission, "model", result.status, elapsed=0, payload_chars=len(json.dumps(context[-1].get("content","")) if context else 0), report_valid=result.is_valid)
                         return {"status": result.status, "report": report}
                     if repair_count < max_repair:
                         repair_count += 1
@@ -1094,16 +1095,10 @@ def _partial_dict(mission, ledger, reason: str) -> dict:
             class _NoDeadline:
                 def must_return_partial(self):
                     return False
-
                 def remaining(self):
                     return 999
-
             answer_graph = _runtime_prefetch_required_sources(
-                mission,
-                ledger,
-                answer_graph,
-                _allowed_tool_names(mission),
-                _NoDeadline(),
+                mission, ledger, answer_graph, _allowed_tool_names(mission), _NoDeadline(),
             )
         report = build_runtime_report_from_answer_graph(mission, ledger, answer_graph, reason=reason, report_source="runtime_answer_graph")
         _annotate_report_provenance(mission, report, "runtime_answer_graph")
@@ -1128,8 +1123,32 @@ def _partial_dict(mission, ledger, reason: str) -> dict:
             report.setdefault("caveats", []).append(
                 f"Runtime closure cap: exploration policy requires {', '.join(unmet)} but model terminated before completion."
             )
+        _record_closer_attempt(mission, "runtime", str(report.get("status", "PARTIAL")), report_valid=True)
         return {"status": str(report.get("status", "PARTIAL") or "PARTIAL"), "report": report}
     return {"status": "PARTIAL", "report": build_deterministic_partial_report(mission, ledger, reason)}
+
+
+def _record_closer_attempt(mission: Any, closer_type: str, status: str, *, elapsed: float = 0, payload_chars: int = 0, report_valid: bool = False):
+    """Record a closure attempt for metrics tracking."""
+    try:
+        from codex_oss.runtime.closer import record_closure_attempt
+        project_root = os.getcwd()
+        mission_dir = os.path.join(project_root, ".codex-oss", "missions", getattr(mission, "mission_id", "unknown"))
+        os.makedirs(mission_dir, exist_ok=True)
+        record_closure_attempt(
+            mission_dir,
+            f"close_{int(time.time())}",
+            closer_model=str(getattr(mission, "runtime_model_alias", "") or "unknown"),
+            closure_strategy="model_report" if closer_type == "model" else "runtime_answer_graph",
+            elapsed_seconds=elapsed,
+            payload_chars=payload_chars,
+            deadline_remaining_seconds=0,
+            result=status,
+            report_valid=report_valid,
+            final_closure_source="model_report" if closer_type == "model" else "runtime_answer_graph",
+        )
+    except Exception:
+        pass
 
 
 def _partial(mission, ledger, reason: str, deadline) -> dict:
