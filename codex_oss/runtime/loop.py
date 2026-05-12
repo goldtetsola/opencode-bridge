@@ -278,11 +278,31 @@ def run_loop(mission: Any, ledger: Any, call_model_fn, tools, emitter,
             # Enforce context budget
             context = enforce_context_budget(context, max_chars=6000)
 
+            # Budget reservation: skip model call if deadline too tight for closer
+            if not forced_final_requested:
+                from codex_oss.runtime.closer import should_attempt_closer, compute_closure_budgets
+                remaining = deadline.remaining()
+                has_evidence = bool(getattr(ledger, "files_inspected", {}) or getattr(ledger, "commands_run", []))
+                total_deadline = deadline.request_deadline if hasattr(deadline, 'request_deadline') else 90
+                budgets = compute_closure_budgets(total_deadline)
+                in_report_phase = _mission_phase(ledger) in ("REPORT", "VERIFY")
+                if has_evidence and in_report_phase and total_deadline >= 60 and not should_attempt_closer(mission, remaining):
+                    return _partial(mission, ledger, "closer_budget_exhausted", deadline)
+
             # Call model
             model_timeout = max(1, deadline.remaining() - 2)
             if forced_final_requested:
                 final_timeout = float(os.getenv("RUNTIME_FINAL_REPORT_MODEL_TIMEOUT_SECONDS", "20"))
                 model_timeout = max(1, min(model_timeout, final_timeout))
+                # Use compact closer payload if we have answered obligations
+                from codex_oss.runtime.closer import build_closer_payload
+                answer_graph = getattr(ledger, "answer_graph", {}) or {}
+                sufficiency = answer_graph.get("sufficiency", {}) if isinstance(answer_graph, dict) else {}
+                if sufficiency.get("required_answered", 0) > 0:
+                    claim_graph = getattr(ledger, "claim_graph", {}) or {}
+                    compact = build_closer_payload(mission, answer_graph, claim_graph, ledger)
+                    context = [{"role": "user", "content": compact}]
+                    _record_closer_attempt(mission, "closer", "attempting", payload_chars=len(compact))
             try:
                 response = call_model_fn(context, tools, model_timeout)
                 deadline.record_call()
