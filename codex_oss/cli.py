@@ -262,7 +262,7 @@ def main():
         _stop_bridge(port)
         import time
         time.sleep(1)
-        _start_bridge(port, "production")
+        _supervise(port, daemon=True)
         if verify:
             time.sleep(2)
             from codex_oss.runtime_manifest import STARTUP_TREE_SHA256, compute_tree_sha256, _PROJECT_ROOT

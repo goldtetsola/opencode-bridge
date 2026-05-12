@@ -381,6 +381,12 @@ def _write_readonly_mission_artifacts(mission: Any, ledger: Any, report: dict, s
         "progress_policy_enabled": bool(getattr(mission, "progress_policy_enabled", True)),
         "objective_spec": dict(getattr(mission, "objective_spec", {}) or {}) if isinstance(getattr(mission, "objective_spec", None), dict) else None,
         "sufficiency_policy": dict(getattr(mission, "sufficiency_policy", {}) or {}),
+        "answer_obligations": list(getattr(mission, "answer_obligations", []) or []),
+        "must_inspect": list(getattr(mission, "must_inspect", []) or []),
+        "evidence_collection_mode": str(getattr(mission, "evidence_collection_mode", "") or ""),
+        "exploration_policy": dict(getattr(mission, "exploration_policy", {}) or {}),
+        "source_requirements": list(getattr(mission, "source_requirements", []) or []),
+        "closure_policy": dict(getattr(mission, "closure_policy", {}) or {}),
     }
     ledger_payload = {
         "mission_id": mission_id,
