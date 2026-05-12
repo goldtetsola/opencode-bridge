@@ -462,6 +462,27 @@ def run_loop(mission: Any, ledger: Any, call_model_fn, tools, emitter,
                                     )})
                                 continue
                             return _partial(mission, ledger, f"objective_coverage_failed:{','.join(coverage_errors[:3])}", deadline)
+                        # Report semantic completeness gate
+                        if str(report.get("status", "") or "").upper() == "COMPLETE":
+                            from codex_oss.report_semantics import build_published_answer, evaluate_report_semantic_completeness, apply_semantic_status_cap
+                            published = build_published_answer(mission, refreshed_answer_graph, refreshed_graph)
+                            semantic = evaluate_report_semantic_completeness(mission, report, published, refreshed_answer_graph, answer_sufficiency)
+                            if not semantic.get("ok"):
+                                if repair_count < max_repair:
+                                    repair_count += 1
+                                    context.append({"role": "user", "content":
+                                        REPAIR_PROMPT.format(
+                                            reason=(
+                                                f"report semantic completeness: {semantic.get('reason_codes', [])}. "
+                                                f"Required repairs: {semantic.get('required_repairs', [])}. "
+                                                f"Canonical answer: {json.dumps(published.get('required_answers', [])[:2])}"
+                                            )
+                                        )})
+                                    continue
+                                report = apply_semantic_status_cap(report, semantic)
+                                _annotate_report_provenance(mission, report, "model_report_downgraded")
+                                _record_closer_attempt(mission, "model", report.get("status", "PARTIAL"), elapsed=0, report_valid=False)
+                                return {"status": report.get("status", "PARTIAL"), "report": report}
                         _annotate_report_provenance(mission, report, "model_report")
                         _record_closer_attempt(mission, "model", result.status, elapsed=0, payload_chars=len(json.dumps(context[-1].get("content","")) if context else 0), report_valid=result.is_valid)
                         return {"status": result.status, "report": report}

@@ -146,6 +146,19 @@ def finalize_burnin_run(project_root: str, run_id: str) -> JSON:
                 is_suspicious = True
             if operator_asserted:
                 is_suspicious = True
+            # Hollow COMPLETE detection
+            findings = report.get("findings", []) or []
+            missing = report.get("missing_fields", []) or []
+            uncertainties = " ".join(str(u) for u in (report.get("uncertainties", []) or [])).lower()
+            if not findings and not _is_deterministic(report, closure):
+                is_suspicious = True
+            if any(str(m).strip() for m in missing):
+                is_suspicious = True
+            for pattern in ["target value was not retrieved", "file was not inspected",
+                             "unable to determine", "answer was not retrieved", "not found"]:
+                if pattern in uncertainties:
+                    is_suspicious = True
+                    break
 
         if is_false:
             false_completes += 1
@@ -248,3 +261,7 @@ def _cleanup_rating(report: JSON) -> str:
     if caveats <= 4:
         return "moderate"
     return "major"
+
+
+def _is_deterministic(report: JSON, closure: str) -> bool:
+    return "deterministic" in closure.lower() or "fast_path" in closure.lower()

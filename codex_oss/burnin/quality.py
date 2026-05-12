@@ -150,6 +150,19 @@ def _check_suspicious(mission: JSON, report: JSON, ledger: JSON, style: str, has
     caveats = " ".join(str(c) for c in ((report or {}).get("caveats", []) or []))
     if "evidence floor was covered" in caveats.lower() and not has_obs:
         return True
+    # Hollow COMPLETE detection
+    if status == "COMPLETE":
+        findings = (report or {}).get("findings", []) or []
+        missing = (report or {}).get("missing_fields", []) or []
+        uncertainties = " ".join(str(u) for u in ((report or {}).get("uncertainties", []) or [])).lower()
+        if not findings and style == "open_investigation":
+            return True
+        if any(str(m).strip() for m in missing):
+            return True
+        for pattern in ["target value was not retrieved", "file was not inspected", "unable to determine",
+                         "answer was not retrieved", "not found"]:
+            if pattern in uncertainties:
+                return True
     return False
 
 
