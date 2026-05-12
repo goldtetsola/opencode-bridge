@@ -33,13 +33,16 @@ import http.client
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any
 
 ROOT = os.path.dirname(os.path.dirname(__file__))
+sys.path.insert(0, ROOT)
 BASE_URL = os.getenv("OSS_LIVE_BURNIN_BASE_URL", "http://127.0.0.1:4000/v1").rstrip("/")
 AUTH = os.getenv("PROXY_API_KEY") or os.getenv("LITELLM_MASTER_KEY") or "sk-local-codex-bridge"
 TIMEOUT = float(os.getenv("OSS_LIVE_BURNIN_TIMEOUT", "180"))
 MODEL = os.getenv("OSS_LIVE_BURNIN_MODEL", "mission-a3-kimi")
+MISSIONS_ROOT = os.path.join(ROOT, ".codex-oss", "missions")
 
 REQUIRED_OUTPUTS = [
     "files_inspected", "commands_run", "findings", "uncertainties",
@@ -60,6 +63,8 @@ class BurninCase:
 class BurninResult:
     case: str = ""
     category: str = ""
+    case_id: str = ""
+    mission_id: str = ""
     status: str = ""
     closure_source: str = ""
     required_sources_covered: int = 0
@@ -73,6 +78,8 @@ class BurninResult:
     caveats: list[str] = field(default_factory=list)
     missing_evidence: list[str] = field(default_factory=list)
     passed: bool = False
+    elapsed: float = 0
+    artifact_dir: str = ""
 
 
 def _make_mission(name: str, objective: str, **overrides) -> dict:
@@ -108,6 +115,10 @@ def _make_mission(name: str, objective: str, **overrides) -> dict:
     }
     base.update(overrides)
     return base
+
+
+def _run_mission_id(base_mission_id: str, idx: int, run_id: str) -> str:
+    return f"{base_mission_id}_{idx}__{run_id}"
 
 
 def build_burnin_cases() -> list[BurninCase]:
@@ -756,7 +767,7 @@ def extract_metrics(mission: dict, response: dict) -> BurninResult:
     return result
 
 
-def run_burnin(cases: list[BurninCase], limit: int = 25, start: int = 1):
+def run_burnin(cases: list[BurninCase], *, mission_ids: list[str], limit: int = 25, start: int = 1):
     """Run burn-in cases against the live bridge."""
     results: list[BurninResult] = []
     total = min(limit, len(cases))
@@ -767,9 +778,10 @@ def run_burnin(cases: list[BurninCase], limit: int = 25, start: int = 1):
     print(f"Timeout: {TIMEOUT}s")
     print("-" * 60)
 
-    for idx, case in enumerate(cases[start - 1 : start - 1 + total], start=start):
+    for local_idx, case in enumerate(cases[start - 1 : start - 1 + total], start=0):
+        idx = start + local_idx
         mission = dict(case.mission)
-        mission["mission_id"] = f"{mission['mission_id']}_{idx}"
+        mission["mission_id"] = mission_ids[local_idx]
 
         print(f"\n[{idx}/{total}] {case.name} ({case.category})")
         start_time = time.time()
@@ -783,12 +795,16 @@ def run_burnin(cases: list[BurninCase], limit: int = 25, start: int = 1):
         if response.get("error"):
             err = str(response.get("error", "") or "")[:120]
             print(f"  ERROR: {err}")
-            results.append(BurninResult(case=case.name, category=case.category, passed=False))
+            results.append(BurninResult(case=case.name, category=case.category, mission_id=mission["mission_id"], passed=False, elapsed=elapsed))
             continue
 
         result = extract_metrics(mission, response)
         result.case = case.name
+        result.case_id = f"case_{idx:03d}"
         result.category = case.category
+        result.mission_id = mission["mission_id"]
+        result.elapsed = elapsed
+        result.artifact_dir = os.path.join(MISSIONS_ROOT, mission["mission_id"])
 
         print(f"  Status: {result.status} | Closure: {result.closure_source} | "
               f"Sources: {result.required_sources_covered}/{result.required_total} | "
@@ -850,6 +866,40 @@ def run_burnin(cases: list[BurninCase], limit: int = 25, start: int = 1):
     return results
 
 
+def _read_json(path: str) -> dict[str, Any]:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _artifact_bundle(mission_id: str) -> dict[str, dict[str, Any]]:
+    mission_dir = os.path.join(MISSIONS_ROOT, mission_id)
+    return {
+        "mission": _read_json(os.path.join(mission_dir, "mission.json")),
+        "report": _read_json(os.path.join(mission_dir, "report.json")),
+        "ledger": _read_json(os.path.join(mission_dir, "ledger.json")),
+        "answer_graph": _read_json(os.path.join(mission_dir, "answer_graph.json")),
+        "decision_trace": _read_json(os.path.join(mission_dir, "decision_trace.json")),
+    }
+
+
+def _mission_quality(case: BurninCase, mission_id: str) -> dict[str, Any]:
+    from codex_oss.burnin.quality import classify_quality_validity
+
+    artifacts = _artifact_bundle(mission_id)
+    quality = classify_quality_validity(
+        mission=artifacts["mission"] or case.mission,
+        report=artifacts["report"],
+        ledger=artifacts["ledger"],
+        answer_graph=artifacts["answer_graph"],
+        decision_trace=artifacts["decision_trace"],
+    )
+    return quality
+
+
 def _pct(part: int, total: int) -> str:
     if total == 0:
         return "0%"
@@ -881,6 +931,8 @@ def _check_runtime_freshness():
 
 
 def main():
+    from codex_oss.burnin.harness import BurninHarness
+
     if not os.getenv("LIVE_BURNIN"):
         print("Skipping live burn-in (set LIVE_BURNIN=1 to run).")
         print("Run: set -a; source .codex-oss/env/opencode-go.env; set +a; LIVE_BURNIN=1 python3 tests/test_a3_open_burnin_pack.py")
@@ -892,23 +944,29 @@ def main():
     cases = build_burnin_cases()
     limit = int(os.getenv("OSS_LIVE_BURNIN_LIMIT", "25"))
     start = int(os.getenv("OSS_LIVE_BURNIN_START_INDEX", "1"))
-
-    # ── Harness integration ──
-    from datetime import datetime, timezone
-    from codex_oss.burnin.harness import BurninHarness
-
     run_id = f"burnin_a3_open_{datetime.now(timezone.utc).strftime('%Y_%m_%d_%H%M%S')}"
+    selected_cases = cases[start - 1 : start - 1 + min(limit, len(cases))]
     harness = BurninHarness(
         run_id=run_id, suite="a3_open", project_root=ROOT,
         required_aliases=["mission-a3-kimi", "mission-a3-deepseek", "mission-a2-flash"],
         bridge_url=BASE_URL.rstrip("/v1"),
+        auth=AUTH,
     )
 
     # Register cases
-    for i, case in enumerate(cases):
+    mission_ids: list[str] = []
+    selected_index_by_case_id: dict[str, int] = {}
+    for local_idx, case in enumerate(selected_cases, start=0):
+        idx = start + local_idx
+        base_mission_id = str(case.mission.get("mission_id", f"case_{idx}"))
+        mission_id = _run_mission_id(base_mission_id, idx, run_id)
+        case_id = f"case_{idx:03d}"
+        mission_ids.append(mission_id)
+        selected_index_by_case_id[case_id] = local_idx
         harness.register_case(
-            f"case_{i + 1:03d}", case.mission.get("mission_id", f"case_{i + 1}"),
+            case_id, mission_id,
             model_alias=MODEL, category=case.category,
+            expected_outcome=case.expected_requires_closure,
         )
 
     # Preflight
@@ -919,36 +977,41 @@ def main():
             print(f"  - {f}")
         return 1
 
-    results = run_burnin(cases, limit=limit, start=start)
+    results: list[BurninResult] = []
+    final_status = "FAIL"
+    try:
+        results = run_burnin(selected_cases, mission_ids=mission_ids, limit=limit, start=start)
+        harness.scan_missing_artifacts(MISSIONS_ROOT)
 
-    # Record results with quality classification
-    for i, r in enumerate(results):
-        try:
-            from codex_oss.burnin.quality import classify_quality_validity
-            mission_json = cases[i].mission if i < len(cases) else {}
-            qv = classify_quality_validity(
-                mission=mission_json,
-                report={"status": r.status, "closure_source": r.closure_source, "caveats": r.caveats},
-                ledger={"commands_run": [{"tool": "rtk_read"} for _ in range(r.optional_exploration + r.required_sources_covered)]},
-                answer_graph={"sufficiency": {"required_answered": r.required_sources_covered, "required_total": r.required_total}},
-                decision_trace=None,
-            )
+        for result in results:
+            if not result.case_id or result.case_id not in selected_index_by_case_id:
+                continue
+            case = selected_cases[selected_index_by_case_id[result.case_id]]
+            quality = _mission_quality(case, result.mission_id) if result.mission_id else {}
             harness.record_case_completion(
-                f"case_{i + 1:03d}",
-                elapsed=r.elapsed if hasattr(r, 'elapsed') else 0,
-                mission_status=r.status,
-                closure_source=r.closure_source,
-                quality_result=qv,
-            )
-        except Exception:
-            harness.record_case_completion(
-                f"case_{i + 1:03d}",
-                mission_status=r.status,
-                closure_source=r.closure_source,
+                result.case_id,
+                elapsed=result.elapsed,
+                mission_artifact_dir=result.artifact_dir,
+                mission_status=result.status,
+                closure_source=result.closure_source,
+                quality_result=quality,
             )
 
-    harness.finalize("PASS" if (passed := len([r for r in results if r.passed])) / max(len(results), 1) >= 0.8 else "WEAK")
-    print(f"\nBurn-in summary: {harness.output_dir}/summary.json")
+        harness.scan_missing_artifacts(MISSIONS_ROOT)
+
+        false_completes = len([r for r in results if r.false_complete])
+        raw_dumps = len([r for r in results if r.raw_dump_incidents > 0])
+        passed = len([r for r in results if r.passed])
+        if false_completes > 0 or raw_dumps > 0:
+            final_status = "FAIL"
+        elif len(results) > 0 and passed / len(results) < 0.5:
+            final_status = "WEAK"
+        else:
+            final_status = "PASS"
+    finally:
+        harness.scan_missing_artifacts(MISSIONS_ROOT)
+        harness.finalize(final_status)
+        print(f"\nBurn-in summary: {harness.output_dir}/summary.json")
 
     false_completes = len([r for r in results if r.false_complete])
     raw_dumps = len([r for r in results if r.raw_dump_incidents > 0])
