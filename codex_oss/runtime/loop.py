@@ -485,6 +485,9 @@ def run_loop(mission: Any, ledger: Any, call_model_fn, tools, emitter,
                         _annotate_report_provenance(mission, report, "model_report")
                         report["semantic_gate_evaluated"] = True
                         report["semantic_gate_decision"] = "ACCEPT"
+                        from codex_oss.completion import build_completion_envelope, default_completion_contract
+                        contract = getattr(mission, "completion_contract", {}) or default_completion_contract(mission)
+                        report["completion_envelope"] = build_completion_envelope(mission, report, refreshed_answer_graph, answer_sufficiency, None)
                         _record_closer_attempt(mission, "model", result.status, elapsed=0, payload_chars=len(json.dumps(context[-1].get("content","")) if context else 0), report_valid=result.is_valid)
                         return {"status": result.status, "report": report}
                     if repair_count < max_repair:
@@ -1195,6 +1198,10 @@ def _partial_dict(mission, ledger, reason: str) -> dict:
         report = build_runtime_report_from_answer_graph(mission, ledger, answer_graph, reason=_sanitize_fallback_reason(reason), report_source="runtime_answer_graph")
         report["semantic_gate_evaluated"] = False
         report["timeout_recovery_used"] = True
+        from codex_oss.completion import build_completion_envelope, default_completion_contract
+        contract = getattr(mission, "completion_contract", {}) or default_completion_contract(mission)
+        envelope = build_completion_envelope(mission, report, answer_graph, None, None)
+        report["completion_envelope"] = envelope
         _annotate_report_provenance(mission, report, "runtime_answer_graph")
         exploration_policy = _exploration_policy(mission)
         after_floor = str(exploration_policy.get("after_required_floor", "") or "")

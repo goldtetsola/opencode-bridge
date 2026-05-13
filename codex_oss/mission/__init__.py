@@ -107,6 +107,7 @@ class MissionV1:
     exploration_policy: dict = field(default_factory=dict)
     closer_model: str = ""
     fallback_closer_model: str = ""
+    completion_contract: dict = field(default_factory=dict)
 
     # AdaptiveAutonomyBudgetV1
     max_model_calls: int = 25

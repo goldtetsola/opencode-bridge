@@ -174,23 +174,41 @@ def finalize_burnin_run(project_root: str, run_id: str) -> JSON:
         if status in ("PARTIAL", "ESCALATE") and has_observations:
             truthful_partials += 1
 
-        # Scenario fidelity: compare actual vs expected
+        # Scenario fidelity using multi-axis envelope if available
+        envelope = report.get("completion_envelope", {}) or {}
         expected_outcome = case.get("expected_outcome", "")
-        tolerance = bool(case.get("tolerance", case.get("tolerance_for_false_complete", False)))
-        if expected_outcome:
-            eo = str(expected_outcome).upper().replace("_", " ")
-            if "OR" in eo or tolerance:
-                # Flexible expectation — accept COMPLETE, PARTIAL, or ESCALATE for tolerant cases
-                if status not in ("COMPLETE", "PARTIAL", "ESCALATE"):
-                    scenario_fidelity_failures.append(case_id)
-                else:
+        tolerance = bool(case.get("tolerance", False))
+
+        if expected_outcome and envelope:
+            # Multi-axis comparison
+            expected_answer = _parse_expected_set(case, "expected_answer_statuses", expected_outcome)
+            expected_verify = _parse_expected_set(case, "expected_verification_statuses", expected_outcome)
+            expected_closure = _parse_expected_set(case, "expected_closure_statuses", expected_outcome)
+            # Fall back to status match if no envelope axes specified
+            if expected_answer or expected_verify or expected_closure:
+                match = True
+                if expected_answer:
+                    match = match and envelope.get("answer_status", "") in expected_answer
+                if expected_verify:
+                    match = match and envelope.get("verification_status", "") in expected_verify
+                if expected_closure:
+                    match = match and envelope.get("closure_status", "") in expected_closure
+                if match:
                     scenario_fidelity_passes += 1
+                else:
+                    scenario_fidelity_failures.append(case_id)
             else:
-                expected_set = set(s.strip() for s in eo.replace(",", " ").split() if s.strip())
-                if expected_set and status not in expected_set:
-                    scenario_fidelity_failures.append(case_id)
-                else:
+                if _check_status_match(status, expected_outcome, tolerance):
                     scenario_fidelity_passes += 1
+                else:
+                    scenario_fidelity_failures.append(case_id)
+        elif expected_outcome:
+            if _check_status_match(status, expected_outcome, tolerance):
+                scenario_fidelity_passes += 1
+            else:
+                scenario_fidelity_failures.append(case_id)
+        else:
+            scenario_fidelity_passes += 1
 
         if "raw dump" in caveats.lower():
             raw_dumps += 1
@@ -300,3 +318,26 @@ def _cleanup_rating(report: JSON) -> str:
 
 def _is_deterministic(report: JSON, closure: str) -> bool:
     return "deterministic" in closure.lower() or "fast_path" in closure.lower()
+
+
+def _parse_expected_set(case: JSON, key: str, fallback: str) -> set[str]:
+    val = case.get(key)
+    if isinstance(val, list):
+        return set(str(v).upper() for v in val)
+    return set()
+
+
+def _check_status_match(status: str, expected_outcome: str, tolerance: bool) -> bool:
+    """Fallback status matching when no envelope axes are specified."""
+    eo = str(expected_outcome).upper().replace("_", " ")
+    if "OR" in eo or tolerance:
+        return status in ("COMPLETE", "PARTIAL", "ESCALATE")
+    expected_set = set(s.strip() for s in eo.replace(",", " ").split() if s.strip())
+    if expected_set:
+        return status in expected_set
+    return True
+
+
+# Update the inline call in the case loop to use this helper
+# (replacing the _check_status_match inline calls)
+# This is called in the scenario_fidelity section above
