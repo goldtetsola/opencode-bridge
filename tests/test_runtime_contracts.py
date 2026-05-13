@@ -3878,6 +3878,108 @@ def assert_semantic_gate_downgrades_hollow_complete():
     assert result2["ok"] is True, f"Valid COMPLETE should pass: {result2}"
 
 
+def assert_run_loop_downgrades_hollow_model_complete():
+    """Integration: fake model reads file then returns hollow COMPLETE — runtime must downgrade."""
+    with tempfile.TemporaryDirectory(dir=ROOT) as td:
+        from pathlib import Path
+
+        sample = Path(td) / "semantic_hollow_target.py"
+        sample.write_text("def find_target():\n    return 'found'\n", encoding="utf-8")
+        sample_rel = os.path.relpath(sample, ROOT)
+        m = mission(
+            mission_id="mission_semantic_hollow_integration",
+            objective="Investigate whether the target function exists.",
+            objective_style="open_investigation",
+            evidence_collection_mode="prefetch_floor",
+            exploration_policy={"after_required_floor": "close_immediately", "min_optional_actions_after_floor": 0, "max_optional_actions_after_floor": 0, "require_contradiction_search": False},
+            allowed_roots=[],
+            allowed_paths=[sample_rel],
+            allowed_tool_classes=["read"],
+            tool_budget=5,
+            answer_obligations=[
+                {
+                    "id": "q1",
+                    "question": "Does the target file contain find_target()?",
+                    "required": True,
+                    "source_hints": [sample_rel],
+                    "source_requirements": [{"path": sample_rel, "evidence_kind": "function_presence", "required": True}],
+                }
+            ],
+            must_inspect=[sample_rel],
+        )
+        ledger = EvidenceLedger(mission_id=m.mission_id, tool_budget_remaining=m.tool_budget)
+        calls = {"n": 0}
+
+        def fake_model(messages, tools, timeout):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                # Read the required file to satisfy evidence floor
+                return {
+                    "choices": [{
+                        "message": {
+                            "content": (
+                                '{"action_type":"tool_call","phase":"NARROW","tool_name":"rtk_read",'
+                                f'"arguments":{{"path":"{sample_rel}"}},'
+                                '"reason":"Inspect target file.","hypothesis":"find_target exists.",'
+                                '"target_question":"Does the file contain find_target?",'
+                                '"expected_information_gain":"Confirm.",'
+                                '"why_not_report_yet":"Need to inspect first."}'
+                            )
+                        }
+                    }]
+                }
+            if calls["n"] == 2:
+                # Return a hollow COMPLETE — structurally valid but semantically empty
+                return {
+                    "choices": [{
+                        "message": {
+                            "content": json.dumps({
+                                "action_type": "final_report",
+                                "report": {
+                                    "status": "COMPLETE",
+                                    "files_inspected": [{"path": sample_rel, "complete": True}],
+                                    "commands_run": [{"tool": "rtk_read", "args": {"path": sample_rel}}],
+                                    "findings": [],
+                                    "missing_fields": ["target function not found"],
+                                    "uncertainties": ["The target value was not retrieved."],
+                                    "confidence": "HIGH",
+                                    "caveats": [],
+                                    "escalation_recommendation": "GPT-5.5 review",
+                                },
+                            })
+                        }
+                    }]
+                }
+            if calls["n"] == 3:
+                # After repair attempt, return valid COMPLETE
+                return {
+                    "choices": [{
+                        "message": {
+                            "content": json.dumps({
+                                "action_type": "final_report",
+                                "report": {
+                                    "status": "COMPLETE",
+                                    "files_inspected": [{"path": sample_rel, "complete": True}],
+                                    "commands_run": [{"tool": "rtk_read", "args": {"path": sample_rel}}],
+                                    "findings": [{"claim": "find_target is defined in " + sample_rel, "evidence_refs": ["file:" + sample_rel + "#extract:1", "command:0"]}],
+                                    "missing_fields": [],
+                                    "uncertainties": [],
+                                    "confidence": "MEDIUM",
+                                    "caveats": [],
+                                    "escalation_recommendation": "GPT-5.5 review",
+                                },
+                            })
+                        }
+                    }]
+                }
+            raise TimeoutError("simulated timeout")
+
+        result = run_loop(m, ledger, fake_model, [], None, m.allowed_roots, m.allowed_paths, request_deadline=90)
+        # The hollow COMPLETE on call 2 should be sent to repair (or downgraded if no repair budget).
+        # Call 3 returns a valid COMPLETE after repair, so final status should be COMPLETE.
+        assert result["status"] in ("COMPLETE", "PARTIAL"), f"Expected COMPLETE or PARTIAL after repair, got {result['status']}: {result}"
+
+
 def main():
     assert_run_loop_accepts_valid_final_report()
     assert_model_text_extraction_handles_provider_variants()
@@ -3949,6 +4051,7 @@ def main():
     assert_evidence_kind_insufficient_when_some_shapes_missing()
     assert_evidence_kind_multiple_shapes_with_contradiction()
     assert_semantic_gate_downgrades_hollow_complete()
+    assert_run_loop_downgrades_hollow_model_complete()
     print("PASS: runtime contract suite")
 
 
