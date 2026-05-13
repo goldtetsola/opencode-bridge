@@ -967,6 +967,7 @@ def main():
             case_id, mission_id,
             model_alias=MODEL, category=case.category,
             expected_outcome=case.expected_requires_closure,
+            tolerance=case.tolerance_for_false_complete,
         )
 
     # Preflight

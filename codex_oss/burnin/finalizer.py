@@ -57,6 +57,8 @@ def finalize_burnin_run(project_root: str, run_id: str) -> JSON:
     runtime_closures = 0
     evidence_failures = 0
     cleanup_ratings: dict[str, int] = {}
+    scenario_fidelity_failures: list[str] = []
+    scenario_fidelity_passes = 0
 
     for case in expected_cases:
         case_id = case.get("case_id", "")
@@ -172,6 +174,24 @@ def finalize_burnin_run(project_root: str, run_id: str) -> JSON:
         if status in ("PARTIAL", "ESCALATE") and has_observations:
             truthful_partials += 1
 
+        # Scenario fidelity: compare actual vs expected
+        expected_outcome = case.get("expected_outcome", "")
+        tolerance = bool(case.get("tolerance", case.get("tolerance_for_false_complete", False)))
+        if expected_outcome:
+            eo = str(expected_outcome).upper().replace("_", " ")
+            if "OR" in eo or tolerance:
+                # Flexible expectation — accept COMPLETE, PARTIAL, or ESCALATE for tolerant cases
+                if status not in ("COMPLETE", "PARTIAL", "ESCALATE"):
+                    scenario_fidelity_failures.append(case_id)
+                else:
+                    scenario_fidelity_passes += 1
+            else:
+                expected_set = set(s.strip() for s in eo.replace(",", " ").split() if s.strip())
+                if expected_set and status not in expected_set:
+                    scenario_fidelity_failures.append(case_id)
+                else:
+                    scenario_fidelity_passes += 1
+
         if "raw dump" in caveats.lower():
             raw_dumps += 1
         if "evidence ref" in caveats.lower() and "not found" in caveats.lower():
@@ -212,6 +232,11 @@ def finalize_burnin_run(project_root: str, run_id: str) -> JSON:
         and summary.earned_complete_rate >= 0.3
         and not missing_ids
     )
+    scenario_fidelity_ok = (
+        not scenario_fidelity_failures
+        if scenario_fidelity_failures or scenario_fidelity_passes > 0
+        else None
+    )
 
     summary.result = "PASS" if truth_safe_ok else "FAIL"
     summary.result_reasons = []
@@ -219,6 +244,11 @@ def finalize_burnin_run(project_root: str, run_id: str) -> JSON:
         summary.result_reasons.append("truth_safe_fail")
     if truth_safe_ok and not native_feeling_ok:
         summary.result_reasons.append("native_feeling_fail")
+    if scenario_fidelity_ok is False:
+        summary.result_reasons.append(f"scenario_fidelity_fail:{','.join(scenario_fidelity_failures[:5])}")
+        if truth_safe_ok and scenario_fidelity_passes > 0:
+            # Scenario fidelity matters for canary trust
+            summary.result = "FAIL"
 
     result_dict = summary.to_dict()
 
@@ -232,6 +262,11 @@ def finalize_burnin_run(project_root: str, run_id: str) -> JSON:
     }
     result_dict["summary_type"] = "reconciled"
     result_dict["summary_complete"] = True
+    result_dict["scenario_fidelity"] = {
+        "pass": scenario_fidelity_ok,
+        "failures": scenario_fidelity_failures[:10],
+        "passes": scenario_fidelity_passes,
+    }
     result_dict["native_feeling"] = {
         "pass": native_feeling_ok,
         "model_self_close_rate": round(summary.model_self_close_rate, 2),

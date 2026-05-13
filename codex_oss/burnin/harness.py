@@ -66,7 +66,7 @@ class BurninHarness:
 
     def register_case(
         self, case_id: str, mission_id: str, agent: str = "", model_alias: str = "",
-        category: str = "", expected_outcome: str = "",
+        category: str = "", expected_outcome: str = "", tolerance: bool = False,
     ):
         self.cases[case_id] = BurninCaseResult(
             case_id=case_id, mission_id=mission_id, state=CaseState.QUEUED,
@@ -76,6 +76,7 @@ class BurninHarness:
             "case_id": case_id, "mission_id": mission_id,
             "agent": agent, "model_alias": model_alias,
             "category": category, "expected_outcome": expected_outcome,
+            "tolerance": tolerance,
         })
         self.manifest.expected_case_count = len(self.manifest.expected_cases)
 
