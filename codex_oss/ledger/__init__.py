@@ -92,22 +92,24 @@ class EvidenceLedger:
     def add_file(self, path: str, result: "ToolResult", turn: int):
         args = getattr(result, "args", {}) or {}
         is_range_read = "start_line" in args or "end_line" in args
+        read_success = result.exit_code == 0 and bool(result.stdout) if hasattr(result, 'exit_code') else bool(result.stdout)
         entry = FileEntry(
             path=path,
-            complete=result.complete,
-            full_content_cached=bool(result.complete and not is_range_read),
-            chars_total=result.chars_total,
-            chars_returned=len(result.stdout),
-            sha256=result.sha256,
-            tool=result.tool,
+            complete=result.complete if hasattr(result, 'complete') else read_success,
+            full_content_cached=bool(read_success and not is_range_read),
+            chars_total=result.chars_total if hasattr(result, 'chars_total') else 0,
+            chars_returned=len(result.stdout or ""),
+            sha256=result.sha256 if hasattr(result, 'sha256') else "",
+            tool=result.tool if hasattr(result, 'tool') else "rtk_read",
             turn=turn,
-            risk_flags=list(result.risk_flags),
-            extracts=_build_extracts(result.stdout),
-            cached_text=result.stdout,
+            risk_flags=list(getattr(result, 'risk_flags', []) or []),
+            extracts=_build_extracts(result.stdout) if read_success else [],
+            cached_text=result.stdout if read_success else "",
         )
         self.files_inspected[path] = entry
-        self.total_bytes_read += result.chars_total
-        if result.redactions_applied:
+        if read_success:
+            self.total_bytes_read += getattr(result, 'chars_total', len(result.stdout or ""))
+        if getattr(result, 'redactions_applied', False):
             self.redactions_applied = True
 
     def add_command(self, tool: str, args: dict, result: "ToolResult", turn: int):

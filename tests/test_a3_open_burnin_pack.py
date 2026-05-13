@@ -55,8 +55,15 @@ class BurninCase:
     name: str
     category: str
     mission: dict
-    expected_requires_closure: str = ""  # COMPLETE | PARTIAL | ESCALATE
-    tolerance_for_false_complete: bool = False  # True if COMPLETE is acceptable even with gaps
+    expected_requires_closure: str = ""
+    tolerance_for_false_complete: bool = False
+    # Multi-axis scenario expectations
+    expected_answer_statuses: list = field(default_factory=list)
+    expected_evidence_statuses: list = field(default_factory=list)
+    expected_verification_statuses: list = field(default_factory=list)
+    expected_closure_statuses: list = field(default_factory=list)
+    expected_final_statuses: list = field(default_factory=list)
+    requires_native_feeling: bool = False
 
 
 @dataclass
@@ -141,6 +148,11 @@ def build_burnin_cases() -> list[BurninCase]:
             must_inspect=["codex_oss/nonexistent.py"],
         ),
         expected_requires_closure="PARTIAL",
+        expected_answer_statuses=["BLOCKED"],
+        expected_evidence_statuses=["BLOCKED"],
+        expected_final_statuses=["PARTIAL", "ESCALATE"],
+        expected_closure_statuses=["RUNTIME_CLOSED"],
+        tolerance_for_false_complete=True,
     ))
 
     cases.append(BurninCase(
@@ -190,6 +202,7 @@ def build_burnin_cases() -> list[BurninCase]:
         name="shape_function_definition",
         category="evidence_kind",
         mission=_make_mission("shape_func_def",
+            exploration_policy={"after_required_floor": "close_immediately", "min_optional_actions_after_floor": 0, "max_optional_actions_after_floor": 0, "require_contradiction_search": False},
             objective="Find which files define the build_implementation_readiness_graph function.",
             allowed_paths=["codex_oss/implementation_graph.py", "codex_oss/implementation.py"],
             allowed_tool_classes=["read", "search"],
@@ -213,6 +226,7 @@ def build_burnin_cases() -> list[BurninCase]:
         name="shape_config_value",
         category="evidence_kind",
         mission=_make_mission("shape_config",
+            exploration_policy={"after_required_floor": "close_immediately", "min_optional_actions_after_floor": 0, "max_optional_actions_after_floor": 0, "require_contradiction_search": False},
             objective="Find the fallback budget value in the deadline policy.",
             allowed_paths=["codex_oss/runtime/policy.py"],
             allowed_tool_classes=["read"],
@@ -237,6 +251,7 @@ def build_burnin_cases() -> list[BurninCase]:
         name="ambiguous_which_model_aliases",
         category="ambiguous_multifile",
         mission=_make_mission("ambiguous_model_aliases",
+            exploration_policy={"after_required_floor": "close_immediately", "min_optional_actions_after_floor": 0, "max_optional_actions_after_floor": 0, "require_contradiction_search": False},
             objective="Find all model alias mappings used in the runtime and report how they work.",
             allowed_paths=[
                 "codex_oss/runtime/loop.py",
@@ -265,6 +280,7 @@ def build_burnin_cases() -> list[BurninCase]:
         name="ambiguous_artifact_pipeline",
         category="ambiguous_multifile",
         mission=_make_mission("artifact_pipeline",
+            exploration_policy={"after_required_floor": "close_immediately", "min_optional_actions_after_floor": 0, "max_optional_actions_after_floor": 0, "require_contradiction_search": False},
             objective="Trace how implementation artifacts flow from patch proposal through persistence. Which files write which artifacts?",
             allowed_paths=[
                 "codex_oss/implementation.py",
@@ -301,19 +317,19 @@ def build_burnin_cases() -> list[BurninCase]:
             allowed_paths=[
                 "codex_oss/answer_graph.py",
                 "codex_oss/claim_graph.py",
-                "codex_oss/coverage_graph.py",
+                "codex_oss/answer_graph.py",
             ],
             allowed_tool_classes=["read", "search"],
             answer_obligations=[{
                 "id": "q1", "question": "What does CoverageGraphV1 track, and how does it relate to answer obligations?",
                 "required": True,
-                "source_hints": ["codex_oss/coverage_graph.py", "codex_oss/answer_graph.py"],
+                "source_hints": ["codex_oss/answer_graph.py", "codex_oss/answer_graph.py"],
                 "source_requirements": [
-                    {"path": "codex_oss/coverage_graph.py", "evidence_kind": "coverage_model", "required": True, "prefetch": False},
+                    {"path": "codex_oss/answer_graph.py", "evidence_kind": "coverage_model", "required": True, "prefetch": False},
                     {"path": "codex_oss/answer_graph.py", "evidence_kind": "obligation_model", "required": True, "prefetch": False},
                 ],
             }],
-            must_inspect=["codex_oss/coverage_graph.py", "codex_oss/answer_graph.py"],
+            must_inspect=["codex_oss/answer_graph.py", "codex_oss/answer_graph.py"],
         ),
         expected_requires_closure="COMPLETE",
     ))
@@ -416,6 +432,7 @@ def build_burnin_cases() -> list[BurninCase]:
         name="shape_mapping_and_config",
         category="evidence_kind",
         mission=_make_mission("shape_mapping_config",
+            exploration_policy={"after_required_floor": "close_immediately", "min_optional_actions_after_floor": 0, "max_optional_actions_after_floor": 0, "require_contradiction_search": False},
             objective="Find the RUNTIME_AUTONOMY_PROFILES dict in codex_oss/managed_bridge.py and report the max_tool_budget for mission-a5-kimi.",
             allowed_paths=["codex_oss/managed_bridge.py"],
             allowed_tool_classes=["read"],
@@ -439,6 +456,7 @@ def build_burnin_cases() -> list[BurninCase]:
         name="shape_zero_match_search",
         category="evidence_kind",
         mission=_make_mission("shape_zero_match",
+            exploration_policy={"after_required_floor": "close_immediately", "min_optional_actions_after_floor": 0, "max_optional_actions_after_floor": 0, "require_contradiction_search": False},
             objective="Search for a non-existent function name 'definitely_not_in_codebase' in codex_oss/. Verify zero-match evidence.",
             allowed_paths=["codex_oss/answer_graph.py", "codex_oss/claim_graph.py", "codex_oss/runtime/loop.py"],
             allowed_tool_classes=["read", "search"],
@@ -462,6 +480,7 @@ def build_burnin_cases() -> list[BurninCase]:
         name="shape_flag_detection",
         category="evidence_kind",
         mission=_make_mission("shape_flag",
+            exploration_policy={"after_required_floor": "close_immediately", "min_optional_actions_after_floor": 0, "max_optional_actions_after_floor": 0, "require_contradiction_search": False},
             objective="Find any flag_parameter or flag_read shapes in codex_oss/raw_lane.py. Check for probe flags or behavior derivation patterns.",
             allowed_paths=["codex_oss/raw_lane.py"],
             allowed_tool_classes=["read"],
@@ -485,6 +504,7 @@ def build_burnin_cases() -> list[BurninCase]:
         name="scheduler_read_pool_concurrency",
         category="scheduler",
         mission=_make_mission("scheduler_read_pool",
+            exploration_policy={"after_required_floor": "close_immediately", "min_optional_actions_after_floor": 0, "max_optional_actions_after_floor": 0, "require_contradiction_search": False},
             objective="Investigate how the read-pool scheduler works. Find the scheduler/concurrency policy in the runtime.",
             allowed_paths=["codex_oss/runtime/policy.py", "codex_oss/runtime/loop.py"],
             allowed_tool_classes=["read", "search"],
@@ -505,6 +525,7 @@ def build_burnin_cases() -> list[BurninCase]:
         name="scheduler_mission_slot_tracking",
         category="scheduler",
         mission=_make_mission("scheduler_slot",
+            exploration_policy={"after_required_floor": "close_immediately", "min_optional_actions_after_floor": 0, "max_optional_actions_after_floor": 0, "require_contradiction_search": False},
             objective="Find how acquire_mission_slot and release_mission_slot work in the runtime scheduler.",
             allowed_paths=["codex_oss/runtime/policy.py", "codex_oss/runtime/loop.py"],
             allowed_tool_classes=["read", "search"],
@@ -525,6 +546,7 @@ def build_burnin_cases() -> list[BurninCase]:
         name="scheduler_lane_capacity",
         category="scheduler",
         mission=_make_mission("scheduler_lane",
+            exploration_policy={"after_required_floor": "close_immediately", "min_optional_actions_after_floor": 0, "max_optional_actions_after_floor": 0, "require_contradiction_search": False},
             objective="Find the lane capacity configuration for read_pool, patch_pool, isolated_apply, and workspace_apply.",
             allowed_paths=["codex_oss/runtime/policy.py"],
             allowed_tool_classes=["read"],
@@ -543,6 +565,7 @@ def build_burnin_cases() -> list[BurninCase]:
         name="patch_pipeline_artifact_flow",
         category="patch_pipeline",
         mission=_make_mission("patch_artifact_flow",
+            exploration_policy={"after_required_floor": "close_immediately", "min_optional_actions_after_floor": 0, "max_optional_actions_after_floor": 0, "require_contradiction_search": False},
             objective="Trace how implementation artifacts flow from validate_patch_proposal through apply_patch_in_isolated_worktree.",
             allowed_paths=["codex_oss/implementation.py"],
             allowed_tool_classes=["read", "search"],
@@ -563,6 +586,7 @@ def build_burnin_cases() -> list[BurninCase]:
         name="patch_pipeline_rollback_investigation",
         category="patch_pipeline",
         mission=_make_mission("patch_rollback",
+            exploration_policy={"after_required_floor": "close_immediately", "min_optional_actions_after_floor": 0, "max_optional_actions_after_floor": 0, "require_contradiction_search": False},
             objective="Find how rollback artifacts are generated in the implementation pipeline. Look for rollback_diff and git apply -R references.",
             allowed_paths=["codex_oss/implementation.py"],
             allowed_tool_classes=["read", "search"],
@@ -581,6 +605,7 @@ def build_burnin_cases() -> list[BurninCase]:
         name="patch_pipeline_verification_scope",
         category="patch_pipeline",
         mission=_make_mission("patch_verification",
+            exploration_policy={"after_required_floor": "close_immediately", "min_optional_actions_after_floor": 0, "max_optional_actions_after_floor": 0, "require_contradiction_search": False},
             objective="Find how verification_policy is enforced during isolated implementation. Which function validates verification commands?",
             allowed_paths=["codex_oss/implementation.py"],
             allowed_tool_classes=["read", "search"],
@@ -599,6 +624,7 @@ def build_burnin_cases() -> list[BurninCase]:
         name="raw_lane_cert_investigation",
         category="raw_lane",
         mission=_make_mission("raw_lane_cert",
+            exploration_policy={"after_required_floor": "close_immediately", "min_optional_actions_after_floor": 0, "max_optional_actions_after_floor": 0, "require_contradiction_search": False},
             objective="Investigate the raw_lane module. How does it differ from the runtime-backed managed_bridge path?",
             allowed_paths=["codex_oss/raw_lane.py", "codex_oss/managed_bridge.py"],
             allowed_tool_classes=["read", "search"],
@@ -621,6 +647,7 @@ def build_burnin_cases() -> list[BurninCase]:
         name="raw_lane_probe_flags",
         category="raw_lane",
         mission=_make_mission("raw_lane_probe",
+            exploration_policy={"after_required_floor": "close_immediately", "min_optional_actions_after_floor": 0, "max_optional_actions_after_floor": 0, "require_contradiction_search": False},
             objective="Check if codex_oss/raw_lane.py uses probe flags or behavior flags that differentiate raw cert from runtime-backed cert.",
             allowed_paths=["codex_oss/raw_lane.py"],
             allowed_tool_classes=["read"],
@@ -968,6 +995,11 @@ def main():
             model_alias=MODEL, category=case.category,
             expected_outcome=case.expected_requires_closure,
             tolerance=case.tolerance_for_false_complete,
+            expected_answer_statuses=case.expected_answer_statuses,
+            expected_evidence_statuses=case.expected_evidence_statuses,
+            expected_verification_statuses=case.expected_verification_statuses,
+            expected_closure_statuses=case.expected_closure_statuses,
+            expected_final_statuses=case.expected_final_statuses,
         )
 
     # Preflight

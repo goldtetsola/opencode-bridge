@@ -67,17 +67,33 @@ class BurninHarness:
     def register_case(
         self, case_id: str, mission_id: str, agent: str = "", model_alias: str = "",
         category: str = "", expected_outcome: str = "", tolerance: bool = False,
+        expected_answer_statuses: list | None = None,
+        expected_evidence_statuses: list | None = None,
+        expected_verification_statuses: list | None = None,
+        expected_closure_statuses: list | None = None,
+        expected_final_statuses: list | None = None,
     ):
         self.cases[case_id] = BurninCaseResult(
             case_id=case_id, mission_id=mission_id, state=CaseState.QUEUED,
             agent=agent, model_alias=model_alias,
         )
-        self.manifest.expected_cases.append({
+        case_entry = {
             "case_id": case_id, "mission_id": mission_id,
             "agent": agent, "model_alias": model_alias,
             "category": category, "expected_outcome": expected_outcome,
             "tolerance": tolerance,
-        })
+        }
+        if expected_answer_statuses:
+            case_entry["expected_answer_statuses"] = expected_answer_statuses
+        if expected_evidence_statuses:
+            case_entry["expected_evidence_statuses"] = expected_evidence_statuses
+        if expected_verification_statuses:
+            case_entry["expected_verification_statuses"] = expected_verification_statuses
+        if expected_closure_statuses:
+            case_entry["expected_closure_statuses"] = expected_closure_statuses
+        if expected_final_statuses:
+            case_entry["expected_final_statuses"] = expected_final_statuses
+        self.manifest.expected_cases.append(case_entry)
         self.manifest.expected_case_count = len(self.manifest.expected_cases)
 
     def set_case_state(self, case_id: str, state: str, failure_class: str = ""):
