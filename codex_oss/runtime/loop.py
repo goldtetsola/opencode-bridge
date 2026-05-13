@@ -470,14 +470,10 @@ def run_loop(mission: Any, ledger: Any, call_model_fn, tools, emitter,
                             if not semantic.get("ok"):
                                 if repair_count < max_repair:
                                     repair_count += 1
-                                    context.append({"role": "user", "content":
-                                        REPAIR_PROMPT.format(
-                                            reason=(
-                                                f"report semantic completeness: {semantic.get('reason_codes', [])}. "
-                                                f"Required repairs: {semantic.get('required_repairs', [])}. "
-                                                f"Canonical answer: {json.dumps(published.get('required_answers', [])[:2])}"
-                                            )
-                                        )})
+                                    from codex_oss.runtime.closer import build_report_skeleton, build_targeted_repair_prompt
+                                    skeleton = build_report_skeleton(mission, refreshed_answer_graph)
+                                    repair_text = build_targeted_repair_prompt(report, semantic, skeleton)
+                                    context.append({"role": "user", "content": repair_text})
                                     continue
                                 report = apply_semantic_status_cap(report, semantic)
                                 report["semantic_gate_evaluated"] = True

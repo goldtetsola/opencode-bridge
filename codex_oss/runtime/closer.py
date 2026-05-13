@@ -134,6 +134,7 @@ def record_closure_attempt(
     *,
     closer_model: str = "",
     closure_strategy: str = "same_model_final_report",
+    call_type: str = "",
     started_at: str = "",
     elapsed_seconds: float = 0,
     timeout_seconds: float = 0,
@@ -141,7 +142,9 @@ def record_closure_attempt(
     deadline_remaining_seconds: float = 0,
     result: str = "",
     error: str = "",
+    error_type: str = "",
     report_valid: bool = False,
+    repair_attempted: bool = False,
     final_closure_source: str = "",
 ):
     """Record a closure attempt to closure_attempts.jsonl."""
@@ -150,6 +153,7 @@ def record_closure_attempt(
         "attempt_id": attempt_id,
         "closer_model": closer_model,
         "closure_strategy": closure_strategy,
+        "call_type": call_type,
         "started_at": started_at or str(int(time.time())),
         "elapsed_seconds": round(elapsed_seconds, 1),
         "timeout_seconds": round(timeout_seconds, 1),
@@ -157,8 +161,128 @@ def record_closure_attempt(
         "deadline_remaining_seconds": round(deadline_remaining_seconds, 1),
         "result": result,
         "error": error[:200] if error else "",
+        "error_type": error_type,
         "report_valid": report_valid,
+        "repair_attempted": repair_attempted,
         "final_closure_source": final_closure_source,
     }
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(entry, sort_keys=True) + "\n")
+
+
+def build_report_skeleton(
+    mission: Any,
+    answer_graph: JSON,
+) -> JSON:
+    """Build a report skeleton the closer fills in, not writes from scratch."""
+    sufficiency = answer_graph.get("sufficiency", {}) or {}
+    obligations = (
+        list(answer_graph.get("required_obligations", []) or [])
+        + list(answer_graph.get("optional_obligations", []) or [])
+    )
+    answered = [o for o in obligations if o.get("status") == "answered"]
+    recommended = sufficiency.get("recommended_status", "PARTIAL")
+    confidence = sufficiency.get("confidence_cap", "MEDIUM")
+
+    required_findings = []
+    for o in answered:
+        refs = list(o.get("evidence_refs", []) or [])[:3]
+        required_findings.append({
+            "obligation_id": str(o.get("id", "") or ""),
+            "claim": f"Evidence was gathered for: {str(o.get('question', ''))[:120]}",
+            "evidence_refs": refs,
+        })
+
+    missing_sources = sufficiency.get("missing_required_sources", []) or []
+    contradictions = sufficiency.get("contradicted_obligations", []) or []
+    blocked = sufficiency.get("blocked_obligations", []) or []
+
+    required_caveats = []
+    if missing_sources:
+        required_caveats.append(f"Required sources not inspected: {', '.join(str(s) for s in missing_sources[:4])}")
+    if contradictions:
+        required_caveats.append(f"Contradictions unresolved: {', '.join(str(c) for c in contradictions[:4])}")
+    if blocked:
+        required_caveats.append(f"Blocked sources: {', '.join(str(b) for b in blocked[:4])}")
+
+    return {
+        "schema_version": "report_skeleton.v1",
+        "status": recommended if recommended != "ESCALATE" else "PARTIAL",
+        "allowed_statuses": [recommended] if recommended in ("COMPLETE", "PARTIAL", "FAILED") else ["PARTIAL", "ESCALATE"],
+        "confidence": confidence,
+        "required_findings": required_findings,
+        "required_caveats": required_caveats,
+        "forbidden_claims": ["full repo-wide behavior was verified"],
+    }
+
+
+def build_skeleton_closer_payload(
+    mission: Any,
+    skeleton: JSON,
+    *,
+    max_chars: int = 6000,
+) -> str:
+    """Build a minimal closer prompt from a report skeleton."""
+    lines = []
+    lines.append("Fill in this report skeleton. Do not change status. Do not invent evidence.")
+    lines.append("")
+    lines.append(f"Status: {skeleton.get('status', 'PARTIAL')}")
+    lines.append(f"Allowed statuses: {', '.join(skeleton.get('allowed_statuses', []))}")
+    lines.append(f"Confidence: {skeleton.get('confidence', 'MEDIUM')}")
+    lines.append("")
+
+    findings = skeleton.get("required_findings", []) or []
+    if findings:
+        lines.append("Required findings:")
+        for f in findings:
+            lines.append(f"- [{f.get('obligation_id', '')}] {f.get('claim', '')}")
+            refs = ", ".join(f.get("evidence_refs", []) or [])
+            if refs:
+                lines.append(f"  Evidence: {refs}")
+
+    caveats = skeleton.get("required_caveats", []) or []
+    if caveats:
+        lines.append("\nRequired caveats:")
+        for c in caveats:
+            lines.append(f"- {c}")
+
+    lines.append(f"\nForbidden: {', '.join(skeleton.get('forbidden_claims', []))}")
+    lines.append("")
+    lines.append("Return a ValidatedReportV1 JSON using only the provided findings and evidence refs.")
+    lines.append("Do not add new claims. Do not change status upward.")
+
+    payload = "\n".join(lines)
+    if len(payload) > max_chars:
+        payload = payload[:max_chars - 50] + "\n\n[truncated]"
+    return payload
+
+
+def build_targeted_repair_prompt(
+    report: JSON,
+    semantic_result: JSON,
+    skeleton: JSON,
+) -> str:
+    """Build a repair prompt for a semantically incomplete closer report."""
+    codes = semantic_result.get("reason_codes", []) or []
+    repairs = semantic_result.get("required_repairs", []) or []
+    lines = [
+        "Your report was structurally valid but semantically incomplete.",
+        "",
+        f"Problems: {', '.join(codes)}",
+    ]
+    if repairs:
+        lines.append("Required fixes:")
+        for r in repairs:
+            lines.append(f"- {r}")
+    lines.append("")
+    lines.append("Use this skeleton. Return only a corrected ValidatedReportV1 JSON.")
+    lines.append(f"Status: {skeleton.get('status', 'PARTIAL')}")
+    lines.append(f"Allowed statuses: {', '.join(skeleton.get('allowed_statuses', []))}")
+    lines.append(f"Confidence: {skeleton.get('confidence', 'MEDIUM')}")
+    findings = skeleton.get("required_findings", []) or []
+    if findings:
+        lines.append("Required findings to include:")
+        for f in findings:
+            lines.append(f"- {f.get('claim', '')}")
+    lines.append("Do not invent evidence. Do not change status upward.")
+    return "\n".join(lines)
