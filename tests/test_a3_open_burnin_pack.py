@@ -999,35 +999,30 @@ def main():
             )
 
         harness.scan_missing_artifacts(MISSIONS_ROOT)
-
-        false_completes = len([r for r in results if r.false_complete])
-        raw_dumps = len([r for r in results if r.raw_dump_incidents > 0])
-        passed = len([r for r in results if r.passed])
-        if false_completes > 0 or raw_dumps > 0:
-            final_status = "FAIL"
-        elif len(results) > 0 and passed / len(results) < 0.5:
-            final_status = "WEAK"
-        else:
-            final_status = "PASS"
     finally:
         harness.scan_missing_artifacts(MISSIONS_ROOT)
-        harness.finalize(final_status)
-        print(f"\nBurn-in summary: {harness.output_dir}/summary.json")
+        harness.finalize()
 
-    false_completes = len([r for r in results if r.false_complete])
-    raw_dumps = len([r for r in results if r.raw_dump_incidents > 0])
-    passed = len([r for r in results if r.passed])
+    # Use authoritative finalizer
+    from codex_oss.burnin.finalizer import finalize_burnin_run
+    authoritative = finalize_burnin_run(ROOT, run_id)
+    truth_safe = authoritative.get("truth_safe", {}) or {}
+    scenario = authoritative.get("scenario_fidelity", {}) or {}
+    native = authoritative.get("native_feeling", {}) or {}
 
-    if false_completes > 0 or raw_dumps > 0:
-        print(f"\nBURN-IN FAILED: {false_completes} false COMPLETE, {raw_dumps} raw dumps")
+    print(f"\nBURN-IN TRUTH_SAFE: {'PASS' if truth_safe.get('pass') else 'FAIL'}")
+    print(f"BURN-IN SCENARIO_FIDELITY: {'PASS' if scenario.get('pass') else 'FAIL'}")
+    print(f"BURN-IN NATIVE_FEELING: {'PASS' if native.get('pass') else 'FAIL'}")
+    print(f"AUTHORITATIVE SUMMARY: {harness.output_dir}/summary.json")
+
+    result_str = authoritative.get("result", "FAIL")
+    if result_str == "PASS":
+        print(f"\nBURN-IN PASSED: all required axes")
+        return 0
+    else:
+        reasons = authoritative.get("result_reasons", [])
+        print(f"\nBURN-IN FAILED: {', '.join(reasons[:5])}")
         return 1
-
-    if len(results) > 0 and passed / len(results) < 0.5:
-        print(f"\nBURN-IN WEAK: only {_pct(passed, len(results))} passed")
-        return 2
-
-    print(f"\nBURN-IN PASSED: {passed}/{len(results)} cases ok")
-    return 0
 
 
 if __name__ == "__main__":

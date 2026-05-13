@@ -78,6 +78,14 @@ def audit_mission(project_root: str, mission_id: str) -> dict[str, Any]:
             str(report.get("status", "") or "") != "",
             "report status present",
         ))
+        envelope = report.get("completion_envelope", {}) or {}
+        env_status = envelope.get("final_status", "")
+        report_status = str(report.get("status", "") or "")
+        checks.append(_check(
+            "report_envelope_consistent",
+            not env_status or report_status == env_status,
+            f"report.status ({report_status}) matches completion_envelope.final_status ({env_status})" if (not env_status or report_status == env_status) else f"report.status ({report_status}) != completion_envelope.final_status ({env_status})",
+        ))
         checks.append(_check(
             "semantic_review_recorded",
             "semantic_review_ok" in report or "semantic_review_ok" in validation,

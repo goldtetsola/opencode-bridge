@@ -1198,11 +1198,9 @@ def _partial_dict(mission, ledger, reason: str) -> dict:
         report = build_runtime_report_from_answer_graph(mission, ledger, answer_graph, reason=_sanitize_fallback_reason(reason), report_source="runtime_answer_graph")
         report["semantic_gate_evaluated"] = False
         report["timeout_recovery_used"] = True
-        from codex_oss.completion import build_completion_envelope, default_completion_contract
-        contract = getattr(mission, "completion_contract", {}) or default_completion_contract(mission)
-        envelope = build_completion_envelope(mission, report, answer_graph, None, None)
-        report["completion_envelope"] = envelope
         _annotate_report_provenance(mission, report, "runtime_answer_graph")
+
+        # Apply all status caps/downgrades BEFORE building the completion envelope
         exploration_policy = _exploration_policy(mission)
         after_floor = str(exploration_policy.get("after_required_floor", "") or "")
         min_optional = int(exploration_policy.get("min_optional_actions_after_floor", 0) or 0)
@@ -1224,8 +1222,16 @@ def _partial_dict(mission, ledger, reason: str) -> dict:
             report.setdefault("caveats", []).append(
                 f"Runtime closure cap: exploration policy requires {', '.join(unmet)} but model terminated before completion."
             )
-        _record_closer_attempt(mission, "runtime", str(report.get("status", "PARTIAL")), report_valid=True)
-        return {"status": str(report.get("status", "PARTIAL") or "PARTIAL"), "report": report}
+
+        # Build authoritative envelope AFTER all caps are applied
+        from codex_oss.completion import build_completion_envelope, default_completion_contract
+        contract = getattr(mission, "completion_contract", {}) or default_completion_contract(mission)
+        envelope = build_completion_envelope(mission, report, answer_graph, sufficiency=answer_graph.get("sufficiency", {}) if isinstance(answer_graph, dict) else {}, closure_attempts=None)
+        report["completion_envelope"] = envelope
+        report["status"] = envelope["final_status"]
+
+        _record_closer_attempt(mission, "runtime", report["status"], report_valid=True)
+        return {"status": report["status"], "report": report}
     return {"status": "PARTIAL", "report": build_deterministic_partial_report(mission, ledger, reason)}
 
 
