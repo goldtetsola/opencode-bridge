@@ -553,8 +553,19 @@ def _validate_source_requirements(raw: Any, *, field_name: str) -> List[dict]:
             "required_shapes": [str(shape) for shape in (item.get("required_shapes", []) or []) if str(shape)],
             "contradiction_markers": [str(marker) for marker in (item.get("contradiction_markers", []) or []) if str(marker)],
             "completeness_policy": _validate_completeness_policy(item.get("completeness_policy"), evidence_kind),
+            "shape_match_policy": _validate_shape_match_policy(item.get("shape_match_policy"), item.get("required_shapes")),
+            "evidence_plane": str(item.get("evidence_plane", "") or "").strip() or "file_content",
         })
     return requirements
+
+
+def _validate_shape_match_policy(raw: Any, shapes: Any) -> str:
+    if not raw and not shapes:
+        return "all"
+    policy = str(raw or "all").strip().lower()
+    if policy not in ("all", "any"):
+        raise InvalidHandoffError(f"shape_match_policy must be 'all' or 'any', got: {policy}")
+    return policy
 
 
 def _validate_completeness_policy(raw: Any, evidence_kind: str) -> str:

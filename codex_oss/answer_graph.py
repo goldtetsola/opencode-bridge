@@ -470,6 +470,8 @@ def _normalize_obligation(raw: dict[str, Any]) -> dict[str, Any]:
                 "required_shapes": [str(shape) for shape in (item.get("required_shapes", []) or []) if str(shape)],
                 "contradiction_markers": [str(marker) for marker in (item.get("contradiction_markers", []) or []) if str(marker)],
                 "completeness_policy": str(item.get("completeness_policy", "") or "") or "shape_sufficient",
+                "shape_match_policy": str(item.get("shape_match_policy", "") or "") or "all",
+                "evidence_plane": str(item.get("evidence_plane", "") or "") or "file_content",
             })
     return {
         "id": str(raw.get("id", "q")),
@@ -518,17 +520,23 @@ def _source_requirement_view(requirement: dict[str, Any], inspected_paths: set[s
     if successful_read and path in inspected_paths:
         evidence_refs.append(f"file:{path}#extract:1")
     required_shapes = [str(shape) for shape in (requirement.get("required_shapes", []) or []) if str(shape)]
-    detected_shapes = _detected_shapes_for_path(path)
+    detected_shapes = _detected_shapes_for_path(path) if _evidence_plane(requirement) != "command_result" else _detected_command_shapes(path, command_refs)
+    shape_match_policy = str(requirement.get("shape_match_policy", "") or "") or "all"
     contradiction_markers = [str(marker) for marker in (requirement.get("contradiction_markers", []) or []) if str(marker)]
     matched_contradictions = _matched_contradiction_markers(path, contradiction_markers)
     missing_shapes = [shape for shape in required_shapes if shape not in detected_shapes]
+    shape_satisfied = (
+        not required_shapes or
+        (shape_match_policy == "any" and bool(detected_shapes)) or
+        (shape_match_policy == "all" and not missing_shapes)
+    )
     if matched_contradictions:
         status = "contradicted"
     elif failed_reads and not evidence_refs:
         status = "blocked_source"
     elif not evidence_refs:
         status = "missing"
-    elif missing_shapes:
+    elif not shape_satisfied:
         status = "insufficient_evidence"
     else:
         status = "satisfied"
@@ -541,12 +549,32 @@ def _source_requirement_view(requirement: dict[str, Any], inspected_paths: set[s
         "required_shapes": required_shapes,
         "detected_shapes": detected_shapes,
         "missing_shapes": missing_shapes,
+        "shape_match_policy": shape_match_policy,
+        "shape_satisfied": shape_satisfied,
         "contradiction_markers": contradiction_markers,
         "matched_contradictions": matched_contradictions,
         "completeness_policy": completeness_policy,
         "status": status,
         "evidence_refs": list(dict.fromkeys(evidence_refs + failed_reads)),
     }
+
+
+def _evidence_plane(requirement: dict[str, Any]) -> str:
+    return str(requirement.get("evidence_plane", "") or "") or "file_content"
+
+
+def _detected_command_shapes(path: str, command_refs: list[dict[str, Any]]) -> list[str]:
+    """Detect evidence shapes from command results (rtk_grep, etc.)"""
+    shapes = []
+    for ref in command_refs:
+        if path and path != ref.get("path"):
+            continue
+        exit_code = int(ref.get("exit_code", 0) or 0)
+        matches = int(ref.get("matches_count", -1))
+        if exit_code != 0 or matches == 0:
+            shapes.append("zero_match")
+        break  # Only need one match per path
+    return shapes
 
 
 def _obligation_evidence_refs(

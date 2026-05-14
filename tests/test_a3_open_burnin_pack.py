@@ -184,6 +184,7 @@ def build_burnin_cases() -> list[BurninCase]:
         category="contradiction_blocked",
         mission=_make_mission("required_readable",
             objective="Verify the audit module is readable and returns expected fields.",
+            exploration_policy={"after_required_floor": "close_immediately", "min_optional_actions_after_floor": 0, "max_optional_actions_after_floor": 0, "require_contradiction_search": False},
             allowed_paths=["codex_oss/audit.py"],
             allowed_tool_classes=["read"],
             answer_obligations=[{
@@ -331,7 +332,10 @@ def build_burnin_cases() -> list[BurninCase]:
             }],
             must_inspect=["codex_oss/answer_graph.py", "codex_oss/answer_graph.py"],
         ),
-        expected_requires_closure="COMPLETE",
+        expected_requires_closure="PARTIAL",
+        expected_answer_statuses=["ANSWERED"],
+        expected_verification_statuses=["INCOMPLETE"],
+        expected_final_statuses=["PARTIAL"],
     ))
 
     # Category 5: Exploration policy + close_immediately
@@ -467,6 +471,7 @@ def build_burnin_cases() -> list[BurninCase]:
                 "source_requirements": [{
                     "path": "codex_oss/runtime/loop.py",
                     "evidence_kind": "zero_match",
+                    "evidence_plane": "command_result",
                     "required": True, "prefetch": False,
                     "required_shapes": ["zero_match"],
                 }],
@@ -493,6 +498,7 @@ def build_burnin_cases() -> list[BurninCase]:
                     "evidence_kind": "flag_behavior_check",
                     "required": True, "prefetch": False,
                     "required_shapes": ["flag_parameter", "flag_read", "behavior_derivation"],
+                    "shape_match_policy": "any",
                 }],
             }],
             must_inspect=["codex_oss/raw_lane.py"],
