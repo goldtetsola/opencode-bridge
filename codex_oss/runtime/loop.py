@@ -294,15 +294,20 @@ def run_loop(mission: Any, ledger: Any, call_model_fn, tools, emitter,
             if forced_final_requested:
                 final_timeout = float(os.getenv("RUNTIME_FINAL_REPORT_MODEL_TIMEOUT_SECONDS", "20"))
                 model_timeout = max(1, min(model_timeout, final_timeout))
-                # Use compact closer payload if we have answered obligations
-                from codex_oss.runtime.closer import build_closer_payload
+                # CloserDraftV1 flow: runtime builds skeleton, model narrates
                 answer_graph = getattr(ledger, "answer_graph", {}) or {}
                 sufficiency = answer_graph.get("sufficiency", {}) if isinstance(answer_graph, dict) else {}
                 if sufficiency.get("required_answered", 0) > 0:
-                    claim_graph = getattr(ledger, "claim_graph", {}) or {}
-                    compact = build_closer_payload(mission, answer_graph, claim_graph, ledger)
-                    context = [{"role": "user", "content": compact}]
-                    _record_closer_attempt(mission, "closer", "attempting", payload_chars=len(compact))
+                    from codex_oss.runtime.closure import (
+                        build_canonical_answer, build_report_skeleton, build_closer_draft_prompt,
+                    )
+                    from codex_oss.completion import build_completion_envelope, default_completion_contract
+                    contract = getattr(mission, "completion_contract", {}) or default_completion_contract(mission)
+                    envelope = build_completion_envelope(mission, {"status": sufficiency.get("recommended_status", "PARTIAL"), "closure_source": "runtime_answer_graph"}, answer_graph, sufficiency, None)
+                    canonical = build_canonical_answer(mission, answer_graph, envelope, ledger)
+                    skeleton = build_report_skeleton(canonical)
+                    context = [{"role": "user", "content": build_closer_draft_prompt(skeleton)}]
+                    _record_closer_attempt(mission, "closer", "attempting", payload_chars=len(context[0]["content"]))
             try:
                 response = call_model_fn(context, tools, model_timeout)
                 deadline.record_call()
@@ -485,6 +490,7 @@ def run_loop(mission: Any, ledger: Any, call_model_fn, tools, emitter,
                         _annotate_report_provenance(mission, report, "model_report")
                         report["semantic_gate_evaluated"] = True
                         report["semantic_gate_decision"] = "ACCEPT"
+                        report["closure_status"] = "MODEL_NARRATED_RUNTIME_CLOSED" if forced_final_requested else "MODEL_CLOSED"
                         from codex_oss.completion import build_completion_envelope, default_completion_contract
                         contract = getattr(mission, "completion_contract", {}) or default_completion_contract(mission)
                         report["completion_envelope"] = build_completion_envelope(mission, report, refreshed_answer_graph, answer_sufficiency, None)
