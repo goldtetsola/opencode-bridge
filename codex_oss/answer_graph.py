@@ -569,11 +569,13 @@ def _detected_command_shapes(path: str, command_refs: list[dict[str, Any]]) -> l
     for ref in command_refs:
         if path and path != ref.get("path"):
             continue
-        exit_code = int(ref.get("exit_code", 0) or 0)
+        tool_name = str(ref.get("tool_name", "") or "")
+        if tool_name not in ("rtk_grep", "grep"):
+            continue
         matches = int(ref.get("matches_count", -1))
-        if exit_code != 0 or matches == 0:
+        exit_code = int(ref.get("exit_code", 0) or 0)
+        if matches == 0 or (matches < 0 and exit_code != 0):
             shapes.append("zero_match")
-        break  # Only need one match per path
     return shapes
 
 
@@ -850,9 +852,11 @@ def _command_refs(ledger: Any) -> list[dict[str, Any]]:
         args = dict(getattr(command, "args", {}) or {})
         refs.append({
             "ref": f"command:{idx}",
+            "tool_name": str(getattr(command, "tool", "") or ""),
             "path": str(args.get("path", "") or ""),
             "pattern": str(args.get("pattern", "") or ""),
             "exit_code": int(getattr(command, "exit_code", 0) or 0),
+            "matches_count": int(getattr(command, "matches_count", -1) or -1),
         })
     return refs
 
