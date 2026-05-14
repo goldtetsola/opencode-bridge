@@ -397,6 +397,7 @@ def build_burnin_cases() -> list[BurninCase]:
         category="contradiction_blocked",
         mission=_make_mission("two_src_contradiction",
             objective="Check if two sources have contradictory definitions of the same function. Compare codex_oss/implementation.py and codex_oss/implementation_graph.py for build_implementation_readiness_graph.",
+            exploration_policy={"after_required_floor": "close_immediately", "min_optional_actions_after_floor": 0, "max_optional_actions_after_floor": 0, "require_contradiction_search": False},
             allowed_paths=["codex_oss/implementation.py", "codex_oss/implementation_graph.py"],
             allowed_tool_classes=["read", "search"],
             answer_obligations=[{
