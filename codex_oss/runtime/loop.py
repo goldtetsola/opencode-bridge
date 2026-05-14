@@ -144,6 +144,11 @@ def run_loop(mission: Any, ledger: Any, call_model_fn, tools, emitter,
     )
     from codex_oss.decision_trace import append_decision
 
+    # Initialize narration accumulator
+    from codex_oss.runtime.closure import NarrationAccumulator
+    if getattr(ledger, "narration_accumulator", None) is None:
+        ledger.narration_accumulator = NarrationAccumulator()
+
     start = _time.time()
     deadline = DeadlinePolicy(request_deadline=request_deadline)
     deadline.max_total_model_calls = int(getattr(mission, "max_model_calls", deadline.max_total_model_calls))
@@ -1295,6 +1300,23 @@ def _partial_dict(mission, ledger, reason: str) -> dict:
             report.setdefault("caveats", []).append(
                 f"Runtime closure cap: exploration policy requires {', '.join(unmet)} but model terminated before completion."
             )
+
+        # Record closer opportunity before building envelope
+        from codex_oss.runtime.closure import evaluate_closer_eligibility, record_closer_opportunity
+        eligibility = evaluate_closer_eligibility(mission, answer_graph, 999)
+        project_root = os.getcwd()
+        mission_dir = os.path.join(project_root, ".codex-oss", "missions", getattr(mission, "mission_id", "unknown"))
+        os.makedirs(mission_dir, exist_ok=True)
+        skip_reason = "blocked_source" if str(reason).startswith("report_validation_failed") else (reason if not eligibility["eligible"] else "")
+        record_closer_opportunity(
+            mission_dir, f"opp_fallback_{int(time.time())}",
+            phase="REPORT", eligible=eligibility["eligible"],
+            reason=skip_reason or eligibility["reason"],
+            action="attempt_closer_draft" if eligibility["eligible"] else "skip_closer",
+            answer_status=eligibility["answer_status"],
+            required_answered=eligibility["required_answered"],
+            deadline_remaining_seconds=0,
+        )
 
         # Build authoritative envelope AFTER all caps are applied
         from codex_oss.completion import build_completion_envelope, default_completion_contract

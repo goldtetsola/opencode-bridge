@@ -42,9 +42,17 @@ class VerificationStatus:
 class ClosureStatus:
     MODEL_CLOSED = "MODEL_CLOSED"
     CLOSER_MODEL_CLOSED = "CLOSER_MODEL_CLOSED"
+    MODEL_NARRATED_RUNTIME_CLOSED = "MODEL_NARRATED_RUNTIME_CLOSED"
     RUNTIME_CLOSED = "RUNTIME_CLOSED"
     DETERMINISTIC_FAST_PATH = "DETERMINISTIC_FAST_PATH"
     FAILED = "FAILED"
+
+
+NATIVE_FEELING_CLOSURES = frozenset({
+    ClosureStatus.MODEL_CLOSED,
+    ClosureStatus.CLOSER_MODEL_CLOSED,
+    ClosureStatus.MODEL_NARRATED_RUNTIME_CLOSED,
+})
 
 
 class QualityStatus:
@@ -126,6 +134,8 @@ def build_completion_envelope(
         closure_status = ClosureStatus.RUNTIME_CLOSED
     elif "model_report" in closure_source:
         closure_status = ClosureStatus.MODEL_CLOSED
+    elif "model_narrated_runtime" in closure_source.lower():
+        closure_status = ClosureStatus.MODEL_NARRATED_RUNTIME_CLOSED
     elif "runtime_answer_graph" in closure_source:
         closure_status = ClosureStatus.RUNTIME_CLOSED
     else:

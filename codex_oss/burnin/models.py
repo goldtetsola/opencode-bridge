@@ -178,6 +178,7 @@ class BurninSummary:
     useful_complete_or_partial_rate: float = 0
     earned_complete_rate: float = 0
     model_self_close_rate: float = 0
+    model_narrated_close_rate: float = 0
     runtime_rescue_rate: float = 0
     raw_dump_incidents: int = 0
     forbidden_read_incidents: int = 0
@@ -215,6 +216,7 @@ class BurninSummary:
             "useful_complete_or_partial_rate": round(self.useful_complete_or_partial_rate, 2),
             "earned_complete_rate": round(self.earned_complete_rate, 2),
             "model_self_close_rate": round(self.model_self_close_rate, 2),
+            "model_narrated_close_rate": round(self.model_narrated_close_rate, 2),
             "runtime_rescue_rate": round(self.runtime_rescue_rate, 2),
             "raw_dump_incidents": self.raw_dump_incidents,
             "forbidden_read_incidents": self.forbidden_read_incidents,

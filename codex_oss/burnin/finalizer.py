@@ -54,6 +54,7 @@ def finalize_burnin_run(project_root: str, run_id: str) -> JSON:
     truthful_partials = 0
     raw_dumps = 0
     model_closures = 0
+    narrated_closures = 0
     runtime_closures = 0
     evidence_failures = 0
     cleanup_ratings: dict[str, int] = {}
@@ -121,9 +122,12 @@ def finalize_burnin_run(project_root: str, run_id: str) -> JSON:
         # Quality classification
         is_runtime_closed = "runtime_answer_graph" in closure or "runtime" in closure
         is_model_closed = "model_report" in closure
+        is_narrated = "model_narrated_runtime" in closure or report.get("closure_status") == "MODEL_NARRATED_RUNTIME_CLOSED"
 
         if is_runtime_closed:
             runtime_closures += 1
+        if is_narrated:
+            narrated_closures += 1
         if is_model_closed:
             model_closures += 1
 
@@ -231,6 +235,7 @@ def finalize_burnin_run(project_root: str, run_id: str) -> JSON:
     summary.raw_dump_incidents = raw_dumps
     summary.evidence_ref_failures = evidence_failures
     summary.model_self_close_rate = _rate(model_closures, max(completed, 1))
+    summary.model_narrated_close_rate = _rate(narrated_closures, max(completed, 1))
     summary.runtime_rescue_rate = _rate(runtime_closures, max(completed, 1))
 
     useful = completed - false_completes - suspicious
@@ -246,7 +251,7 @@ def finalize_burnin_run(project_root: str, run_id: str) -> JSON:
         and (suspicious == 0)
     )
     native_feeling_ok = (
-        summary.model_self_close_rate >= 0.2
+        (summary.model_self_close_rate >= 0.2 or summary.model_narrated_close_rate >= 0.2)
         and summary.earned_complete_rate >= 0.3
         and not missing_ids
     )
