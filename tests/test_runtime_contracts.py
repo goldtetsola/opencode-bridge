@@ -32,6 +32,7 @@ from codex_oss.runtime.policy import detect_critical_finality, is_broad_root
 from codex_oss.runtime.objectives import classify_objective, synthesize_objective_finding
 from codex_oss.validation import validate_report
 from codex_oss.runtime.policy import acquire_mission_slot, release_mission_slot
+from codex_oss.runtime.closure import record_closure_telemetry
 
 
 def mission(**overrides):
@@ -3980,6 +3981,44 @@ def assert_run_loop_downgrades_hollow_model_complete():
         assert result["status"] in ("COMPLETE", "PARTIAL"), f"Expected COMPLETE or PARTIAL after repair, got {result['status']}: {result}"
 
 
+def assert_record_closure_telemetry_persists_error_and_skip_fields():
+    root = tempfile.mkdtemp(prefix="closure_telemetry_")
+    try:
+        record_closure_telemetry(
+            root,
+            "attempt_001",
+            attempt_type="runtime_fallback",
+            closer_model="mission-a3-kimi",
+            elapsed_seconds=1.2,
+            timeout_seconds=20,
+            payload_chars=0,
+            deadline_remaining_seconds=4.5,
+            skeleton_findings_count=0,
+            allowed_statuses=["PARTIAL"],
+            result="PARTIAL",
+            error_type="timeout",
+            error_message="The read operation timed out",
+            draft_valid=False,
+            merged_report_valid=False,
+            closure_status="RUNTIME_CLOSED",
+            skip_reason="deadline_reached",
+            result_valid=True,
+            final_closure_source="runtime_answer_graph",
+            repair_attempted=False,
+        )
+        path = os.path.join(root, "closure_attempts.jsonl")
+        with open(path, "r", encoding="utf-8") as handle:
+            entry = json.loads(handle.read().strip())
+        assert entry["schema_version"] == "closure_attempt.v2", entry
+        assert entry["error_type"] == "timeout", entry
+        assert entry["error_message"] == "The read operation timed out", entry
+        assert entry["skip_reason"] == "deadline_reached", entry
+        assert entry["closure_status"] == "RUNTIME_CLOSED", entry
+        assert entry["report_valid"] is True, entry
+    finally:
+        shutil.rmtree(root)
+
+
 def main():
     assert_run_loop_accepts_valid_final_report()
     assert_model_text_extraction_handles_provider_variants()
@@ -4052,6 +4091,7 @@ def main():
     assert_evidence_kind_multiple_shapes_with_contradiction()
     assert_semantic_gate_downgrades_hollow_complete()
     assert_run_loop_downgrades_hollow_model_complete()
+    assert_record_closure_telemetry_persists_error_and_skip_fields()
     print("PASS: runtime contract suite")
 
 

@@ -43,6 +43,7 @@ AUTH = os.getenv("PROXY_API_KEY") or os.getenv("LITELLM_MASTER_KEY") or "sk-loca
 TIMEOUT = float(os.getenv("OSS_LIVE_BURNIN_TIMEOUT", "180"))
 MODEL = os.getenv("OSS_LIVE_BURNIN_MODEL", "mission-a3-kimi")
 MISSIONS_ROOT = os.path.join(ROOT, ".codex-oss", "missions")
+AUTONOMY_ONLY_CASE_IDS = ("case_001", "case_008", "case_009", "case_010", "case_011", "case_023")
 
 REQUIRED_OUTPUTS = [
     "files_inspected", "commands_run", "findings", "uncertainties",
@@ -87,6 +88,26 @@ class BurninResult:
     passed: bool = False
     elapsed: float = 0
     artifact_dir: str = ""
+
+
+def _select_case_entries(cases: list[BurninCase], *, start: int, limit: int) -> list[tuple[int, BurninCase]]:
+    """Select cases while preserving their original case numbers."""
+    requested_case_ids = [item.strip() for item in str(os.getenv("OSS_LIVE_BURNIN_CASE_IDS", "") or "").split(",") if item.strip()]
+    requested_names = [item.strip() for item in str(os.getenv("OSS_LIVE_BURNIN_CASE_NAMES", "") or "").split(",") if item.strip()]
+    if os.getenv("LIVE_AUTONOMY_ONLY"):
+        requested_case_ids = list(AUTONOMY_ONLY_CASE_IDS)
+
+    indexed = [(idx, case) for idx, case in enumerate(cases, start=1)]
+    if requested_case_ids or requested_names:
+        wanted_case_ids = set(requested_case_ids)
+        wanted_names = set(requested_names)
+        selected = [
+            (idx, case)
+            for idx, case in indexed
+            if f"case_{idx:03d}" in wanted_case_ids or case.name in wanted_names
+        ]
+        return selected[: max(limit, 0)]
+    return indexed[start - 1 : start - 1 + min(limit, len(cases))]
 
 
 def _make_mission(name: str, objective: str, **overrides) -> dict:
@@ -801,23 +822,22 @@ def extract_metrics(mission: dict, response: dict) -> BurninResult:
     return result
 
 
-def run_burnin(cases: list[BurninCase], *, mission_ids: list[str], limit: int = 25, start: int = 1):
+def run_burnin(case_entries: list[tuple[int, BurninCase]], *, mission_ids: list[str], defined_count: int):
     """Run burn-in cases against the live bridge."""
     results: list[BurninResult] = []
-    total = min(limit, len(cases))
+    total = len(case_entries)
 
-    print(f"\nA3-Open Burn-In Pack: {total} cases ({len(cases)} defined)")
+    print(f"\nA3-Open Burn-In Pack: {total} cases ({defined_count} defined)")
     print(f"Bridge: {BASE_URL}")
     print(f"Model: {MODEL}")
     print(f"Timeout: {TIMEOUT}s")
     print("-" * 60)
 
-    for local_idx, case in enumerate(cases[start - 1 : start - 1 + total], start=0):
-        idx = start + local_idx
+    for local_idx, (idx, case) in enumerate(case_entries, start=0):
         mission = dict(case.mission)
         mission["mission_id"] = mission_ids[local_idx]
 
-        print(f"\n[{idx}/{total}] {case.name} ({case.category})")
+        print(f"\n[{local_idx + 1}/{total}] {case.name} ({case.category})")
         start_time = time.time()
         response = call_bridge(mission)
         elapsed = time.time() - start_time
@@ -900,6 +920,89 @@ def run_burnin(cases: list[BurninCase], *, mission_ids: list[str], limit: int = 
     return results
 
 
+def _load_closure_attempts(mission_id: str) -> list[dict[str, Any]]:
+    path = os.path.join(MISSIONS_ROOT, mission_id, "closure_attempts.jsonl")
+    attempts: list[dict[str, Any]] = []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    item = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(item, dict):
+                    attempts.append(item)
+    except FileNotFoundError:
+        pass
+    return attempts
+
+
+def _autonomy_bucket(attempts: list[dict[str, Any]]) -> str:
+    if not attempts:
+        return "no_attempt_artifact"
+    if any(
+        str(item.get("closure_status", "") or "") in ("MODEL_CLOSED", "MODEL_NARRATED_RUNTIME_CLOSED", "CLOSER_MODEL_CLOSED")
+        or str(item.get("final_closure_source", "") or "") == "model_report"
+        for item in attempts
+    ):
+        return "model_closed"
+
+    substantive = [
+        item for item in attempts
+        if int(item.get("payload_chars", 0) or 0) > 0
+        or str(item.get("attempt_type", "") or "") in ("closer_draft", "full_report")
+    ]
+    timeouted = [
+        item for item in attempts
+        if str(item.get("error_type", "") or "").lower() == "timeout"
+        or "timed out" in str(item.get("error_message", "") or "").lower()
+    ]
+    if substantive and timeouted:
+        return "attempted_timeout"
+    if substantive:
+        invalid = [
+            item for item in substantive
+            if not bool(item.get("merged_report_valid") or item.get("report_valid"))
+        ]
+        if any(str(item.get("error_type", "") or "") == "semantic_gate_failed" for item in invalid):
+            return "attempted_semantic_gate"
+        if any(str(item.get("error_type", "") or "") == "schema_failed" for item in invalid):
+            return "attempted_schema_failed"
+        if invalid:
+            return "attempted_invalid_artifact"
+    if any(str(item.get("skip_reason", "") or "") for item in attempts):
+        return "no_closer_opportunity"
+    return "runtime_closed_without_attempt"
+
+
+def print_autonomy_summary(results: list[BurninResult]) -> None:
+    buckets: dict[str, int] = {}
+    for result in results:
+        if not result.mission_id:
+            continue
+        bucket = _autonomy_bucket(_load_closure_attempts(result.mission_id))
+        buckets[bucket] = buckets.get(bucket, 0) + 1
+
+    print("\nAutonomy-only summary:")
+    ordered = [
+        "model_closed",
+        "attempted_timeout",
+        "attempted_semantic_gate",
+        "attempted_schema_failed",
+        "attempted_invalid_artifact",
+        "no_closer_opportunity",
+        "runtime_closed_without_attempt",
+        "no_attempt_artifact",
+    ]
+    total = sum(buckets.values()) or 1
+    for key in ordered:
+        if key in buckets:
+            print(f"  {key}: {buckets[key]}/{total}")
+
+
 def _read_json(path: str) -> dict[str, Any]:
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -979,7 +1082,8 @@ def main():
     limit = int(os.getenv("OSS_LIVE_BURNIN_LIMIT", "25"))
     start = int(os.getenv("OSS_LIVE_BURNIN_START_INDEX", "1"))
     run_id = f"burnin_a3_open_{datetime.now(timezone.utc).strftime('%Y_%m_%d_%H%M%S')}"
-    selected_cases = cases[start - 1 : start - 1 + min(limit, len(cases))]
+    selected_entries = _select_case_entries(cases, start=start, limit=limit)
+    selected_cases = [case for _, case in selected_entries]
     harness = BurninHarness(
         run_id=run_id, suite="a3_open", project_root=ROOT,
         required_aliases=["mission-a3-kimi", "mission-a3-deepseek", "mission-a2-flash"],
@@ -990,8 +1094,7 @@ def main():
     # Register cases
     mission_ids: list[str] = []
     selected_index_by_case_id: dict[str, int] = {}
-    for local_idx, case in enumerate(selected_cases, start=0):
-        idx = start + local_idx
+    for local_idx, (idx, case) in enumerate(selected_entries, start=0):
         base_mission_id = str(case.mission.get("mission_id", f"case_{idx}"))
         mission_id = _run_mission_id(base_mission_id, idx, run_id)
         case_id = f"case_{idx:03d}"
@@ -1020,7 +1123,7 @@ def main():
     results: list[BurninResult] = []
     final_status = "FAIL"
     try:
-        results = run_burnin(selected_cases, mission_ids=mission_ids, limit=limit, start=1)
+        results = run_burnin(selected_entries, mission_ids=mission_ids, defined_count=len(selected_entries))
         harness.scan_missing_artifacts(MISSIONS_ROOT)
 
         for result in results:
@@ -1053,6 +1156,8 @@ def main():
     print(f"BURN-IN SCENARIO_FIDELITY: {'PASS' if scenario.get('pass') else 'FAIL'}")
     print(f"BURN-IN NATIVE_FEELING: {'PASS' if native.get('pass') else 'FAIL'}")
     print(f"AUTHORITATIVE SUMMARY: {harness.output_dir}/summary.json")
+    if os.getenv("LIVE_AUTONOMY_ONLY"):
+        print_autonomy_summary(results)
 
     result_str = authoritative.get("result", "FAIL")
     if result_str == "PASS":

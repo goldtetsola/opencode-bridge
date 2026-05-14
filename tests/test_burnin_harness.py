@@ -14,7 +14,7 @@ sys.path.insert(0, ROOT)
 
 from codex_oss.burnin.harness import BurninHarness
 from codex_oss.burnin.models import CaseState
-from tests.test_a3_open_burnin_pack import _run_mission_id
+from tests.test_a3_open_burnin_pack import _run_mission_id, _select_case_entries, build_burnin_cases
 
 
 def assert_run_mission_id_is_run_unique():
@@ -74,10 +74,25 @@ def assert_finalize_writes_summary_even_with_missing_cases():
         shutil.rmtree(temp_root)
 
 
+def assert_autonomy_subset_selection_preserves_original_case_ids():
+    previous = os.environ.get("LIVE_AUTONOMY_ONLY")
+    try:
+        os.environ["LIVE_AUTONOMY_ONLY"] = "1"
+        entries = _select_case_entries(build_burnin_cases(), start=1, limit=25)
+        case_ids = [f"case_{idx:03d}" for idx, _ in entries]
+        assert case_ids == ["case_001", "case_008", "case_009", "case_010", "case_011", "case_023"], case_ids
+    finally:
+        if previous is None:
+            os.environ.pop("LIVE_AUTONOMY_ONLY", None)
+        else:
+            os.environ["LIVE_AUTONOMY_ONLY"] = previous
+
+
 def main():
     assert_run_mission_id_is_run_unique()
     assert_scan_missing_artifacts_marks_missing_case()
     assert_finalize_writes_summary_even_with_missing_cases()
+    assert_autonomy_subset_selection_preserves_original_case_ids()
     print("PASS: burnin harness suite")
 
 
