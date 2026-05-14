@@ -307,7 +307,17 @@ def run_loop(mission: Any, ledger: Any, call_model_fn, tools, emitter,
                     canonical = build_canonical_answer(mission, answer_graph, envelope, ledger)
                     skeleton = build_report_skeleton(canonical)
                     context = [{"role": "user", "content": build_closer_draft_prompt(skeleton)}]
-                    _record_closer_attempt(mission, "closer", "attempting", payload_chars=len(context[0]["content"]))
+                    _record_closer_attempt(
+                        mission,
+                        "closer",
+                        "attempting",
+                        attempt_type="closer_draft",
+                        payload_chars=len(context[0]["content"]),
+                        timeout_seconds=model_timeout,
+                        deadline_remaining_seconds=deadline.remaining(),
+                        allowed_statuses=list(skeleton.get("allowed_statuses", []) or []),
+                        skeleton_findings_count=len(list(skeleton.get("required_findings", []) or [])),
+                    )
             try:
                 response = call_model_fn(context, tools, model_timeout)
                 deadline.record_call()
@@ -485,7 +495,21 @@ def run_loop(mission: Any, ledger: Any, call_model_fn, tools, emitter,
                                 report["semantic_gate_decision"] = semantic.get("decision", "")
                                 report["semantic_gate_reason_codes"] = semantic.get("reason_codes", [])
                                 _annotate_report_provenance(mission, report, "model_report_downgraded")
-                                _record_closer_attempt(mission, "model", report.get("status", "PARTIAL"), elapsed=0, report_valid=False)
+                                _record_closer_attempt(
+                                    mission,
+                                    "model",
+                                    report.get("status", "PARTIAL"),
+                                    attempt_type="closer_draft" if forced_final_requested else "full_report",
+                                    elapsed=0,
+                                    payload_chars=len(str(context[-1].get("content", "") or "")) if context else 0,
+                                    report_valid=False,
+                                    error_type="semantic_gate_failed",
+                                    error_message="semantic completeness gate downgraded the model-authored complete report",
+                                    draft_valid=True,
+                                    merged_report_valid=False,
+                                    closure_status="RUNTIME_CLOSED",
+                                    repair_attempted=repair_count > 0,
+                                )
                                 return {"status": report.get("status", "PARTIAL"), "report": report}
                         _annotate_report_provenance(mission, report, "model_report")
                         report["semantic_gate_evaluated"] = True
@@ -494,7 +518,20 @@ def run_loop(mission: Any, ledger: Any, call_model_fn, tools, emitter,
                         from codex_oss.completion import build_completion_envelope, default_completion_contract
                         contract = getattr(mission, "completion_contract", {}) or default_completion_contract(mission)
                         report["completion_envelope"] = build_completion_envelope(mission, report, refreshed_answer_graph, answer_sufficiency, None)
-                        _record_closer_attempt(mission, "model", result.status, elapsed=0, payload_chars=len(json.dumps(context[-1].get("content","")) if context else 0), report_valid=result.is_valid)
+                        _record_closer_attempt(
+                            mission,
+                            "model",
+                            result.status,
+                            attempt_type="closer_draft" if forced_final_requested else "full_report",
+                            elapsed=0,
+                            payload_chars=len(str(context[-1].get("content", "") or "")) if context else 0,
+                            report_valid=result.is_valid,
+                            draft_valid=forced_final_requested,
+                            merged_report_valid=True,
+                            closure_status=report.get("closure_status", ""),
+                            deadline_remaining_seconds=deadline.remaining(),
+                            repair_attempted=repair_count > 0,
+                        )
                         return {"status": result.status, "report": report}
                     if repair_count < max_repair:
                         repair_count += 1
@@ -813,6 +850,18 @@ def run_loop(mission: Any, ledger: Any, call_model_fn, tools, emitter,
 
                 # Execute tool
                 from codex_oss.runtime import TOOL_EXECUTORS
+                # Accumulate model rationale as narration
+                if getattr(ledger, "narration_accumulator", None) is not None and getattr(action, "reason", ""):
+                    acc = getattr(ledger, "narration_accumulator")
+                    hypothesis = str(getattr(action, "hypothesis", "") or "")
+                    expected = str(getattr(action, "expected_information_gain", "") or "")
+                    rationale = str(getattr(action, "reason", "") or "")
+                    text = f"{rationale}"
+                    if hypothesis:
+                        text += f" Hypothesis: {hypothesis}."
+                    if expected:
+                        text += f" Expected: {expected}."
+                    acc.add_model_rationale(text, _mission_phase(ledger))
                 executor = TOOL_EXECUTORS.get(tool_name)
                 if not executor or tool_name not in allowed_tool_names:
                     _record_action_trace(
@@ -919,6 +968,24 @@ def run_loop(mission: Any, ledger: Any, call_model_fn, tools, emitter,
                     "If this evidence is sufficient, return final_report now. If more exploration is needed, "
                     "the next action must include hypothesis, expected_information_gain, and why_not_report_yet."
                 )})
+                # Record closer opportunity when first useful evidence appears
+                if answer_sufficiency is not None and bool(answer_sufficiency.get("required_answered", 0)):
+                    from codex_oss.runtime.closure import evaluate_closer_eligibility, record_closer_opportunity
+                    eligibility = evaluate_closer_eligibility(mission, answer_graph, deadline.remaining())
+                    project_root = os.getcwd()
+                    mission_dir = os.path.join(project_root, ".codex-oss", "missions", getattr(mission, "mission_id", "unknown"))
+                    os.makedirs(mission_dir, exist_ok=True)
+                    record_closer_opportunity(
+                        mission_dir,
+                        f"opp_{int(time.time())}",
+                        phase=_mission_phase(ledger),
+                        eligible=eligibility["eligible"],
+                        reason=eligibility["reason"],
+                        action="attempt_closer_draft" if eligibility["eligible"] else "skip_closer",
+                        answer_status=eligibility["answer_status"],
+                        required_answered=eligibility["required_answered"],
+                        deadline_remaining_seconds=deadline.remaining(),
+                    )
     finally:
         release_mission_slot(mission.mission_id)
         if commentary is not None:
@@ -1235,30 +1302,102 @@ def _partial_dict(mission, ledger, reason: str) -> dict:
         envelope = build_completion_envelope(mission, report, answer_graph, sufficiency=answer_graph.get("sufficiency", {}) if isinstance(answer_graph, dict) else {}, closure_attempts=None)
         report["completion_envelope"] = envelope
         report["status"] = envelope["final_status"]
-
-        _record_closer_attempt(mission, "runtime", report["status"], report_valid=True)
+        acc = getattr(ledger, "narration_accumulator", None)
+        if acc is not None:
+            report["narration_accumulator"] = acc.to_dict()
+            if acc.has_valid_narration:
+                report["closure_status"] = "MODEL_NARRATED_RUNTIME_CLOSED"
+        error_type, skip_reason = _classify_closure_reason(reason)
+        _record_closer_attempt(
+            mission,
+            "runtime",
+            report["status"],
+            attempt_type="runtime_fallback",
+            report_valid=True,
+            error_type=error_type,
+            error_message=reason,
+            closure_status="RUNTIME_CLOSED",
+            skip_reason=skip_reason,
+            deadline_remaining_seconds=0,
+        )
         return {"status": report["status"], "report": report}
     return {"status": "PARTIAL", "report": build_deterministic_partial_report(mission, ledger, reason)}
 
 
-def _record_closer_attempt(mission: Any, closer_type: str, status: str, *, elapsed: float = 0, payload_chars: int = 0, report_valid: bool = False):
+def _classify_closure_reason(reason: str) -> tuple[str, str]:
+    lower = str(reason or "").lower()
+    if "timed out" in lower:
+        return "timeout", ""
+    if lower.startswith("closer_budget_exhausted"):
+        return "", "closer_budget_exhausted"
+    if lower.startswith("deadline_reached"):
+        return "", "deadline_reached"
+    if lower.startswith("model_call_limit_reached"):
+        return "", "model_call_limit_reached"
+    if lower.startswith("budget_exhausted"):
+        return "", "budget_exhausted"
+    if lower.startswith("deadline_final_report_ignored"):
+        return "", "deadline_final_report_ignored"
+    if lower.startswith("model_call_failed"):
+        return "model_call_failed", ""
+    if lower.startswith("report_validation_failed"):
+        return "schema_failed", ""
+    if lower.startswith("objective_coverage_failed"):
+        return "objective_coverage_failed", ""
+    if lower.startswith("action_parse_failed"):
+        return "parse_failed", ""
+    return "", ""
+
+
+def _record_closer_attempt(
+    mission: Any,
+    closer_type: str,
+    status: str,
+    *,
+    elapsed: float = 0,
+    payload_chars: int = 0,
+    report_valid: bool = False,
+    attempt_type: str = "",
+    error_type: str = "",
+    error_message: str = "",
+    draft_valid: bool = False,
+    merged_report_valid: bool = False,
+    closure_status: str = "",
+    skip_reason: str = "",
+    timeout_seconds: float = 0,
+    deadline_remaining_seconds: float = 0,
+    allowed_statuses: list[str] | None = None,
+    skeleton_findings_count: int = 0,
+    repair_attempted: bool = False,
+):
     """Record a closure attempt for metrics tracking."""
     try:
-        from codex_oss.runtime.closer import record_closure_attempt
+        from codex_oss.runtime.closure import record_closure_telemetry
         project_root = os.getcwd()
         mission_dir = os.path.join(project_root, ".codex-oss", "missions", getattr(mission, "mission_id", "unknown"))
         os.makedirs(mission_dir, exist_ok=True)
-        record_closure_attempt(
+        final_source = "model_report" if closer_type == "model" else "runtime_answer_graph"
+        record_closure_telemetry(
             mission_dir,
             f"close_{int(time.time())}",
+            attempt_type=attempt_type or ("closer_draft" if closer_type == "closer" else "runtime_fallback" if closer_type == "runtime" else "full_report"),
             closer_model=str(getattr(mission, "closer_model", "") or getattr(mission, "runtime_model_alias", "") or "unknown"),
-            closure_strategy="model_report" if closer_type == "model" else "runtime_answer_graph",
             elapsed_seconds=elapsed,
+            timeout_seconds=timeout_seconds,
             payload_chars=payload_chars,
-            deadline_remaining_seconds=0,
+            deadline_remaining_seconds=deadline_remaining_seconds,
+            skeleton_findings_count=skeleton_findings_count,
+            allowed_statuses=allowed_statuses,
             result=status,
-            report_valid=report_valid,
-            final_closure_source="model_report" if closer_type == "model" else "runtime_answer_graph",
+            error_type=error_type,
+            error_message=error_message,
+            draft_valid=draft_valid,
+            merged_report_valid=merged_report_valid,
+            closure_status=closure_status or ("RUNTIME_CLOSED" if closer_type == "runtime" else ""),
+            skip_reason=skip_reason,
+            result_valid=report_valid,
+            final_closure_source=final_source,
+            repair_attempted=repair_attempted,
         )
     except Exception:
         pass

@@ -198,6 +198,119 @@ def merge_draft_into_report(canonical_answer: JSON, draft: JSON) -> JSON:
     return report
 
 
+class NarrationAccumulator:
+    """Accumulates model-action rationales and valid closer draft fragments."""
+
+    def __init__(self):
+        self.fragments: list[JSON] = []
+
+    def add_model_rationale(self, rationale: str, phase: str = ""):
+        if rationale and rationale.strip():
+            self.fragments.append({
+                "fragment_id": f"frag_{len(self.fragments) + 1:03d}",
+                "source": "model_action_rationale",
+                "phase": phase,
+                "text": str(rationale)[:500],
+                "evidence_refs": [],
+                "valid": True,
+            })
+
+    def add_closer_draft(self, draft: JSON):
+        if draft and draft.get("narrative_summary"):
+            self.fragments.append({
+                "fragment_id": f"frag_{len(self.fragments) + 1:03d}",
+                "source": "closer_draft",
+                "phase": "REPORT",
+                "text": str(draft.get("narrative_summary", ""))[:800],
+                "evidence_refs": [],
+                "valid": True,
+            })
+
+    def add_commentary(self, text: str):
+        if text and text.strip():
+            self.fragments.append({
+                "fragment_id": f"frag_{len(self.fragments) + 1:03d}",
+                "source": "runtime_commentary",
+                "phase": "",
+                "text": str(text)[:500],
+                "evidence_refs": [],
+                "valid": True,
+            })
+
+    def to_dict(self) -> JSON:
+        valid = [f for f in self.fragments if f.get("valid")]
+        return {
+            "schema_version": "narration_accumulator.v1",
+            "fragments": self.fragments,
+            "valid_fragment_count": len(valid),
+            "usable_for_final_report": len(valid) > 0,
+        }
+
+    @property
+    def has_valid_narration(self) -> bool:
+        return any(f.get("valid") for f in self.fragments)
+
+
+def record_closer_opportunity(
+    mission_dir: str,
+    opportunity_id: str,
+    *,
+    phase: str = "",
+    eligible: bool = False,
+    reason: str = "",
+    action: str = "skip_closer",
+    answer_status: str = "",
+    required_answered: str = "",
+    deadline_remaining_seconds: float = 0,
+):
+    """Record a closer opportunity (attempted or skipped). No blank fields."""
+    path = os.path.join(mission_dir, "closer_opportunities.jsonl")
+    entry = {
+        "schema_version": "closer_opportunity.v1",
+        "opportunity_id": opportunity_id,
+        "phase": phase,
+        "eligible": eligible,
+        "reason": reason or "no_useful_evidence_yet",
+        "action": action,
+        "answer_status": answer_status,
+        "required_answered": required_answered,
+        "deadline_remaining_seconds": round(deadline_remaining_seconds, 1),
+    }
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, sort_keys=True) + "\n")
+
+
+def evaluate_closer_eligibility(
+    mission: Any, answer_graph: JSON, deadline_remaining: float,
+) -> JSON:
+    """Determine whether a closer opportunity should be created."""
+    sufficiency = answer_graph.get("sufficiency", {}) or {}
+    required_answered = sufficiency.get("required_answered", 0)
+    claims = list(answer_graph.get("claims", []) or [])
+
+    eligible = required_answered > 0 or bool(claims)
+    reason = "core_answer_available" if eligible else "no_useful_evidence_yet"
+
+    # Don't attempt if evidence is blocked or contradicted
+    blocked = sufficiency.get("blocked_obligations", []) or []
+    contradicted = sufficiency.get("contradicted_obligations", []) or []
+    if blocked or contradicted:
+        eligible = False
+        reason = "blocked_or_contradicted"
+
+    # Don't attempt if deadline is too tight
+    if deadline_remaining < 15:
+        eligible = False
+        reason = "deadline_insufficient"
+
+    return {
+        "eligible": eligible,
+        "reason": reason,
+        "answer_status": sufficiency.get("recommended_status", ""),
+        "required_answered": f"{required_answered}/{sufficiency.get('required_total', 0)}",
+    }
+
+
 def build_runtime_report_from_canonical(canonical_answer: JSON) -> JSON:
     """Build a full report from the canonical answer without model narrative."""
     findings = canonical_answer.get("required_findings", []) or []
@@ -259,6 +372,7 @@ def record_closure_telemetry(
         "allowed_statuses": allowed_statuses or [],
         "result": result or "runtime_skipped",
         "error_type": error_type,
+        "error_message": (error_message or "")[:200],
         "draft_valid": draft_valid,
         "merged_report_valid": merged_report_valid,
         "closure_status": closure_status,
