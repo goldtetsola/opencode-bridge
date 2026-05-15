@@ -1084,7 +1084,7 @@ def _runtime_prefetch_required_sources(
     allowed_tool_names: set[str],
     deadline: Any,
 ) -> dict[str, Any]:
-    if "rtk_read" not in allowed_tool_names:
+    if "rtk_read" not in allowed_tool_names and "rtk_grep" not in allowed_tool_names:
         return answer_graph
     pending = []
     try:
@@ -1106,16 +1106,29 @@ def _runtime_prefetch_required_sources(
         if ledger.tool_budget_remaining <= 0 or deadline.must_return_partial():
             break
         raw_path = str(item.get("path", "") or "")
-        if not raw_path or raw_path in (getattr(ledger, "files_inspected", {}) or {}):
+        if not raw_path:
+            continue
+        tool_name = str(item.get("tool_name", "") or "rtk_read")
+        if tool_name not in allowed_tool_names:
+            continue
+        executor = TOOL_EXECUTORS.get(tool_name)
+        if not executor:
+            continue
+        # For grep, skip if path already inspected and we're looking for command evidence
+        if tool_name == "rtk_read" and raw_path in (getattr(ledger, "files_inspected", {}) or {}):
             continue
         resolved, error = resolve_path(raw_path, getattr(mission, "allowed_roots", []) or [], getattr(mission, "allowed_paths", []) or [])
         if error:
             continue
+        pattern = str(item.get("pattern", "") or "")
+        action_args: dict = {"path": resolved}
+        if pattern:
+            action_args["pattern"] = pattern
         synthetic_action = type("RuntimePrefetchAction", (), {
             "action_type": "tool_call",
-            "tool_name": "rtk_read",
-            "arguments": {"path": resolved},
-            "reason": f"Runtime prefetch for required source {resolved}",
+            "tool_name": tool_name,
+            "arguments": action_args,
+            "reason": f"Runtime prefetch for required source {resolved}{f' pattern={pattern}' if pattern else ''}",
             "hypothesis": f"Required source {resolved} is needed before coverage can complete.",
             "target_question": str(item.get("obligation_id", "") or "required_source"),
             "phase": _mission_phase(ledger),

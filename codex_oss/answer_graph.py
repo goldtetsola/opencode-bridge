@@ -677,23 +677,38 @@ def _obligation_confidence(status: str, evidence_refs: list[str]) -> str:
 
 
 def _agenda_items_for_obligation(obligation: dict[str, Any]) -> list[dict[str, Any]]:
+    from codex_oss.answer_graph import _evidence_plane
     items: list[dict[str, Any]] = []
     for requirement in list(obligation.get("source_requirements", []) or []):
         path = str(requirement.get("path", "") or "")
         if not path or not bool(requirement.get("required", True)):
             continue
+        plane = _evidence_plane(requirement) if '_evidence_plane' in globals() else str(requirement.get("evidence_plane", "") or "file_content")
+        kind, tool_name = _agenda_kind_for_requirement(requirement, plane)
         items.append({
             "id": f"agenda_{obligation.get('id', 'q')}_{_slug(path)}",
-            "kind": "required_read",
+            "kind": kind,
+            "tool_name": tool_name,
             "path": path,
+            "pattern": str(requirement.get("pattern", "") or requirement.get("command_requirement", {}).get("pattern", "") or ""),
             "obligation_id": str(obligation.get("id", "") or ""),
             "priority": "high",
             "status": "done" if requirement.get("status") == "satisfied" else "pending",
             "reason": f"Required source for obligation {obligation.get('id', '')}.",
             "prefetch": bool(requirement.get("prefetch", True)),
             "required_shapes": list(requirement.get("required_shapes", []) or []),
+            "evidence_plane": plane,
         })
     return items
+
+
+def _agenda_kind_for_requirement(requirement: dict[str, Any], plane: str) -> tuple[str, str]:
+    if plane == "command_result":
+        kind = str(requirement.get("evidence_kind", "") or "")
+        if "zero_match" in kind.lower():
+            return ("required_grep_zero_match", "rtk_grep")
+        return ("required_grep", "rtk_grep")
+    return ("required_read", "rtk_read")
 
 
 def _dedupe_agenda(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -771,15 +786,24 @@ def _sufficiency_reason_code(
 def _next_required_actions(agenda_items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     actions = []
     for item in agenda_items:
-        if item.get("kind") != "required_read" or item.get("status") == "done":
+        kind = str(item.get("kind", "") or "")
+        status = str(item.get("status", "") or "")
+        if status == "done":
+            continue
+        if kind not in ("required_read", "required_grep", "required_grep_zero_match"):
             continue
         path = str(item.get("path", "") or "")
+        pattern = str(item.get("pattern", "") or "")
+        tool_name = str(item.get("tool_name", "") or "rtk_read")
+        args: dict[str, str] = {"path": path}
+        if tool_name == "rtk_grep" and pattern:
+            args["pattern"] = pattern
         if not path:
             continue
         actions.append({
             "action_type": "tool_call",
-            "tool_name": "rtk_read",
-            "arguments": {"path": path},
+            "tool_name": tool_name,
+            "arguments": args,
             "reason": str(item.get("reason", "") or "Required source has not been inspected."),
             "obligation_id": str(item.get("obligation_id", "") or ""),
         })
