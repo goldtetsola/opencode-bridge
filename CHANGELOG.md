@@ -1,5 +1,17 @@
 # Changelog
 
+## v13 - May 2026
+
+### Runtime-backed OSS subagent UX
+
+Runtime missions now stream safe, native-style progress commentary while they run.
+
+- **Visible commentary streaming**: managed MissionV1 requests start SSE before the runtime loop begins. Commentary messages stream with `phase="commentary"` and final reports stream with `phase="final_answer"`.
+- **Richer middle narration**: A2/A3 missions now emit model action requests, model-declared action rationale, tool start, tool result summaries, coverage updates, report validation, and model-call failure events.
+- **Visible artifacts**: every current runtime mission writes `visible_commentary.jsonl` and `summary.md`; final reports link both.
+- **Safe by design**: commentary exposes public progress, not hidden chain-of-thought, provider reasoning content, full file dumps, secrets, or system/developer prompts.
+- **Docs refresh**: README rewritten around user outcomes, setup, MissionV1 usage, visible progress, safety boundaries, artifacts, and troubleshooting.
+
 ## v12 — May 2026
 
 ### Acceptance model
@@ -38,11 +50,14 @@ Cross-platform `codex-oss up --daemon` starts bridge as supervised daemon. Termi
 ```bash
 codex-oss up --daemon    # start and detach
 codex-oss run -- codex   # start bridge, run Codex CLI, cleanup
-codex-oss doctor         # 24 checks including supervisor invariant
+codex-oss doctor         # default health/supervisor/source checks
 ```
 
+### OSS Agent Runtime contract hardening
+A2/A3 managed investigations now enter a dedicated runtime adapter instead of living inside the HTTP handler. Structured `oss_agent_mission.v1` handoffs run inside the bridge with JSON-only actions, `tools=[]` upstream, explicit runtime-owned RTK tools, evidence-ledger validation, critical-path read checks, source-hash health identity, and terminal structured reports on runtime failures.
+
 ### Doctor
-`codex-oss doctor` checks 24 invariants across config, agents, agreements, rules, bridge health, GPT leakage, OSS inference, state persistence, supervisor lifecycle, and structured handoff validation.
+`codex-oss doctor` now separates offline/default/live-model checks. Default doctor checks bridge health and source identity without burning an OSS model call; `--offline` checks local files/config only; `--live-model` runs the optional inference smoke.
 
 ---
 

@@ -9,21 +9,41 @@ from typing import Optional
 
 from .doctor import run_doctor, find_project_root
 
-PROVIDER_BLOCK = '''[model_providers.opencode_bridge]
+OPENCODE_PROVIDER_BLOCK = '''[model_providers.opencode_bridge]
 name = "OpenCode Bridge"
 base_url = "http://127.0.0.1:4000/v1"
-env_key = "LITELLM_MASTER_KEY"
 wire_api = "responses"
 request_max_retries = 2
 stream_max_retries = 2
 stream_idle_timeout_ms = 300000
+
+[model_providers.opencode_bridge.auth]
+command = "echo"
+args = ["sk-local-codex-bridge"]
+timeout_ms = 1000
 '''
+
+OSS_RUNTIME_PROVIDER_BLOCK = '''[model_providers.oss_runtime]
+name = "OSS Agent Runtime"
+base_url = "http://127.0.0.1:4000/v1"
+wire_api = "responses"
+request_max_retries = 1
+stream_max_retries = 1
+stream_idle_timeout_ms = 1800000
+
+[model_providers.oss_runtime.auth]
+command = "echo"
+args = ["sk-local-codex-bridge"]
+timeout_ms = 1000
+'''
+
+PROVIDER_BLOCK = OPENCODE_PROVIDER_BLOCK.rstrip() + "\n\n" + OSS_RUNTIME_PROVIDER_BLOCK
 
 AGENTS_MD_BLOCK = '''
 <!-- codex-oss:start -->
 ## OSS delegation
 
-Use OSS agents for bounded low/medium-risk work only.
+Use OSS agents for bounded low/medium-risk work only. Use runtime-controlled OSS agents for normal A2/A3 read-only investigation; raw OSS agents are experimental baselines.
 
 When spawning OSS agents, always use fork_turns: "none":
 - Full-history forks inherit GPT-5.5 model/reasoning, which conflicts with OSS agent overrides.
@@ -52,7 +72,28 @@ After the JSON block, add any human-readable context needed for the worker. For 
 - Never use recursive codex exec from inside a Codex session.
 - Never set model_provider = "opencode_bridge" as the parent session provider.
 - Never delegate critical paths to OSS agents.
+
+### Portable command discipline
+- Read the repo instructions before running commands.
+- Prefer portable search/list commands: `rg`, `rg --files`, and POSIX-compatible `ls`.
+- Do not use GNU-only/macOS-incompatible flags such as `ls --tree`.
+- Do not assume private helper tools are installed.
+- If a command is blocked or unsupported, retry once with the suggested replacement and mention the blocked command in the report.
+- Do not paste full file contents or raw tool output into the final answer; summarize and cite paths/lines.
+- The requested output format is mandatory. If you cannot satisfy it, return LOW confidence with caveats instead of dumping evidence.
+- For A2/A3 read-only investigation, prefer MissionV1 through the bridge runtime over broad shell access.
 <!-- codex-oss:end -->
+'''
+
+COMMAND_DISCIPLINE = '''COMMAND DISCIPLINE:
+- Read repo instructions before running commands.
+- Prefer portable commands: `rg`, `rg --files`, and POSIX-compatible `ls`.
+- Do not use GNU-only/macOS-incompatible flags such as `ls --tree`.
+- Do not assume private helper tools are installed.
+- If a command is blocked or unsupported, retry once with the suggested replacement before giving up.
+- Do not paste full file contents or raw tool output into the final answer; summarize and cite paths/lines.
+- The requested output format is mandatory. If you cannot satisfy it, return LOW confidence with caveats instead of dumping evidence.
+- For A2/A3 read-only investigation, prefer MissionV1/managed-runtime handoffs when available.
 '''
 
 RECURSIVE_RULE = '''# codex-oss: generated rule — do not edit manually
@@ -105,7 +146,7 @@ RULES:
 - Make the smallest defensible change.
 - Use the available file/search/shell tools. Do not assume a specific tool prefix.
 - If uncertain, escalate — do not guess.
-"""
+''' + COMMAND_DISCIPLINE + '''"""
 '''
 
 AGENT_KIMI = '''name = "oss_kimi_rapid"
@@ -143,7 +184,7 @@ RULES:
 - Prefer one tool call per turn. Do not make parallel tool calls.
 - Use the available file/search/shell tools. Do not assume a specific tool prefix.
 - When scouting for a downstream task, structure findings so the next worker can use them.
-"""
+''' + COMMAND_DISCIPLINE + '''"""
 '''
 
 AGENT_FLASH = '''name = "oss_flash_support"
@@ -183,6 +224,69 @@ RULES:
 - Read-only by default.
 - Keep output concise and evidence-backed.
 - Use the available file/search/shell tools. Do not assume a specific tool prefix.
+''' + COMMAND_DISCIPLINE + '''"""
+'''
+
+AGENT_RUNTIME_KIMI = '''name = "oss_kimi_investigator"
+description = "Runtime-controlled OSS investigator. USE ME WHEN: A2/A3 read-only repo exploration, implementation-site discovery, dependency mapping, evidence-backed reports. DO NOT USE FOR: writes, critical-path final decisions, or prose-only handoffs. Requires MissionV1."
+
+model_provider = "opencode_bridge"
+model = "mission-a3-kimi"
+model_reasoning_effort = "medium"
+sandbox_mode = "read-only"
+
+developer_instructions = """
+You are a runtime-controlled OSS investigator.
+
+You must receive exactly one MissionV1 handoff block labeled OSS_HANDOFF_JSON with schema_version "oss_agent_mission.v1".
+If MissionV1 is missing or invalid, return INVALID_MISSION and ask the parent to provide one.
+
+Do not use shell commands directly.
+Do not return raw file contents.
+The runtime owns tools, evidence, validation, and report structure.
+Treat your result as evidence for GPT-5.5, not final authority.
+"""
+'''
+
+AGENT_RUNTIME_DEEPSEEK = '''name = "oss_deepseek_investigator"
+description = "Runtime-controlled DeepSeek investigator. USE ME WHEN: reasoning-heavy A3 read-only investigation with explicit MissionV1, uncertainty tracking, and evidence-backed reports. DO NOT USE FOR: writes or critical-path final authority."
+
+model_provider = "opencode_bridge"
+model = "mission-a3-deepseek"
+model_reasoning_effort = "high"
+sandbox_mode = "read-only"
+
+developer_instructions = """
+You are a runtime-controlled OSS investigation reasoning engine.
+
+You must receive exactly one MissionV1 handoff block labeled OSS_HANDOFF_JSON with schema_version "oss_agent_mission.v1".
+If MissionV1 is missing or invalid, return INVALID_MISSION and ask the parent to provide one.
+
+Do not use shell commands directly.
+Do not return raw file contents.
+The runtime owns tools, evidence, validation, and report structure.
+Treat your result as evidence for GPT-5.5, not final authority.
+"""
+'''
+
+AGENT_RUNTIME_FLASH = '''name = "oss_flash_context"
+description = "Runtime-controlled cheap OSS context/report worker. USE ME WHEN: low-risk A2/A3 read-only context gathering, docs inventories, and evidence-backed summaries with explicit MissionV1. DO NOT USE FOR: correctness-critical work or writes."
+
+model_provider = "opencode_bridge"
+model = "mission-a2-flash"
+model_reasoning_effort = "medium"
+sandbox_mode = "read-only"
+
+developer_instructions = """
+You are a runtime-controlled OSS context worker.
+
+You must receive exactly one MissionV1 handoff block labeled OSS_HANDOFF_JSON with schema_version "oss_agent_mission.v1".
+If MissionV1 is missing or invalid, return INVALID_MISSION and ask the parent to provide one.
+
+Do not use shell commands directly.
+Do not return raw file contents.
+The runtime owns tools, evidence, validation, and report structure.
+Treat your result as evidence for GPT-5.5, not final authority.
 """
 '''
 
@@ -224,7 +328,7 @@ def install(project_root: Optional[Path] = None, force: bool = False) -> int:
     print()
     print("Running doctor checks...")
     print()
-    report = run_doctor(root)
+    report = run_doctor(root, offline=True)
     report.print()
 
     if errors:
@@ -241,17 +345,22 @@ def _ensure_config(root: Path, force: bool) -> int:
 
     existing = config_path.read_text() if config_path.exists() else ""
 
-    if PROVIDER_BLOCK.strip() in existing:
-        print("  .codex/config.toml — provider block already present")
+    provider_blocks = []
+    if "[model_providers.opencode_bridge]" not in existing or force:
+        provider_blocks.append(OPENCODE_PROVIDER_BLOCK.strip())
+    if "[model_providers.oss_runtime]" not in existing or force:
+        provider_blocks.append(OSS_RUNTIME_PROVIDER_BLOCK.strip())
+
+    if not provider_blocks:
+        print("  .codex/config.toml — provider blocks already present")
         return 0
 
     if existing and not force:
-        # Append to existing config
-        content = existing.rstrip() + "\n\n" + PROVIDER_BLOCK
+        content = existing.rstrip() + "\n\n" + "\n\n".join(provider_blocks) + "\n"
         config_path.write_text(content)
-        print("  .codex/config.toml — appended provider block")
+        print("  .codex/config.toml — appended missing provider block(s)")
     else:
-        config_path.write_text(PROVIDER_BLOCK)
+        config_path.write_text("\n\n".join(provider_blocks) + "\n")
         print("  .codex/config.toml — created with provider block")
 
     return 0
@@ -262,6 +371,9 @@ def _ensure_agents(root: Path, force: bool) -> int:
     agents_dir.mkdir(parents=True, exist_ok=True)
 
     agents = {
+        "oss-kimi-investigator.toml": AGENT_RUNTIME_KIMI,
+        "oss-deepseek-investigator.toml": AGENT_RUNTIME_DEEPSEEK,
+        "oss-flash-context.toml": AGENT_RUNTIME_FLASH,
         "oss-deepseek-pro.toml": AGENT_DEEPSEEK,
         "oss-kimi-rapid.toml": AGENT_KIMI,
         "oss-flash-support.toml": AGENT_FLASH,

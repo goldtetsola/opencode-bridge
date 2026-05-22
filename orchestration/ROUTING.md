@@ -61,22 +61,26 @@ Task received by GPT-5.5
     │           LOW → escalate to GPT-5.4
     │
     └─ Ambiguous? (unclear scope, unknown blast radius)
-            → oss_kimi_rapid first (scout, fork_turns: "none")
+            → oss_kimi_investigator first (runtime-controlled scout, fork_turns: "none")
             → Based on scout: DeepSeek or GPT-5.4
 ```
 
 ## Agent capability matrix
 
-| Agent | Model | Reasoning | Write? | Req/5hr | Best for | Do NOT use for |
-|---|---|---|---|---|---|---|
-| `oss_kimi_rapid` | kimi-k2.6 | medium | read-only | 1,100 | Repo nav, review, scouting, first-pass analysis | Auth, cross-module, critical paths, final production code |
-| `oss_deepseek_pro` | deepseek-v4-pro | high | workspace-write | 3,400 | Bounded impl, debugging, feature work, analysis | Cross-module (>2 files), untested code, critical paths |
-| `oss_flash_support` | deepseek-v4-flash | medium | read-only | 31,000 | Docs, changelog, summaries, test inventory, formatting | ANY correctness-critical work |
+| Agent | Model | Reasoning | Write? | Best for | Do NOT use for |
+|---|---|---|---|---|---|
+| `oss_kimi_investigator` | mission-a3-kimi (runtime) | medium | read-only | Repo nav, review, scouting, first-pass analysis | Auth, cross-module, critical paths |
+| `oss_deepseek_investigator` | mission-a3-deepseek (runtime) | high | read-only | Deeper investigation, multi-file analysis | Auth, critical paths |
+| `oss_flash_context` | mission-a2-flash (runtime) | medium | read-only | Docs, changelog, summaries, formatting | Correctness-critical work |
+| `oss_deepseek_pro` | deepseek-v4-pro (raw) | high | workspace-write | Bounded impl, debugging baseline | Cross-module (>2 files), critical paths |
+| `oss_kimi_rapid` | kimi-k2.6 (raw) | medium | read-only | Manual repo nav baseline | Auth, critical paths |
+| `oss_flash_support` | deepseek-v4-flash (raw) | medium | read-only | Manual docs/support baseline | Correctness-critical work |
 
-All three require:
-- `model_provider = "opencode_bridge"` (routes through the bridge)
-- `fork_turns: "none"` when spawned by the orchestrator
-- Explicit handoff (task, scope, forbidden paths, output format)
+**Runtime-controlled (first 3 rows)** use MissionV1 contracts with governed tool access, evidence tracking, and audit artifacts. This is the recommended path for all OSS work.
+
+**Raw experimental (last 3 rows)** use prompt-only discipline with broad Codex tools. Research/baseline only.
+
+All agents require `model_provider = "opencode_bridge"` and `fork_turns: "none"`.
 
 ## Fork mode
 
@@ -191,7 +195,7 @@ Risk tier: medium. This is exploration only; GPT-5.5 decides any follow-up.
 → Tool compatibility issue. OSS models don't receive Codex's RTK system prompt. Document known tool mappings or test each agent's tool preferences.
 
 ### "DeepSeek/Kimi timed out on a complex task"
-→ Bridge v3+ has SSE heartbeat. If using v2, upgrade. If timeouts persist, increase `UPSTREAM_TIMEOUT_SECONDS` and `SSE_UPSTREAM_HEARTBEAT_SECONDS`.
+→ The bridge has SSE heartbeat support. If timeouts persist, increase `UPSTREAM_TIMEOUT_SECONDS` and `SSE_UPSTREAM_HEARTBEAT_SECONDS`.
 
 ### "401 Unauthorized on subagent spawn"
 → Codex session auth issue. Try: `codex logout && codex login`. Test from persistent Codex Desktop rather than `codex exec`. Consider `cli_auth_credentials_store = "file"` in `~/.codex/config.toml`.

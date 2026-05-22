@@ -1,12 +1,69 @@
 #!/usr/bin/env python3
-"""v10 runtime tests — proper tool execution, Rorschach task, managed autonomy."""
+"""v10 runtime tests — proper tool execution and managed autonomy."""
 
-import json, os, time, urllib.request, subprocess, sys, re
+import json, os, time, urllib.request, subprocess, sys, re, threading, socketserver, http.server, shutil
 
 BRIDGE_PORT = 4005
-RORSCHACH = "/Users/goldtetsola/Desktop/Coding Projects/Rorschach"
+FAKE_UPSTREAM_PORT = 9005
 AUTH = "sk-local-codex-bridge"
 URL = f"http://127.0.0.1:{BRIDGE_PORT}/v1/responses"
+LIVE_MODE = os.getenv("V10_LIVE_MODE", "0") == "1"
+LIVE_PROJECT_ROOT = os.path.abspath(os.getenv("V10_LIVE_PROJECT_ROOT", os.getcwd()))
+
+
+def fake_chat_response(content, tool_calls=None):
+    message = {"role": "assistant", "content": content}
+    if tool_calls:
+        message["content"] = None
+        message["tool_calls"] = tool_calls
+    return json.dumps({
+        "id": "chatcmpl-v10-fake",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": "kimi-k2.6",
+        "choices": [{
+            "index": 0,
+            "message": message,
+            "finish_reason": "tool_calls" if tool_calls else "stop",
+        }],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20},
+    }).encode()
+
+
+class FakeUpstream(http.server.BaseHTTPRequestHandler):
+    calls = 0
+
+    def do_POST(self):
+        FakeUpstream.calls += 1
+        if FakeUpstream.calls == 1:
+            data = fake_chat_response("", tool_calls=[{
+                "id": "call_fake",
+                "type": "function",
+                "function": {"name": "rtk_read", "arguments": "{\"path\":\"package.json\"}"},
+            }])
+        else:
+            content = "PARTIAL\nsummary: fixture finalizer completed\nconfidence: low\ncaveats: fake upstream"
+            data = fake_chat_response(content)
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def log_message(self, *args):
+        pass
+
+
+class ReusableTCPServer(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+
+def start_fake_upstream():
+    server = ReusableTCPServer(("127.0.0.1", FAKE_UPSTREAM_PORT), FakeUpstream)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server
 
 
 def extract_path(args):
@@ -30,37 +87,44 @@ def extract_path(args):
     return json.dumps(args)
 
 
-def run_rtk_read(project_root, rel_path):
-    """Execute rtk read and return faithful output."""
+def run_runtime_read(project_root, rel_path):
+    """Execute the runtime read tool shape with a native fallback."""
     full = os.path.normpath(os.path.join(project_root, rel_path))
     if not os.path.abspath(full).startswith(os.path.abspath(project_root) + os.sep):
         return f"[SECURITY] Path escapes project root: {rel_path}"
 
     try:
-        out = subprocess.run(["rtk", "read", rel_path], cwd=project_root,
-                             capture_output=True, text=True, timeout=15)
+        if shutil.which("rtk"):
+            out = subprocess.run(["rtk", "read", rel_path], cwd=project_root,
+                                 capture_output=True, text=True, timeout=15)
+            stdout, stderr, returncode = out.stdout, out.stderr, out.returncode
+        else:
+            with open(full, "r", encoding="utf-8", errors="replace") as handle:
+                stdout = handle.read()
+            stderr, returncode = "", 0
         MAX = 4000
-        content = out.stdout
+        content = stdout
         if len(content) > MAX:
             content = (f"[TRUNCATED: {len(content)} chars total, showing first {MAX}]\n"
                        + content[:MAX] + f"\n[... {len(content) - MAX} more chars omitted ...]")
-        return (f"[rtk_read RESULT]\npath: {rel_path}\nexit_code: {out.returncode}\n"
-                f"stdout_bytes: {len(out.stdout)}\nstderr_bytes: {len(out.stderr)}\n\n"
-                f"STDOUT:\n{content}\n\nSTDERR:\n{out.stderr}")
+        return (f"[runtime_read RESULT]\npath: {rel_path}\nexit_code: {returncode}\n"
+                f"stdout_bytes: {len(stdout)}\nstderr_bytes: {len(stderr)}\n\n"
+                f"STDOUT:\n{content}\n\nSTDERR:\n{stderr}")
     except Exception as e:
-        return f"[rtk_read ERROR]\npath: {rel_path}\nerror: {e}"
+        return f"[runtime_read ERROR]\npath: {rel_path}\nerror: {e}"
 
 
-def run_rtk_git(project_root, args_list):
-    """Execute rtk git and return faithful output."""
+def run_runtime_git(project_root, args_list):
+    """Execute the runtime safe-git tool shape with a native fallback."""
     try:
-        out = subprocess.run(["rtk", "git"] + args_list, cwd=project_root,
+        cmd = (["rtk", "git"] if shutil.which("rtk") else ["git"]) + args_list
+        out = subprocess.run(cmd, cwd=project_root,
                              capture_output=True, text=True, timeout=15)
-        return (f"[rtk_git RESULT]\ncmd: git {' '.join(args_list)}\n"
+        return (f"[runtime_git RESULT]\ncmd: git {' '.join(args_list)}\n"
                 f"exit_code: {out.returncode}\n"
                 f"STDOUT:\n{out.stdout[:3000]}\n\nSTDERR:\n{out.stderr}")
     except Exception as e:
-        return f"[rtk_git ERROR]\nerror: {e}"
+        return f"[runtime_git ERROR]\nerror: {e}"
 
 
 def call_bridge(body, timeout=120):
@@ -99,7 +163,7 @@ def test_multi_turn_with_evidence_ledger():
 
     # Read package.json
     path = extract_path(tc0[0].get("arguments", "{}"))
-    content = run_rtk_read(".", path)
+    content = run_runtime_read(".", path)
 
     body2 = {
         "model": "ocg-kimi-k2.6", "stream": False,
@@ -119,20 +183,20 @@ def test_multi_turn_with_evidence_ledger():
     print("  PASS: Managed autonomy + evidence injection active")
 
 
-def test_rorschach_prep_task():
-    """Exact Rorschach prep task with faithful tool execution."""
-    print("\n=== Test 2: Rorschach prep task ===")
+def test_live_repo_prep_task():
+    """Generic live repo prep task with faithful tool execution."""
+    print("\n=== Test 2: Live repo prep task ===")
 
-    if not os.path.isdir(RORSCHACH):
-        print("  SKIP: Rorschach project not found")
+    if not os.path.isdir(LIVE_PROJECT_ROOT):
+        print("  SKIP: V10_LIVE_PROJECT_ROOT not found")
         return
 
     task = (
         "ROLE: OSS read-only proof prep scout.\n"
         "TASK TYPE: read-only repo/memory inspection. PREP REPORT.\n"
-        "READ-ONLY PATHS: .codex/napkin.md, docs/CONTINUITY.md, ORCHESTRATION.md, docs/memory/ORCHESTRATOR.md.\n"
+        "READ-ONLY PATHS: README.md, docs/CONTINUITY.md, tests/test_protocol_conformance.py.\n"
         "VERIFICATION STEPS: git status --short, git rev-parse --abbrev-ref HEAD, git rev-parse HEAD, git log --oneline -3.\n"
-        "DELIVERABLE: source id to use, prior green proof ids, current HEAD/branch, stale-memory caveats.\n"
+        "DELIVERABLE: repo purpose, current HEAD/branch, relevant test coverage, caveats.\n"
         "DO NOT TOUCH: no edits, no staging, no DB, no secrets.\n"
         "COMPLETION RULE: read-only report only."
     )
@@ -141,7 +205,7 @@ def test_rorschach_prep_task():
         "model": "ocg-kimi-k2.6", "stream": False,
         "input": [
             {"role": "system", "content": task},
-            {"role": "user", "content": "Execute the prep report. Read each file using rtk_read."},
+            {"role": "user", "content": "Execute the prep report. Read each file using the provided read tool."},
         ],
         "tools": [
             {"type": "function", "name": "rtk_read", "parameters": {"type": "object",
@@ -170,10 +234,10 @@ def test_rorschach_prep_task():
             if path in files_read:
                 print(f"  Turn {turns}: DUPLICATE read of {path} — would suppress in runtime")
                 content = (f"[DUPLICATE_SUPPRESSED]\n{path} was already read completely.\n"
-                           f"Remaining: {', '.join(p for p in ['.codex/napkin.md','docs/CONTINUITY.md','ORCHESTRATION.md','docs/memory/ORCHESTRATOR.md'] if p not in files_read)}")
+                           f"Remaining: {', '.join(p for p in ['README.md','docs/CONTINUITY.md','tests/test_protocol_conformance.py'] if p not in files_read)}")
             else:
                 files_read.add(path)
-                content = run_rtk_read(RORSCHACH, path)
+                content = run_runtime_read(LIVE_PROJECT_ROOT, path)
                 print(f"  Turn {turns}: read {path} ({len(content)} chars)")
             last_was_read = True
         elif name in ("rtk_git", "exec_command"):
@@ -185,7 +249,7 @@ def test_rorschach_prep_task():
                     args_list = args_list.split()
             except:
                 args_list = []
-            content = run_rtk_git(RORSCHACH, args_list)
+            content = run_runtime_git(LIVE_PROJECT_ROOT, args_list)
             print(f"  Turn {turns}: git {' '.join(args_list) if args_list else '?'}")
             last_was_read = False
         else:
@@ -210,7 +274,7 @@ def test_rorschach_prep_task():
             print(f"    -> FINALIZED ({turns} files read): {text[:150]}")
 
             # Validate output
-            has_source = "c07d2202" in text or "source" in text.lower()
+            has_source = "repo" in text.lower() or "purpose" in text.lower()
             has_head = "HEAD" in text or "branch" in text.lower()
             has_caveats = "stale" in text.lower() or "caveat" in text.lower() or "warning" in text.lower()
             print(f"    Validation: source_id={'✓' if has_source else '✗'}, "
@@ -239,23 +303,48 @@ def main():
         "FORCE_SINGLE_TOOL_INSTRUCTIONS": "0",
         "EXPOSE_EMPTY_REASONING_ITEM": "0",
     })
+    os.environ["UPSTREAM_BASE"] = f"http://127.0.0.1:{FAKE_UPSTREAM_PORT}/v1"
 
-    # Bridge must be started externally (we connect to existing)
-    # Check if bridge is running
+    upstream = None
+    bridge_proc = None
+    if not LIVE_MODE:
+        os.environ["OPENCODE_GO_API_KEY"] = "sk-test"
+        os.environ["GPT_MODEL_STRATEGY"] = "oss"
+        upstream = start_fake_upstream()
+        bridge_proc = subprocess.Popen(
+            [sys.executable, os.path.join(os.path.dirname(__file__), "..", "bridge.py")],
+            env={**os.environ},
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
     try:
-        req = urllib.request.Request(f"http://127.0.0.1:{BRIDGE_PORT}/health")
-        req.add_header("Authorization", f"Bearer {AUTH}")
-        urllib.request.urlopen(req, timeout=2)
-    except:
-        print("ERROR: Bridge not running on port", BRIDGE_PORT)
-        print("Start with:")
-        print(f"  cd /Users/goldtetsola/Desktop/Coding Projects/opencode-bridge")
-        print(f"  OPENCODE_GO_API_KEY=... python3 bridge.py")
-        sys.exit(1)
+        for _ in range(20):
+            try:
+                req = urllib.request.Request(f"http://127.0.0.1:{BRIDGE_PORT}/health")
+                req.add_header("Authorization", f"Bearer {AUTH}")
+                urllib.request.urlopen(req, timeout=2)
+                break
+            except Exception:
+                time.sleep(0.5)
+        else:
+            print("ERROR: Bridge not running on port", BRIDGE_PORT)
+            sys.exit(1)
 
-    test_multi_turn_with_evidence_ledger()
-    test_rorschach_prep_task()
-    print("\nAll v10 runtime tests passed")
+        test_multi_turn_with_evidence_ledger()
+        if LIVE_MODE:
+            test_live_repo_prep_task()
+        else:
+            print("\n=== Test 2: Live repo prep task ===")
+            print("  SKIP: set V10_LIVE_MODE=1 and optionally V10_LIVE_PROJECT_ROOT=/path/to/repo")
+        print("\nAll v10 runtime tests passed")
+    finally:
+        if bridge_proc:
+            bridge_proc.terminate()
+            bridge_proc.wait()
+        if upstream:
+            upstream.shutdown()
+            upstream.server_close()
 
 
 if __name__ == "__main__":

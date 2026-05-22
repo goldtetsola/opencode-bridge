@@ -25,7 +25,7 @@ Intended upstream:
   https://opencode.ai/zen/go/v1/chat/completions
 
 Required env:
-  OPENCODE_GO_API_KEY
+  UPSTREAM_API_KEY or OPENCODE_GO_API_KEY
 
 Recommended env:
   PROXY_API_KEY or LITELLM_MASTER_KEY   # key Codex sends to this local proxy
@@ -2049,8 +2049,15 @@ class ProxyApp:
         self.upstream_base = os.getenv("UPSTREAM_BASE", "https://opencode.ai/zen/go/v1").rstrip("/")
         self.upstream_chat_url = f"{self.upstream_base}/chat/completions"
         self.upstream_models_url = f"{self.upstream_base}/models"
-        self.upstream_key = os.getenv("OPENCODE_GO_API_KEY", "")
+        self.upstream_key = os.getenv("UPSTREAM_API_KEY") or os.getenv("OPENCODE_GO_API_KEY", "")
         self.proxy_key = os.getenv("PROXY_API_KEY") or os.getenv("LITELLM_MASTER_KEY") or ""
+        if self.proxy_key and self.upstream_key and self.proxy_key == self.upstream_key:
+            print("FATAL: Local proxy token (PROXY_API_KEY/LITELLM_MASTER_KEY) must not equal the upstream OpenCode Go key.", file=sys.stderr)
+            print("Use a separate local bearer token for Codex-to-bridge auth. Set CODEX_OSS_LOCAL_TOKEN.", file=sys.stderr)
+            sys.exit(1)
+        if self.proxy_key and self.upstream_key and len(self.proxy_key) > 30 and self.proxy_key.startswith("sk-"):
+            if self.proxy_key[:8] == self.upstream_key[:8]:
+                print("WARNING: Local proxy token shares prefix with upstream key. Verify they are different.", file=sys.stderr)
         self.gpt_model_strategy = os.getenv("GPT_MODEL_STRATEGY", "error").strip().lower()
         self.gpt_oss_fallback = os.getenv("GPT_MODEL_OSS_FALLBACK", "deepseek-v4-pro").strip()
         self.openai_key = os.getenv("OPENAI_API_KEY", "")
@@ -2081,8 +2088,8 @@ class ProxyApp:
         # Fatal missing key in production mode
         if self.gpt_model_strategy == "error" and not self.upstream_key:
             if os.getenv("ALLOW_MISSING_OPENCODE_KEY", "0") != "1":
-                print("FATAL: OPENCODE_GO_API_KEY is not set and GPT_MODEL_STRATEGY=error.", file=sys.stderr)
-                print("Set OPENCODE_GO_API_KEY or start with ALLOW_MISSING_OPENCODE_KEY=1", file=sys.stderr)
+                print("FATAL: UPSTREAM_API_KEY/OPENCODE_GO_API_KEY is not set and GPT_MODEL_STRATEGY=error.", file=sys.stderr)
+                print("Set UPSTREAM_API_KEY, OPENCODE_GO_API_KEY, or start with ALLOW_MISSING_OPENCODE_KEY=1", file=sys.stderr)
                 sys.exit(1)
 
         # Concurrency semaphores — prevent rate-limit death spirals
@@ -2630,660 +2637,52 @@ class ProxyApp:
         response_id: Optional[str] = None,
         created_at: Optional[int] = None,
     ) -> JSON:
-        choice = (chat_resp.get("choices") or [{}])[0]
-        upstream_msg = choice.get("message") or {}
+        from codex_oss.transport.response_builder import build_response_object_from_chat
 
-        content = as_text(upstream_msg.get("content", ""))
-        reasoning_content = upstream_msg.get("reasoning_content") or upstream_msg.get("reasoning")
-        thinking_blocks = upstream_msg.get("thinking_blocks")
-
-        tool_calls_in = upstream_msg.get("tool_calls") or []
-        tool_calls_out: List[JSON] = []
-
-        for tc in tool_calls_in:
-            if not isinstance(tc, dict):
-                continue
-            tc_id = str(tc.get("id") or tc.get("call_id") or new_id("call"))
-            fn = tc.get("function") or {}
-            raw_name = str(fn.get("name") or tc.get("name") or "tool")
-            name = restore_tool_name(raw_name, reverse_name_map)
-            args = fn.get("arguments", tc.get("arguments", "{}"))
-            if not isinstance(args, str):
-                args = json_dumps(args)
-            # Store chat-format name as returned by the provider for replay; expose original name to Codex.
-            replay_tc = {
-                "id": tc_id,
-                "type": "function",
-                "function": {"name": raw_name, "arguments": args},
-            }
-            tool_calls_out.append({"replay": replay_tc, "codex": {"id": new_id("fc"), "call_id": tc_id, "name": name, "arguments": args}})
-
-        assistant_msg: JSON = {"role": "assistant", "content": content or ""}
-        if reasoning_content:
-            assistant_msg["reasoning_content"] = reasoning_content
-        if thinking_blocks:
-            assistant_msg["thinking_blocks"] = thinking_blocks
-        if tool_calls_out:
-            assistant_msg["tool_calls"] = [x["replay"] for x in tool_calls_out]
-
-        response_id = response_id or new_id("resp")
-        created_at = created_at or now()
-        all_messages = repair_chat_history(base_messages, None) + [assistant_msg]
-        pending_ids = [x["codex"]["call_id"] for x in tool_calls_out]
-
-        self.state.put(
-            StoredResponse(
-                response_id=response_id,
-                model_alias=model_alias,
-                model_upstream=model_upstream,
-                messages=all_messages,
-                pending_call_ids=pending_ids,
-                created_at=created_at,
-                task_max_exchanges=_extract_budget(base_messages),
-            )
+        return build_response_object_from_chat(
+            body=body,
+            chat_resp=chat_resp,
+            base_messages=base_messages,
+            model_alias=model_alias,
+            model_upstream=model_upstream,
+            reverse_name_map=reverse_name_map,
+            state_put=self.state.put,
+            stored_response_factory=StoredResponse,
+            repair_chat_history=repair_chat_history,
+            extract_budget=_extract_budget,
+            restore_tool_name=restore_tool_name,
+            new_id=new_id,
+            now=now,
+            json_dumps=json_dumps,
+            as_text=as_text,
+            response_id=response_id,
+            created_at=created_at,
         )
-
-        output: List[JSON] = []
-        # Do not expose raw reasoning_content. Keep it in private proxy state only.
-        # If Codex wants a reasoning item shape, provide an empty summary-only item.
-        if reasoning_content and os.getenv("EXPOSE_EMPTY_REASONING_ITEM", "1") != "0":
-            output.append({"type": "reasoning", "id": new_id("rs"), "summary": []})
-
-        for x in tool_calls_out:
-            fc = x["codex"]
-            output.append(
-                {
-                    "type": "function_call",
-                    "id": fc["id"],
-                    "call_id": fc["call_id"],
-                    "name": fc["name"],
-                    "arguments": fc["arguments"],
-                    "status": "completed",
-                }
-            )
-
-        if content:
-            output.append(
-                {
-                    "type": "message",
-                    "id": new_id("msg"),
-                    "status": "completed",
-                    "role": "assistant",
-                    "content": [{"type": "output_text", "text": content, "annotations": []}],
-                }
-            )
-
-        usage = chat_resp.get("usage") or {}
-        resp_obj: JSON = {
-            "id": response_id,
-            "object": "response",
-            "created_at": created_at,
-            "status": "completed",
-            "error": None,
-            "incomplete_details": None,
-            "instructions": body.get("instructions"),
-            "model": model_alias,
-            "output": output,
-            "parallel_tool_calls": False,
-            "previous_response_id": body.get("previous_response_id"),
-            "store": False,
-            "temperature": body.get("temperature"),
-            "top_p": body.get("top_p"),
-            "truncation": body.get("truncation", "disabled"),
-            "usage": {
-                "input_tokens": usage.get("prompt_tokens", usage.get("input_tokens", 0)),
-                "output_tokens": usage.get("completion_tokens", usage.get("output_tokens", 0)),
-                "total_tokens": usage.get("total_tokens", 0),
-            },
-            "metadata": body.get("metadata") or {},
-        }
-        return resp_obj
 
 
 APP = ProxyApp()
 START_TIME = time.time()
+ACTIVE_REQUESTS = 0
+ACTIVE_REQUESTS_COND = threading.Condition()
+SHUTDOWN_REQUESTED = threading.Event()
 
-
-
-@dataclass
-class ToolStreamState:
-    index: int
-    item_id: str
-    call_id: str
-    raw_name_parts: List[str]
-    args_parts: List[str]
-    output_index: int = -1
-    added: bool = False
-    done: bool = False
-
-    @property
-    def raw_name(self) -> str:
-        return "".join(self.raw_name_parts).strip()
-
-    @property
-    def arguments(self) -> str:
-        return "".join(self.args_parts)
-
-
-class ChatStreamAssembler:
-    """Convert live Chat Completions SSE chunks into Responses SSE events."""
-
-    def __init__(
-        self,
-        handler: "Handler",
-        body: JSON,
-        base_messages: List[JSON],
-        model_alias: str,
-        model_upstream: str,
-        reverse_name_map: Dict[str, str],
-        response_id: str,
-        created_at: int,
-    ):
-        self.handler = handler
-        self.body = body
-        self.base_messages = base_messages
-        self.model_alias = model_alias
-        self.model_upstream = model_upstream
-        self.reverse_name_map = reverse_name_map
-        self.response_id = response_id
-        self.created_at = created_at
-        self.output_order: List[Tuple[str, Any]] = []
-        self.next_output_index = 0
-
-        self.text_started = False
-        self.text_done = False
-        self.text_item_id = new_id("msg")
-        self.text_parts: List[str] = []
-
-        self.reasoning_parts: List[str] = []
-        self.thinking_blocks: List[Any] = []
-        self.tool_states: Dict[int, ToolStreamState] = {}
-        self.usage: JSON = {}
-        self.last_progress = time.time()
-
-    def _write_sse(self, event: str, data: Any) -> None:
-        self.handler._write_sse(event, data)
-        self.last_progress = time.time()
-
-    def maybe_progress(self, note: str = "upstream_stream") -> None:
-        interval = float(os.getenv("SSE_VISIBLE_PROGRESS_SECONDS", "8"))
-        if time.time() - self.last_progress >= interval:
-            self.handler._write_in_progress(self.response_id, self.model_alias, self.created_at, self.body, note)
-            self.last_progress = time.time()
-
-    def _assign_output_index(self, kind: str, key: Any) -> int:
-        idx = self.next_output_index
-        self.next_output_index += 1
-        self.output_order.append((kind, key))
-        return idx
-
-    def ensure_text_item(self) -> int:
-        if self.text_started:
-            # Find existing output index.
-            for i, (kind, key) in enumerate(self.output_order):
-                if kind == "message" and key == "text":
-                    return i
-        idx = self._assign_output_index("message", "text")
-        self.text_started = True
-        item = {
-            "type": "message",
-            "id": self.text_item_id,
-            "status": "in_progress",
-            "role": "assistant",
-            "content": [],
-        }
-        self._write_sse("response.output_item.added", {"type": "response.output_item.added", "output_index": idx, "item": item})
-        self._write_sse(
-            "response.content_part.added",
-            {
-                "type": "response.content_part.added",
-                "output_index": idx,
-                "content_index": 0,
-                "part": {"type": "output_text", "text": "", "annotations": []},
-                "item_id": self.text_item_id,
-            },
-        )
-        return idx
-
-    def on_content_delta(self, text: str) -> None:
-        if not text:
-            return
-        idx = self.ensure_text_item()
-        chunk_size = int(os.getenv("SSE_CHUNK_SIZE", "256"))
-        for start in range(0, len(text), chunk_size):
-            delta = text[start : start + chunk_size]
-            self.text_parts.append(delta)
-            self._write_sse(
-                "response.output_text.delta",
-                {
-                    "type": "response.output_text.delta",
-                    "output_index": idx,
-                    "content_index": 0,
-                    "delta": delta,
-                    "item_id": self.text_item_id,
-                },
-            )
-
-    def on_reasoning_delta(self, text: str) -> None:
-        if text:
-            self.reasoning_parts.append(text)
-        # Do not expose raw reasoning text. Emit occasional progress so Codex does not
-        # treat a long hidden-thinking phase as a dead stream.
-        self.maybe_progress("hidden_reasoning")
-
-    def _get_tool_state(self, index: int) -> ToolStreamState:
-        if index not in self.tool_states:
-            self.tool_states[index] = ToolStreamState(
-                index=index,
-                item_id=new_id("fc"),
-                call_id=new_id("call"),
-                raw_name_parts=[],
-                args_parts=[],
-            )
-        return self.tool_states[index]
-
-    def _ensure_tool_added(self, st: ToolStreamState, force: bool = False) -> None:
-        if st.added:
-            return
-        if not st.raw_name and not force:
-            return
-        raw_name = st.raw_name or "tool"
-        name = restore_tool_name(raw_name, self.reverse_name_map)
-        st.output_index = self._assign_output_index("function_call", st.index)
-        item = {
-            "type": "function_call",
-            "id": st.item_id,
-            "call_id": st.call_id,
-            "name": name,
-            "arguments": "",
-            "status": "in_progress",
-        }
-        self._write_sse(
-            "response.output_item.added",
-            {"type": "response.output_item.added", "output_index": st.output_index, "item": item},
-        )
-        st.added = True
-
-    def _emit_args_delta(self, st: ToolStreamState, delta: str) -> None:
-        if not delta:
-            return
-        self._ensure_tool_added(st, force=bool(st.raw_name))
-        if not st.added:
-            # Buffer until name arrives.
-            return
-        arg_chunk_size = int(os.getenv("SSE_FUNCTION_ARGS_CHUNK_SIZE", "512"))
-        for start in range(0, len(delta), arg_chunk_size):
-            part = delta[start : start + arg_chunk_size]
-            self._write_sse(
-                "response.function_call_arguments.delta",
-                {
-                    "type": "response.function_call_arguments.delta",
-                    "output_index": st.output_index,
-                    "item_id": st.item_id,
-                    "delta": part,
-                },
-            )
-
-    def on_tool_call_delta(self, tc: JSON) -> None:
-        try:
-            idx = int(tc.get("index", 0))
-        except Exception:
-            idx = 0
-        st = self._get_tool_state(idx)
-        if tc.get("id") and st.call_id.startswith("call_"):
-            # Prefer upstream tool_call id if we have not already exposed a generated id.
-            if not st.added:
-                st.call_id = str(tc["id"])
-        fn = tc.get("function") or {}
-        name_part = fn.get("name") or tc.get("name")
-        if name_part:
-            st.raw_name_parts.append(str(name_part))
-            self._ensure_tool_added(st, force=False)
-            # If arguments arrived before the name, flush them now as one delta stream.
-            if st.added and st.arguments:
-                already_emitted_key = "_already_emitted_chars"
-                emitted = getattr(st, already_emitted_key, 0)
-                remaining = st.arguments[emitted:]
-                if remaining:
-                    self._emit_args_delta(st, remaining)
-                    setattr(st, already_emitted_key, len(st.arguments))
-
-        args_delta = fn.get("arguments", tc.get("arguments"))
-        if args_delta is not None:
-            args_text = args_delta if isinstance(args_delta, str) else json_dumps(args_delta)
-            before = len(st.arguments)
-            st.args_parts.append(args_text)
-            if st.added:
-                self._emit_args_delta(st, args_text)
-                setattr(st, "_already_emitted_chars", len(st.arguments))
-            else:
-                # Preserve for later flush when the name arrives. Nothing has been
-                # emitted yet, so keep the emitted counter at zero.
-                if not hasattr(st, "_already_emitted_chars"):
-                    setattr(st, "_already_emitted_chars", 0)
-
-    def on_chunk(self, chunk: JSON) -> None:
-        if chunk.get("usage"):
-            self.usage = chunk["usage"]
-        for choice in chunk.get("choices") or []:
-            delta = choice.get("delta") or {}
-            if not isinstance(delta, dict):
-                continue
-            # Provider-specific hidden reasoning fields.
-            for key in ("reasoning_content", "reasoning", "thinking"):
-                if delta.get(key):
-                    self.on_reasoning_delta(as_text(delta.get(key)))
-            if delta.get("thinking_blocks"):
-                self.thinking_blocks.append(delta.get("thinking_blocks"))
-                self.maybe_progress("hidden_thinking_blocks")
-            if delta.get("content") is not None:
-                self.on_content_delta(as_text(delta.get("content")))
-            for tc in delta.get("tool_calls") or []:
-                if isinstance(tc, dict):
-                    self.on_tool_call_delta(tc)
-            if choice.get("finish_reason"):
-                self.maybe_progress(f"finish:{choice.get('finish_reason')}")
-
-    def _final_message_item(self) -> Optional[JSON]:
-        if not self.text_started:
-            return None
-        text = "".join(self.text_parts)
-        return {
-            "type": "message",
-            "id": self.text_item_id,
-            "status": "completed",
-            "role": "assistant",
-            "content": [{"type": "output_text", "text": text, "annotations": []}],
-        }
-
-    def _final_function_item(self, st: ToolStreamState) -> JSON:
-        raw_name = st.raw_name or "tool"
-        name = restore_tool_name(raw_name, self.reverse_name_map)
-        return {
-            "type": "function_call",
-            "id": st.item_id,
-            "call_id": st.call_id,
-            "name": name,
-            "arguments": st.arguments,
-            "status": "completed",
-        }
-
-    def finalize(self) -> JSON:
-        # Force-add and finish any tool calls that only became complete at stream end.
-        for idx in sorted(self.tool_states):
-            st = self.tool_states[idx]
-            self._ensure_tool_added(st, force=True)
-            if not st.done:
-                args = st.arguments
-                emitted = getattr(st, "_already_emitted_chars", 0)
-                if emitted < len(args):
-                    self._emit_args_delta(st, args[emitted:])
-                    setattr(st, "_already_emitted_chars", len(args))
-                self._write_sse(
-                    "response.function_call_arguments.done",
-                    {
-                        "type": "response.function_call_arguments.done",
-                        "output_index": st.output_index,
-                        "item_id": st.item_id,
-                        "arguments": args,
-                    },
-                )
-                self._write_sse(
-                    "response.output_item.done",
-                    {"type": "response.output_item.done", "output_index": st.output_index, "item": self._final_function_item(st)},
-                )
-                st.done = True
-
-        if self.text_started and not self.text_done:
-            text = "".join(self.text_parts)
-            idx = next(i for i, (kind, key) in enumerate(self.output_order) if kind == "message" and key == "text")
-            self._write_sse(
-                "response.output_text.done",
-                {
-                    "type": "response.output_text.done",
-                    "output_index": idx,
-                    "content_index": 0,
-                    "text": text,
-                    "item_id": self.text_item_id,
-                },
-            )
-            part = {"type": "output_text", "text": text, "annotations": []}
-            self._write_sse(
-                "response.content_part.done",
-                {
-                    "type": "response.content_part.done",
-                    "output_index": idx,
-                    "content_index": 0,
-                    "part": part,
-                    "item_id": self.text_item_id,
-                },
-            )
-            self._write_sse(
-                "response.output_item.done",
-                {"type": "response.output_item.done", "output_index": idx, "item": self._final_message_item()},
-            )
-            self.text_done = True
-
-        output_by_index: Dict[int, JSON] = {}
-        for idx, (kind, key) in enumerate(self.output_order):
-            if kind == "message":
-                item = self._final_message_item()
-                if item:
-                    output_by_index[idx] = item
-            elif kind == "function_call":
-                st = self.tool_states[int(key)]
-                output_by_index[idx] = self._final_function_item(st)
-        output = [output_by_index[i] for i in sorted(output_by_index)]
-
-        content = "".join(self.text_parts)
-        reasoning_content = "".join(self.reasoning_parts)
-        assistant_msg: JSON = {"role": "assistant", "content": content or ""}
-        if reasoning_content:
-            assistant_msg["reasoning_content"] = reasoning_content
-        if self.thinking_blocks:
-            assistant_msg["thinking_blocks"] = self.thinking_blocks
-
-        replay_tool_calls: List[JSON] = []
-        for idx in sorted(self.tool_states):
-            st = self.tool_states[idx]
-            replay_tool_calls.append(
-                {
-                    "id": st.call_id,
-                    "type": "function",
-                    "function": {"name": st.raw_name or "tool", "arguments": st.arguments},
-                }
-            )
-        if replay_tool_calls:
-            assistant_msg["tool_calls"] = replay_tool_calls
-
-        all_messages = repair_chat_history(self.base_messages, None) + [assistant_msg]
-        APP.state.put(
-            StoredResponse(
-                response_id=self.response_id,
-                model_alias=self.model_alias,
-                model_upstream=self.model_upstream,
-                messages=all_messages,
-                pending_call_ids=[tc["id"] for tc in replay_tool_calls],
-                created_at=self.created_at,
-                task_max_exchanges=_extract_budget(self.base_messages),
-            )
-        )
-
-        usage = self.usage or {}
-        resp_obj = APP.build_response_shell(
-            self.body,
-            self.model_alias,
-            response_id=self.response_id,
-            created_at=self.created_at,
-            status="completed",
-            output=output,
-        )
-        resp_obj["usage"] = {
-            "input_tokens": usage.get("prompt_tokens", usage.get("input_tokens", 0)),
-            "output_tokens": usage.get("completion_tokens", usage.get("output_tokens", 0)),
-            "total_tokens": usage.get("total_tokens", 0),
-        }
-        return resp_obj
-
-
-# ── v9: ResponseEmitter — guarantees terminal SSE for every request ──
-
-class ResponseEmitter:
-    """Single transport abstraction. Every POST path must use this. No raw wfile writes."""
-
-    def __init__(self, handler, response_id: str, model_alias: str,
-                 stream: bool, created_at: Optional[int] = None):
-        self.handler = handler
-        self.response_id = response_id
-        self.model_alias = model_alias
-        self.stream = stream
-        self.created_at = created_at or now()
-        self._terminated = False
-        self._output_index = 0
-        self._sse_headers_sent = False
-        self._emitted_output: List[JSON] = []
-
-    def start(self):
-        if self.stream:
-            self.handler.send_response(200)
-            self.handler.send_header("Content-Type", "text/event-stream")
-            self.handler.send_header("Cache-Control", "no-cache")
-            self.handler.send_header("Connection", "close")
-            self.handler.end_headers()
-            self._sse_headers_sent = True
-            self._write_sse("response.created", {
-                "type": "response.created",
-                "response": {
-                    "id": self.response_id,
-                    "object": "response",
-                    "created_at": self.created_at,
-                    "status": "in_progress",
-                    "error": None,
-                    "incomplete_details": None,
-                    "instructions": None,
-                    "model": self.model_alias,
-                    "output": [],
-                    "parallel_tool_calls": False,
-                    "previous_response_id": None,
-                    "store": False,
-                    "temperature": None,
-                    "top_p": None,
-                    "truncation": "disabled",
-                    "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
-                    "metadata": {},
-                }
-            })
-
-    def emit_text_message(self, text: str, status: str = "completed"):
-        msg_id = new_id("msg")
-        idx = self._next_index()
-        message_item = {"type": "message", "id": msg_id, "status": status, "role": "assistant",
-                        "content": [{"type": "output_text", "text": text, "annotations": []}]}
-
-        if self.stream:
-            if not self._sse_headers_sent:
-                self.start()
-            item = {"type": "message", "id": msg_id, "status": "in_progress", "role": "assistant", "content": []}
-            self._write_sse("response.output_item.added", {
-                "type": "response.output_item.added", "output_index": idx, "item": item})
-            self._write_sse("response.content_part.added", {
-                "type": "response.content_part.added", "output_index": idx, "content_index": 0,
-                "part": {"type": "output_text", "text": "", "annotations": []}, "item_id": msg_id})
-            self._write_sse("response.output_text.delta", {
-                "type": "response.output_text.delta", "output_index": idx, "content_index": 0, "delta": text})
-            self._write_sse("response.output_text.done", {
-                "type": "response.output_text.done", "output_index": idx, "content_index": 0, "text": text})
-            self._write_sse("response.content_part.done", {
-                "type": "response.content_part.done", "output_index": idx, "content_index": 0,
-                "part": {"type": "output_text", "text": text, "annotations": []}, "item_id": msg_id})
-            self._write_sse("response.output_item.done", {
-                "type": "response.output_item.done", "output_index": idx,
-                "item": message_item})
-        else:
-            self._json_response = {
-                "id": self.response_id,
-                "object": "response",
-                "created_at": self.created_at,
-                "status": status,
-                "error": None,
-                "incomplete_details": None,
-                "instructions": None,
-                "model": self.model_alias,
-                "output": [message_item],
-                "parallel_tool_calls": False,
-                "previous_response_id": None,
-                "store": False,
-                "temperature": None, "top_p": None, "truncation": "disabled",
-                "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
-                "metadata": {},
-            }
-        self._emitted_output.append(message_item)
-
-    def emit_error(self, message: str, status_code: int = 400, error_type: str = "invalid_request_error"):
-        if self.stream and self._sse_headers_sent:
-            self._write_sse("response.failed", {
-                "type": "response.failed",
-                "response": {"id": self.response_id, "object": "response",
-                              "status": "failed",
-                              "error": {"message": message, "type": error_type, "code": error_type}}})
-            self._write_sse("done", {})
-        else:
-            data = json.dumps({"error": {"message": message, "type": error_type, "code": error_type}}).encode("utf-8")
-            self.handler.send_response(status_code)
-            self.handler.send_header("Content-Type", "application/json")
-            self.handler.send_header("Content-Length", str(len(data)))
-            self.handler.end_headers()
-            self.handler.wfile.write(data)
-        self._terminated = True
-
-    def complete(self):
-        if self._terminated:
-            return
-        if self.stream:
-            self._write_sse("response.completed", {
-                "type": "response.completed",
-                "response": {
-                    "id": self.response_id, "object": "response",
-                    "created_at": self.created_at, "status": "completed",
-                    "error": None, "incomplete_details": None,
-                    "instructions": None, "model": self.model_alias,
-                    "output": self._emitted_output, "parallel_tool_calls": False,
-                    "previous_response_id": None, "store": False,
-                    "temperature": None, "top_p": None, "truncation": "disabled",
-                    "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
-                    "metadata": {},
-                }
-            })
-            self._write_sse("done", {})
-        else:
-            if hasattr(self, '_json_response'):
-                data = json.dumps(self._json_response, ensure_ascii=False).encode("utf-8")
-                self.handler.send_response(200)
-                self.handler.send_header("Content-Type", "application/json")
-                self.handler.send_header("Content-Length", str(len(data)))
-                self.handler.end_headers()
-                self.handler.wfile.write(data)
-        self._terminated = True
-
-    def _write_sse(self, event: str, data):
-        raw = json.dumps(data, ensure_ascii=False)
-        msg = f"event: {event}\ndata: {raw}\n\n".encode("utf-8")
-        if event == "done":
-            msg = "data: [DONE]\n\n".encode("utf-8")
-        try:
-            self.handler.wfile.write(msg)
-            self.handler.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError, OSError):
-            self._terminated = True
-
-    def _next_index(self):
-        i = self._output_index
-        self._output_index += 1
-        return i
+from codex_oss.transport.chat_stream import ChatStreamAssembler
+from codex_oss.transport.emitter import ResponseEmitter
 
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "ResponsesChatProxy/12.0"
+
+    def _track_request_start(self) -> None:
+        global ACTIVE_REQUESTS
+        with ACTIVE_REQUESTS_COND:
+            ACTIVE_REQUESTS += 1
+
+    def _track_request_end(self) -> None:
+        global ACTIVE_REQUESTS
+        with ACTIVE_REQUESTS_COND:
+            ACTIVE_REQUESTS = max(0, ACTIVE_REQUESTS - 1)
+            ACTIVE_REQUESTS_COND.notify_all()
 
     def _send_json(self, status: int, obj: Any) -> None:
         data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
@@ -3314,44 +2713,20 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if self.path.rstrip("/") in ("/health", "/v1/health"):
-            model_health = {}
-            for model, h in APP.model_health.items():
-                model_health[model] = {
-                    "status": h.get("status", "ok"),
-                    "errors": h.get("errors", 0),
-                    "since": h.get("since", 0),
-                }
-            status_info = {
-                "ok": True,
-                "service": "responses-chat-proxy",
-                "bridge_version": BRIDGE_VERSION,
-                "time": now(),
-                "pid": os.getpid(),
-                "ppid": os.getppid(),
-                "uptime_seconds": int(time.time() - START_TIME) if 'START_TIME' in dir() else 0,
-                "argv": sys.argv,
-                "supervisor": {
-                    "mode": os.getenv("CODEX_OSS_SUPERVISOR_MODE", "unknown"),
-                    "durable": os.getenv("CODEX_OSS_SUPERVISOR_MODE", "") != "",
-                },
-                "gpt_model_strategy": APP.gpt_model_strategy,
-                "upstream_stream": getattr(APP, "upstream_streaming", True),
-                "has_opencode_key": bool(APP.upstream_key),
-                "state_db": getattr(APP.state, "path", os.getenv("PROXY_STATE_DB", "unknown")),
-                "model_health": model_health,
-                "concurrency": {
-                    "max_global": APP.max_global_concurrency,
-                },
-                "transport_contract": {
-                    "stream_terminal_guarantee": True,
-                },
-            }
-            self._send_json(200, status_info)
+            from codex_oss.health import build_health_status
+            self._send_json(200, build_health_status(APP, BRIDGE_VERSION, __file__, START_TIME))
             return
 
         self._send_error_obj(404, f"Unknown path: {self.path}", "not_found")
 
     def do_POST(self) -> None:  # noqa: N802
+        self._track_request_start()
+        try:
+            self._do_POST_tracked()
+        finally:
+            self._track_request_end()
+
+    def _do_POST_tracked(self) -> None:
         if not APP.auth_ok(self.headers.get("Authorization", "")):
             self._send_error_obj(401, "Unauthorized", "unauthorized")
             return
@@ -3377,6 +2752,55 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     status, data, ctype = APP.call_openai_responses(body)
                     self._send_raw(status, data, ctype)
+                return
+
+            # ── v1 spec: A2/A3 managed investigation via runtime loop ──
+            from codex_oss.managed_bridge import run_managed_mission_from_body, should_handle_managed_mission_body
+            managed_emitter = None
+            commentary_callback = None
+            visible_stream_enabled = os.getenv("OSS_VISIBLE_TRACE_STREAM", "1") != "0"
+            if body.get("stream") and visible_stream_enabled and should_handle_managed_mission_body(body, raw_model_alias):
+                managed_emitter = ResponseEmitter(self, new_id("resp"), raw_model_alias, True)
+                managed_emitter.start()
+
+                def commentary_callback(event):
+                    if not isinstance(event, dict) or event.get("safe_for_user") is not True:
+                        return
+                    text = str(event.get("message") or "").strip()
+                    if not text:
+                        return
+                    managed_emitter.emit_commentary_message(text)
+
+            managed = run_managed_mission_from_body(
+                body=body,
+                raw_model_alias=raw_model_alias,
+                log_fn=APP.log,
+                call_payload_fn=APP.call_continuation_with_deadline,
+                map_model_fn=lambda model: map_model(model, APP.model_map),
+                request_deadline=float(os.getenv("REQUEST_DEADLINE_SECONDS", "90")),
+                commentary_callback=commentary_callback,
+            )
+            if managed.handled:
+                emitter = managed_emitter or ResponseEmitter(self, new_id("resp"), raw_model_alias, bool(body.get("stream")))
+                try:
+                    emitter.emit_text_message(managed.report_text, phase="final_answer")
+                    emitter.complete()
+                except (BrokenPipeError, ConnectionResetError, OSError) as e:
+                    APP.log(
+                        "client_disconnected",
+                        phase="managed_runtime_emit",
+                        mission_status=managed.status,
+                        error=str(e),
+                    )
+                    self.close_connection = True
+                return
+            if managed_emitter is not None:
+                APP.log("managed_runtime_predicate_miss", model_alias=raw_model_alias)
+                managed_emitter.emit_text_message(
+                    "The managed runtime stream could not route this mission. Start a fresh OSS subagent task with a valid MissionV1 handoff.",
+                    phase="final_answer",
+                )
+                managed_emitter.complete()
                 return
 
             # ── v8: Check for continuation BEFORE prepare_chat_payload ──
@@ -3533,65 +2957,28 @@ class Handler(BaseHTTPRequestHandler):
         mode = select_mode(envelope)
         _, _, target_path = _find_tool_call_details(prev_state, tool_call_id)
 
-        if mode == "bounded_write_patch" and tool_kind == "shell":
-            project_root = os.getcwd()
-            changed_paths = collect_owned_path_changes(envelope.get("owned_paths", []), project_root)
-            failed = exit_code != 0 or tool_output_indicates_failure(tool_output_text)
-            if not changed_paths:
-                status = "FAIL" if failed else "PARTIAL"
-                reason = "verification tool was observed, but no changed owned path was visible in git status"
-            elif failed:
-                status = "FAIL"
-                reason = "verification tool output indicated failure"
-            else:
-                status = "PASS"
-                reason = "owned path changes and verification tool output were both observed"
-            text = build_patch_contract_report(
-                envelope, changed_paths, status, reason,
-                verification_seen=True, verification_output=compacted.compacted)
-            emitter = ResponseEmitter(self, new_id("resp"), model_alias, bool(body.get("stream")))
-            emitter.emit_text_message(text)
-            emitter.complete()
-            APP.log("bounded_patch_verification_complete", status=status, changed_paths=changed_paths)
-            return
-
-        if mode == "bounded_write_patch" and tool_kind == "write" and exit_code == 0:
-            project_root = os.getcwd()
-            owned_paths = envelope.get("owned_paths", [])
-            if target_path and not _path_is_within_owned_paths(target_path, owned_paths, project_root):
-                text = build_patch_contract_report(
-                    envelope, [], "FAIL",
-                    f"write target {target_path} is outside the declared owned paths")
-                emitter = ResponseEmitter(self, new_id("resp"), model_alias, bool(body.get("stream")))
-                emitter.emit_text_message(text)
-                emitter.complete()
-                APP.log("bounded_patch_scope_violation", target_path=target_path, owned_paths=owned_paths)
-                return
-            changed_paths = collect_owned_path_changes(owned_paths, project_root)
-            if not changed_paths:
-                text = build_patch_contract_report(
-                    envelope, [], "FAIL",
-                    "write tool returned success but no changed owned path was visible in git status")
-                emitter = ResponseEmitter(self, new_id("resp"), model_alias, bool(body.get("stream")))
-                emitter.emit_text_message(text)
-                emitter.complete()
-                APP.log("bounded_patch_no_owned_change", owned_paths=owned_paths)
-                return
-            if turn < max_exchanges and prev_state:
-                ledger_text = (
-                    "PATCH CONTRACT LEDGER\n"
-                    "Execution mode: bounded_write_patch\n"
-                    f"Owned paths: {', '.join(owned_paths)}\n"
-                    f"Changed owned paths observed: {', '.join(changed_paths)}\n"
-                    f"Required outputs: {', '.join(envelope.get('deliverable_fields', []))}\n"
-                    f"Verification steps: {', '.join(envelope.get('verification_steps', []))}\n"
-                    "Next: run the requested verification if possible, then return the final report. "
-                    "Do not edit outside the owned paths."
-                )
+        if mode == "bounded_write_patch":
+            from codex_oss.legacy_modes import handle_bounded_patch_continuation
+            patch_decision = handle_bounded_patch_continuation(
+                envelope=envelope,
+                tool_kind=tool_kind,
+                tool_output_text=tool_output_text,
+                compacted_output=compacted.compacted,
+                exit_code=exit_code,
+                target_path=target_path,
+                turn=turn,
+                max_exchanges=max_exchanges,
+                project_root=os.getcwd(),
+                collect_owned_path_changes=collect_owned_path_changes,
+                path_is_within_owned_paths=_path_is_within_owned_paths,
+                build_patch_contract_report=build_patch_contract_report,
+                tool_output_indicates_failure=tool_output_indicates_failure,
+            )
+            if patch_decision.continue_for_verification and prev_state:
                 input_items = list(body.get("input", []))
-                input_items.insert(0, {"role": "system", "content": ledger_text})
+                input_items.insert(0, {"role": "system", "content": patch_decision.ledger_text})
                 body["input"] = input_items
-                APP.log("bounded_patch_continue_for_verification", changed_paths=changed_paths)
+                APP.log(patch_decision.log_event, **patch_decision.log_fields)
                 self._handle_fresh_turn(body)
                 if prev_id:
                     refreshed = APP.state.get(str(prev_id))
@@ -3600,14 +2987,13 @@ class Handler(BaseHTTPRequestHandler):
                         refreshed.task_max_exchanges = max_exchanges
                         APP.state.put(refreshed)
                 return
-            text = build_patch_contract_report(
-                envelope, changed_paths, "PARTIAL",
-                "owned path changes were observed, but verification was not observed before the tool budget ended")
-            emitter = ResponseEmitter(self, new_id("resp"), model_alias, bool(body.get("stream")))
-            emitter.emit_text_message(text)
-            emitter.complete()
-            APP.log("bounded_patch_partial_no_verification", changed_paths=changed_paths)
-            return
+            if patch_decision.handled:
+                emitter = ResponseEmitter(self, new_id("resp"), model_alias, bool(body.get("stream")))
+                emitter.emit_text_message(patch_decision.text)
+                emitter.complete()
+                if patch_decision.log_event:
+                    APP.log(patch_decision.log_event, **patch_decision.log_fields)
+                return
 
         # Deterministic close for writes and errors (even under budget)
         # Writers always close deterministically after first write
@@ -3666,165 +3052,55 @@ class Handler(BaseHTTPRequestHandler):
             if mode == "bounded_write_exact" and not context_pack_attempted:
                 context_pack_attempted = True
                 APP.log("mode_bounded_write_exact")
-                owned = envelope.get("owned_paths", [])
-                if owned:
-                    path = owned[0]
-                    exact_content = envelope.get("exact_content", "")
-                    if exact_content and not os.path.exists(os.path.normpath(os.path.join(os.getcwd(), path))):
-                        full = os.path.normpath(os.path.join(os.getcwd(), path))
-                        try:
-                            os.makedirs(os.path.dirname(full), exist_ok=True)
-                            with open(full, "w", encoding="utf-8") as f:
-                                f.write(exact_content + "\n")
-                            APP.log("bounded_write_runtime_write", path=path, bytes=len(exact_content) + 1)
-                        except Exception as e:
-                            APP.log("bounded_write_runtime_write_failed", path=path, error=str(e))
-                    try:
-                        full = os.path.normpath(os.path.join(os.getcwd(), path))
-                        observed = open(full).read().strip()
-                        if observed != exact_content:
-                            report_text = (
-                                f"FAIL\n"
-                                f"File checked: {path}\n"
-                                f"Observed content: {observed}\n"
-                                f"Expected content: {exact_content}\n"
-                                f"Confidence: HIGH — deterministic read-back did not match declared exact_content; "
-                                f"Caveat: final OSS model report bypassed by bridge runtime (mode={mode})."
-                            )
-                            emitter = ResponseEmitter(self, new_id("resp"), model_alias, bool(body.get("stream")))
-                            emitter.emit_text_message(report_text)
-                            emitter.complete()
-                            APP.log("bounded_write_mismatch", path=path)
-                            return
-                        report_text = (
-                            f"PASS\n"
-                            f"File changed: {path}\n"
-                            f"Observed content: {observed}\n"
-                            f"Confidence: HIGH — deterministic read-back after tool execution; "
-                            f"Caveat: final OSS model report bypassed by bridge runtime (mode={mode})."
-                        )
-                        emitter = ResponseEmitter(self, new_id("resp"), model_alias, bool(body.get("stream")))
-                        emitter.emit_text_message(report_text)
-                        emitter.complete()
-                        APP.log("bounded_write_complete", path=path)
-                        return
-                    except Exception as e:
-                        APP.log("bounded_write_failed", error=str(e))
-                        if tool_kind != "write":
-                            context_pack_attempted = False
-                            APP.log("bounded_write_waiting_for_write", path=path, tool_kind=tool_kind)
-                            # Let the model continue to the actual write tool call.
-                        else:
-                            report_text = (
-                                f"FAIL\n"
-                                f"File changed: {path}\n"
-                                f"Observed content: [read-back failed: {e}]\n"
-                                f"Confidence: LOW — assigned file could not be read after tool execution; "
-                                f"Caveat: no model finalizer was allowed to infer success."
-                            )
-                            emitter = ResponseEmitter(self, new_id("resp"), model_alias, bool(body.get("stream")))
-                            emitter.emit_text_message(report_text)
-                            emitter.complete()
-                            return
+                from codex_oss.legacy_modes import handle_bounded_write_exact
+                exact_decision = handle_bounded_write_exact(envelope, mode, tool_kind, os.getcwd(), APP.log)
+                if exact_decision.wait_for_model_write:
+                    context_pack_attempted = False
+                    APP.log("bounded_write_waiting_for_write", tool_kind=tool_kind, **exact_decision.log_fields)
+                elif exact_decision.handled:
+                    emitter = ResponseEmitter(self, new_id("resp"), model_alias, bool(body.get("stream")))
+                    emitter.emit_text_message(exact_decision.text)
+                    emitter.complete()
+                    if exact_decision.log_event:
+                        APP.log(exact_decision.log_event, **exact_decision.log_fields)
+                    return
 
             if mode in ("context_pack", "context_pack_report") and not _has_evidence_ledger(body):
                 context_pack_attempted = True
-                APP.log("context_pack", mode=mode, paths=extract_allowed_paths(handoff_text))
-                session = build_task_session(body, handoff_text, prev_id or "unknown")
-                # Track what's been read from history
-                read_paths = _extract_read_paths_from_history(prev_state.messages)
-                session.read_paths = {p: {"complete": True} for p in read_paths}
-                # Build context pack with remaining files
-                pack = build_context_pack(session, os.getcwd())
-                evidence_coverage_complete, _, _, _ = evaluate_evidence_coverage(envelope, pack)
-                # Send as no-tools finalizer call
-                finalizer_payload = {
-                    "model": map_model(APP.continuation_model, APP.model_map),
-                    "messages": [{"role": "system", "content":
-                        f"You are producing a report from the provided source pack.\n"
-                        f"Required outputs: {', '.join(session.required_outputs)}\n\n"
-                        f"SOURCE PACK:\n{pack}\n\n"
-                        f"Do not request tools. Produce a structured report including all required outputs. "
-                        f"Distinguish source-document claims, planned success criteria, and actually observed verification. "
-                        f"Do not say tests passed, commands ran, files changed, or routing occurred unless the source pack explicitly contains that executed result."}],
-                    "stream": False,
-                    "tools": [],
-                }
-                try:
-                    chat_resp = APP.call_continuation_with_deadline(
-                        finalizer_payload, APP.continuation_deadline)
-                    text = chat_resp.get("choices", [{}])[0].get("message", {}).get("content", "")
-                    # v12: Reject intent/status text and reports that do not satisfy the task contract.
-                    if is_intent_or_status(text):
-                        APP.log("intent_rejected", text_len=len(text))
-                        remaining = request_deadline - (time.time() - request_start)
-                        if remaining > 20:
-                            retry_payload = {
-                                "model": finalizer_payload["model"],
-                                "messages": finalizer_payload["messages"] + [
-                                    {"role": "user", "content":
-                                     "You returned status/intent text instead of a report. "
-                                     "That is invalid. Return the final report now. Do not describe future actions. "
-                                     "Include PASS, FAIL, or PARTIAL; confidence; caveats; and every required output field."}
-                                ],
-                                "stream": False,
-                                "tools": [],
-                            }
-                            try:
-                                chat_resp = APP.call_continuation_with_deadline(retry_payload, APP.continuation_deadline * 0.7)
-                                text = chat_resp.get("choices", [{}])[0].get("message", {}).get("content", "")
-                                APP.log("intent_retry_ok", text_len=len(text))
-                            except Exception:
-                                text = "PARTIAL\nConfidence: LOW\nCaveats: model returned intent/status text; retry failed."
-                                APP.log("intent_retry_failed")
-                    if is_intent_or_status(text):
-                        APP.log("context_pack_intent_fallback", text_len=len(text))
-                        text = build_context_pack_deterministic_report(session, pack, tool_output_text)
-                    else:
-                        is_valid, missing = validate_report_output(
-                            text, mode, envelope,
-                            evidence_coverage_complete=evidence_coverage_complete)
-                        if not is_valid:
-                            APP.log("context_pack_report_contract_fallback", missing=missing, text_len=len(text))
-                            text = build_context_pack_deterministic_report(session, pack, tool_output_text)
+                from codex_oss.legacy_modes import handle_context_pack_report
+                context_decision = handle_context_pack_report(
+                    body=body,
+                    envelope=envelope,
+                    handoff_text=handoff_text,
+                    prev_id=prev_id or "unknown",
+                    prev_state_messages=prev_state.messages,
+                    mode=mode,
+                    tool_output_text=tool_output_text,
+                    request_deadline=request_deadline,
+                    request_start=request_start,
+                    project_root=os.getcwd(),
+                    continuation_model=APP.continuation_model,
+                    model_map=APP.model_map,
+                    continuation_deadline=APP.continuation_deadline,
+                    continuation_fallbacks=APP.continuation_fallbacks,
+                    max_tool_output_chars=APP.max_tool_output_chars,
+                    log_fn=APP.log,
+                    map_model=map_model,
+                    call_continuation_with_deadline=APP.call_continuation_with_deadline,
+                    build_task_session=build_task_session,
+                    extract_read_paths_from_history=_extract_read_paths_from_history,
+                    build_context_pack=build_context_pack,
+                    evaluate_evidence_coverage=evaluate_evidence_coverage,
+                    is_intent_or_status=is_intent_or_status,
+                    validate_report_output=validate_report_output,
+                    build_context_pack_deterministic_report=build_context_pack_deterministic_report,
+                )
+                if context_decision.handled:
                     emitter = ResponseEmitter(self, new_id("resp"), model_alias, bool(body.get("stream")))
-                    emitter.emit_text_message(text)
+                    emitter.emit_text_message(context_decision.text)
                     emitter.complete()
-                    APP.log("context_pack_report_complete", text_len=len(text))
-                    return
-                except Exception as e:
-                    APP.log("context_pack_failed", error=str(e))
-                    text = ""
-                    for fb_model in APP.continuation_fallbacks:
-                        remaining = request_deadline - (time.time() - request_start)
-                        if remaining <= 5:
-                            break
-                        fallback_payload = dict(finalizer_payload)
-                        fallback_payload["model"] = map_model(fb_model, APP.model_map)
-                        try:
-                            APP.log("context_pack_fallback_try", fallback_model=fallback_payload["model"])
-                            chat_resp = APP.call_continuation_with_deadline(
-                                fallback_payload, min(APP.continuation_deadline, remaining - 2))
-                            text = chat_resp.get("choices", [{}])[0].get("message", {}).get("content", "")
-                            is_valid, missing = (
-                                validate_report_output(
-                                    text, mode, envelope,
-                                    evidence_coverage_complete=evidence_coverage_complete)
-                                if text else (False, ["empty_report"])
-                            )
-                            if text and is_valid:
-                                APP.log("context_pack_fallback_ok", fallback_model=fallback_payload["model"], text_len=len(text))
-                                break
-                            APP.log("context_pack_fallback_invalid", fallback_model=fallback_payload["model"], missing=missing, text_len=len(text))
-                            text = ""
-                        except Exception as fallback_error:
-                            APP.log("context_pack_fallback_failed", fallback_model=fallback_payload["model"], error=str(fallback_error))
-                    if not text:
-                        text = build_context_pack_deterministic_report(session, pack, tool_output_text)
-                    emitter = ResponseEmitter(self, new_id("resp"), model_alias, bool(body.get("stream")))
-                    emitter.emit_text_message(text)
-                    emitter.complete()
-                    APP.log("context_pack_degraded_report", text_len=len(text))
+                    if context_decision.log_event:
+                        APP.log(context_decision.log_event, **context_decision.log_fields)
                     return
 
             # Skip managed autonomy if context-pack was attempted
@@ -3870,107 +3146,47 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
         # Finalizer call for reads — no tools, short deadline, compacted output
-        finalizer_model = map_model(APP.continuation_model, APP.model_map)
-        original_task = ""
-        if prev_state:
-            for m in prev_state.messages:
-                if m.get("role") == "user" and m.get("content"):
-                    original_task = str(m["content"])[:500]
-                    break
-
-        finalizer_messages: List[JSON] = []
-        if prev_state:
-            finalizer_messages = list(repair_chat_history(prev_state.messages, tool_outputs))
-            finalizer_messages = merge_new_user_messages(finalizer_messages, [])
-        finalizer_messages.append({
-            "role": "user",
-            "content": (
-                f"Task: {original_task}\n\n"
-                f"Tool executed: {tool_kind} operation\n"
-                f"Tool result:\n{compacted.compacted[:APP.max_tool_output_chars]}"
-            )
-        })
-
-        finalizer_payload = {
-            "model": finalizer_model,
-            "messages": finalizer_messages,
-            "stream": False,  # Non-streaming for finalizer — faster, simpler
-        }
-        if APP.continuation_tools == "none":
-            finalizer_payload["tools"] = []
-            finalizer_payload["tool_choice"] = "none"
-
-        APP.log("continuation_finalizer", model=finalizer_model, deadline=APP.continuation_deadline)
-
         stream = bool(body.get("stream"))
         emitter = ResponseEmitter(self, new_id("resp"), model_alias, stream)
-
-        try:
-            chat_resp = APP.call_continuation_with_deadline(
-                finalizer_payload, APP.continuation_deadline)
-            resp_obj = APP.build_response_object(
-                body, chat_resp, finalizer_messages, model_alias,
-                map_model(model_alias, APP.model_map), reverse_name_map)
+        from codex_oss.legacy_modes import handle_read_finalizer
+        finalizer_decision = handle_read_finalizer(
+            body=body,
+            prev_state_messages=prev_state.messages if prev_state else [],
+            tool_outputs=tool_outputs,
+            tool_kind=tool_kind,
+            compacted_output=compacted.compacted,
+            model_alias=model_alias,
+            reverse_name_map=reverse_name_map,
+            continuation_model=APP.continuation_model,
+            model_map=APP.model_map,
+            continuation_tools=APP.continuation_tools,
+            continuation_deadline=APP.continuation_deadline,
+            continuation_fallbacks=APP.continuation_fallbacks,
+            max_tool_output_chars=APP.max_tool_output_chars,
+            degraded_completion_on_timeout=APP.degraded_completion_on_timeout,
+            log_fn=APP.log,
+            map_model=map_model,
+            repair_chat_history=repair_chat_history,
+            merge_new_user_messages=merge_new_user_messages,
+            extract_handoff_text=_extract_handoff_text,
+            extract_required_deliverables=extract_required_deliverables,
+            validate_report=validate_report,
+            call_continuation_with_deadline=APP.call_continuation_with_deadline,
+            build_response_object=APP.build_response_object,
+            build_degraded_completion=APP.build_degraded_completion,
+        )
+        if finalizer_decision.handled:
             if stream:
-                emitter.start()
-                text = ""
-                for o in resp_obj.get("output", []):
-                    if o.get("type") == "message":
-                        text = o["content"][0]["text"]
-                        break
-                emitter.emit_text_message(text or "Finalizer completed.")
-                emitter.complete()
-                # Validate report quality
-                handoff_text = _extract_handoff_text(finalizer_messages)
-                required = extract_required_deliverables(handoff_text)
-                is_valid, missing = validate_report(text, required)
-                if not is_valid and text:
-                    APP.log("report_invalid", missing=missing, text_len=len(text))
-                elif not is_valid and not text:
-                    APP.log("report_empty")
-            else:
-                emitter._json_response = resp_obj
-                emitter.complete()
-            APP.log("continuation_finalizer_ok")
-        except Exception as e:
-            APP.log("continuation_finalizer_failed", error=str(e))
-
-            # Fallback ladder
-            for fb_model_name in APP.continuation_fallbacks:
-                fb_model = map_model(fb_model_name, APP.model_map)
-                fb_payload = dict(finalizer_payload)
-                fb_payload["model"] = fb_model
-                try:
-                    chat_resp = APP.call_continuation_with_deadline(
-                        fb_payload, APP.continuation_deadline * 0.7)
-                    resp_obj = APP.build_response_object(
-                        body, chat_resp, finalizer_messages, model_alias,
-                        map_model(model_alias, APP.model_map), reverse_name_map)
-                    if stream:
-                        text = ""
-                        for o in resp_obj.get("output", []):
-                            if o.get("type") == "message":
-                                text = o["content"][0]["text"]
-                                break
-                        if not emitter._sse_headers_sent:
-                            emitter.start()
-                        emitter.emit_text_message(text or "Fallback finalizer completed.")
-                    emitter.complete()
-                    APP.log("continuation_fallback_ok", fallback_model=fb_model)
-                    return
-                except Exception:
-                    APP.log("continuation_fallback_failed", model=fb_model)
-
-            # Degraded completion — always return something terminal
-            if APP.degraded_completion_on_timeout:
-                degraded = APP.build_degraded_completion(model_alias, "all finalizers failed", tool_kind)
                 if not emitter._sse_headers_sent:
                     emitter.start()
-                emitter.emit_text_message(degraded["content"][0]["text"])
-                emitter.complete()
-                APP.log("continuation_degraded_complete")
+                emitter.emit_text_message(finalizer_decision.text)
             else:
-                self._send_error_obj(502, f"All continuation finalizers failed for {tool_kind}")
+                emitter._json_response = finalizer_decision.response_obj
+            emitter.complete()
+            if finalizer_decision.log_event:
+                APP.log(finalizer_decision.log_event, **finalizer_decision.log_fields)
+        else:
+            self._send_error_obj(502, f"All continuation finalizers failed for {tool_kind}")
 
     def _handle_fresh_turn(self, body: JSON) -> None:
         """Fallback for when continuation path can't handle the request."""
@@ -4157,14 +3373,24 @@ class Handler(BaseHTTPRequestHandler):
         threading.Thread(target=worker, daemon=True).start()
 
         assembler = ChatStreamAssembler(
-            self,
-            body,
-            base_messages,
-            model_alias,
-            model_upstream,
-            reverse_name_map,
-            response_id,
-            created_at,
+            body=body,
+            base_messages=base_messages,
+            model_alias=model_alias,
+            model_upstream=model_upstream,
+            reverse_name_map=reverse_name_map,
+            response_id=response_id,
+            created_at=created_at,
+            write_sse=self._write_sse,
+            write_progress=lambda note: self._write_in_progress(response_id, model_alias, created_at, body, note),
+            state_put=APP.state.put,
+            stored_response_factory=StoredResponse,
+            build_response_shell=APP.build_response_shell,
+            repair_chat_history=repair_chat_history,
+            extract_budget=_extract_budget,
+            restore_tool_name=restore_tool_name,
+            new_id=new_id,
+            json_dumps=json_dumps,
+            as_text=as_text,
         )
         heartbeat_s = float(os.getenv("SSE_UPSTREAM_HEARTBEAT_SECONDS", "5"))
         actual_model_used = model_upstream
@@ -4576,6 +3802,7 @@ def main() -> None:
         print("warning: binding to a non-localhost host; do not expose this proxy publicly", file=sys.stderr)
 
     httpd = ThreadingHTTPServer((args.host, args.port), Handler)
+    httpd.daemon_threads = False
 
     shutdown_started = threading.Event()
 
@@ -4583,8 +3810,11 @@ def main() -> None:
         if shutdown_started.is_set():
             return
         shutdown_started.set()
+        SHUTDOWN_REQUESTED.set()
         try:
-            sys.stderr.write("shutting down\n")
+            with ACTIVE_REQUESTS_COND:
+                active = ACTIVE_REQUESTS
+            sys.stderr.write(f"shutting down signal={signum} active_requests={active}\n")
             sys.stderr.flush()
         except Exception:
             pass
@@ -4595,6 +3825,15 @@ def main() -> None:
 
     print(f"Responses->Chat proxy listening on http://{args.host}:{args.port}/v1", file=sys.stderr)
     httpd.serve_forever()
+    drain_deadline = time.time() + float(os.getenv("BRIDGE_SHUTDOWN_DRAIN_SECONDS", "180"))
+    with ACTIVE_REQUESTS_COND:
+        while ACTIVE_REQUESTS > 0 and time.time() < drain_deadline:
+            remaining = max(0.1, drain_deadline - time.time())
+            ACTIVE_REQUESTS_COND.wait(timeout=min(1.0, remaining))
+        active = ACTIVE_REQUESTS
+    if active:
+        print(f"shutdown drain expired active_requests={active}", file=sys.stderr)
+    httpd.server_close()
 
 
 if __name__ == "__main__":

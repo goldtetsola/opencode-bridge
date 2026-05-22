@@ -16,6 +16,29 @@ request_max_retries = 2
 stream_max_retries = 2
 stream_idle_timeout_ms = 300000
 
+[model_providers.oss_runtime]
+name = "OSS Agent Runtime"
+base_url = "http://127.0.0.1:4000/v1"
+env_key = "LITELLM_MASTER_KEY"
+wire_api = "responses"
+request_max_retries = 1
+stream_max_retries = 1
+stream_idle_timeout_ms = 1800000
+
+# Optional research lane: direct Codex -> vLLM.
+# Use this to evaluate vLLM's native Responses support, not to bypass MissionV1
+# for serious OSS subagent work. Runtime-backed agents should still use
+# model_provider = "oss_runtime" and mission-a2/mission-a3 aliases.
+#
+# [model_providers.vllm_direct]
+# name = "vLLM Direct"
+# base_url = "http://127.0.0.1:8000/v1"
+# env_key = "VLLM_API_KEY"
+# wire_api = "responses"
+# request_max_retries = 1
+# stream_max_retries = 1
+# stream_idle_timeout_ms = 1800000
+
 # Optional: slim profile for OSS native subagents.
 # Disables MCP/web/apps to avoid sending unsupported tool types.
 [profiles.oss_native]

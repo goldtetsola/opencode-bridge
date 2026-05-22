@@ -1,427 +1,547 @@
 # OpenCode Bridge
 
-Use [OpenCode Go](https://opencode.ai/docs/go/) OSS models (DeepSeek V4 Pro, Kimi K2.6, DeepSeek V4 Flash) as **native [Codex](https://developers.openai.com/codex) subagents** — with full tool-loop support, multi-turn conversation, reasoning preservation, and orchestration routing.
+OpenCode Bridge lets Codex use open-source models as governed subagents. It routes OSS workers through a local Responses-compatible bridge, gives them scoped runtime tools, records what they did, and returns evidence-backed reports for GPT review.
 
-Codex speaks the OpenAI Responses API. OpenCode Go exposes Chat Completions. This bridge sits in the middle, translating between them so Codex can spawn DeepSeek and Kimi workers the same way it spawns GPT workers.
+Use it when you want cheaper or parallel OSS help without handing an OSS model the keys to your repo.
 
-## Critical: Architecture warning
+## What You Get
 
-**Do NOT set `model_provider = "opencode_bridge"` as your top-level Codex provider.** Codex will route GPT-5.5 orchestrator requests through the bridge, which cannot serve GPT models (OpenCode Go rejects them). This causes timeouts on any operation requiring orchestration (reads, writes, multi-turn tool loops).
+- **Runtime-controlled investigations**: OSS agents can read and search only the paths their mission allows.
+- **Evidence-backed reports**: final answers include files inspected, commands run, findings, caveats, and confidence.
+- **Visible progress**: spawned OSS agents stream safe working commentary such as planned actions, tool runs, coverage updates, and closure decisions.
+- **Patch safety rails**: bounded implementation missions validate patches, apply them in an isolated worktree, verify them, and record rollback data.
+- **Auditable artifacts**: every runtime mission writes JSON reports, traces, summaries, ledgers, and decision logs under `.codex-oss/missions/`.
+- **Fail-closed behavior**: missing evidence, invalid reports, blocked paths, contradictions, and provider failures downgrade or escalate instead of pretending success.
 
-**Correct architecture:**
+## Who This Is For
 
-```
-Parent session: GPT-5.5 (native openai provider)
-OSS subagents only: opencode_bridge provider
-```
+OpenCode Bridge is for Codex users who want to delegate bounded work to OSS models while keeping GPT in charge of final judgment.
 
-The bridge is a **subagent-only provider**. Use `model_provider = "opencode_bridge"` in agent TOMLs only. Your `.codex/config.toml` should NOT set a top-level `model_provider` to `opencode_bridge`.
+Good uses:
 
-For direct `codex exec` testing without subagents, use v6 compatibility mode: start the bridge with `GPT_MODEL_STRATEGY=oss` to alias GPT requests to OSS models. This is for bridge testing only — not the recommended production setup.
+- Ask an OSS investigator to inspect a few files and summarize what it found.
+- Run a low-risk repo scout in parallel while GPT continues the main task.
+- Generate or validate a small patch in an isolated worktree.
+- Burn in runtime behavior with deterministic proof packs.
 
-## Quick start
+Avoid it for:
 
-```bash
-# 1. Clone the bridge
-git clone https://github.com/goldtetsola/opencode-bridge.git ~/bridge
+- Authentication, authorization, migrations, recovery paths, CI gates, deployment, or schema authority.
+- Any task where an OSS model's mistake could cause data loss or a security issue.
+- Raw, open-ended "go change the repo" work.
 
-# 2. Set your OpenCode Go key
-echo 'OPENCODE_GO_API_KEY=sk-...' > ~/bridge/.codex-oss/env/opencode-go.env
-
-# 3. cd into your Codex project and install
-cd ~/your-codex-project
-python3 ~/bridge/bin/codex-oss install
-
-# 4. Start the bridge
-OPENCODE_GO_API_KEY=sk-... python3 ~/bridge/bin/codex-oss start --mode production
-
-# 5. Verify everything
-python3 ~/bridge/bin/codex-oss doctor
-# Expected: 24 passed, 0 warnings, 0 failed
-```
-
-That's it. `codex-oss install` generates all config — `.codex/config.toml`, agent TOMLs, `AGENTS.md` routing rules, and recursive-codex-exec blocking. `codex-oss doctor` checks 23 invariants and tells you exactly what to fix.
-
-## What `codex-oss` does
-
-| Command | What it does |
-|---|---|
-| `install` | Generates provider config, 3 agent TOMLs, AGENTS.md delegation contract, recursive-codex blocking rules, runtime directories, and gitignore entries. |
-| `doctor` | Checks 24 invariants: config correctness, agent configuration, AGENTS.md compliance, structured handoff contract, recursive-codex exec blocking, bridge health, daemon supervision, GPT leakage, OSS inference, state DB persistence. PASS/WARN/FAIL with fix instructions. Supports `--json` for automation. |
-| `start` | Launches the bridge with mode selection (`production`/`compat-test`/`openai`). Refuses to start in production mode without a valid key. Sets project-local state paths. |
-| `stop` | Graceful shutdown via PID file or port. |
-| `status` | Queries the bridge health endpoint — shows version, mode, model health, and concurrency config. |
-
-## Architecture
-
-```
-Codex Desktop / CLI
-    │
-    │  Parent session: GPT-5.5 (native openai provider)
-    │  OSS subagents only: opencode_bridge provider
-    │
-    ├─ GPT-5.5 orchestrator (native)
-    │     │
-    │     ├─ GPT-5.4 worker (native)
-    │     └─ OSS subagent spawn
-    │           │
-    │           │  Responses API (SSE streaming, live upstream)
-    │           ▼
-    │     bridge.py   ← this repo
-    │           │
-    │           │  Chat Completions API (stream=true)
-    │           ▼
-    │     api.opencode.ai/zen/go/v1
-    │           │
-    │           ▼
-    │     DeepSeek V4 Pro / Kimi K2.6 / Flash
-```
-
-**Bridge is a subagent-only provider.** Do NOT set `model_provider = "opencode_bridge"` as your session-wide provider. The bridge rejects GPT-5.5 requests (or aliases them to OSS in compatibility mode, which is for testing only).
-
-The bridge handles:
-
-- **Protocol translation**: Responses API ↔ Chat Completions (request format, tool definitions, output items)
-- **SSE streaming with heartbeat**: Sends `response.created` immediately, then heartbeat comments during upstream processing. Prevents Codex timeouts on complex queries with long reasoning.
-- **Tool type filtering**: Strips hosted tools (image_generation, web_search, code_interpreter), MCP namespaces, and app/connector tools that OSS providers reject
-- **Tool format conversion**: Responses flat format → Chat Completions nested `function` wrapper, with name sanitization for strict providers
-- **Reasoning preservation**: DeepSeek V4 Pro requires `reasoning_content` to be replayed across multi-turn tool calls. The proxy stores and injects it correctly
-- **Conversation state**: Tracks response history in SQLite so tool round-trips survive proxy restarts. Matches orphan `function_call_output` items to cached `function_call` items by `call_id`
-- **Context preservation**: Repairs conversation history so earlier completed assistant→tool exchanges are preserved (not truncated), while incomplete tails are dropped
-- **Retry + fallback**: Retries transient upstream errors with exponential backoff. Falls back to alternate models on capacity errors
-- **Developer role mapping**: Maps Codex's `developer` role to `system` for providers that reject it (DeepSeek, Kimi)
-- **GPT model handling** (v6): Detects and rejects GPT-5.5/5.4 requests hitting the bridge by mistake. Configurable via `GPT_MODEL_STRATEGY` — `error` (immediate rejection, default), `oss` (alias to OSS for compatibility testing), or `openai` (API passthrough)
-- **Live upstream streaming** (v5+): Uses `stream=true` against OpenCode Go and translates Chat Completions chunks to Responses SSE deltas in real time
-
-## Environment variables
-
-| Variable | Default | Description |
-|---|---|---|
-| `OPENCODE_GO_API_KEY` | (required) | Your OpenCode Go API key |
-| `PROXY_API_KEY` | `LITELLM_MASTER_KEY` value | Key Codex sends to authenticate with the proxy |
-| `LITELLM_MASTER_KEY` | `sk-local-codex-bridge` | Auth key (shared name for Codex config compatibility). Leave empty for no auth on localhost. |
-| `PROXY_PORT` | `4000` | Port the proxy listens on |
-| `PROXY_STATE_DB` | `/tmp/opencode_responses_proxy_state.sqlite3` | SQLite file for conversation state |
-| `FORCE_SINGLE_TOOL_INSTRUCTIONS` | `0` | Set to `1` to inject a guard discouraging parallel tool calls |
-| `FALLBACK_MODEL_MAP_JSON` | deepseek→kimi/flash fallback | JSON map of model→fallback chain |
-| `UPSTREAM_TIMEOUT_SECONDS` | `240` | Timeout for upstream API calls |
-| `UPSTREAM_RETRIES` | `2` | Number of retries on transient errors |
-| `MODEL_MAP_JSON` | (built-in) | Override model name mapping |
-| `PROXY_LOG_PATH` | (stderr) | Path for structured JSON log output |
-| `SSE_CHUNK_SIZE` | `256` | Characters per SSE text delta chunk |
-| `SSE_UPSTREAM_HEARTBEAT_SECONDS` | `5` | Seconds between heartbeat comments while waiting for upstream |
-| `UPSTREAM_STREAM` | `1` | Use stream=true for upstream Chat Completions (live streaming) |
-| `GPT_MODEL_STRATEGY` | `error` | How to handle GPT-model requests: `error` (reject immediately), `oss` (alias to OSS model for testing), `openai` (passthrough to OpenAI API — requires `OPENAI_API_KEY`) |
-| `GPT_MODEL_OSS_FALLBACK` | `deepseek-v4-pro` | OSS model to use when `GPT_MODEL_STRATEGY=oss` |
-| `OPENAI_API_KEY` | (not set) | Required only for `GPT_MODEL_STRATEGY=openai` |
-| `MAX_GLOBAL_UPSTREAM_CONCURRENCY` | `2` | Cap concurrent upstream requests globally |
-| `MODEL_CONCURRENCY_JSON` | deepseek/kimi 1, flash 2 | Per-model concurrency caps |
-| `CIRCUIT_BREAKER_ERRORS` | `2` | Errors before marking a model degraded |
-| `CIRCUIT_BREAKER_COOLDOWN` | `300` | Seconds before auto-recovering a degraded model |
-| `OSS_MAX_TOOL_TURNS` | `6` | Max tool turns before OSS agent is stopped |
-| `ALLOW_MISSING_OPENCODE_KEY` | `0` | Set to `1` to bypass fatal key check |
-| `OSS_NATIVE_MAX_TOOL_EXCHANGES` | `1` | Max tool calls per OSS subagent turn |
-| `CONTINUATION_TOOLS` | `none` | Tools for continuation turns (`none` = force finalization) |
-| `CONTINUATION_MODEL` | `kimi-k2.6` | Model for read-result finalizer |
-| `CONTINUATION_DEADLINE_SECONDS` | `60` | Deadline for finalizer model calls |
-| `WRITE_RESULT_MODE` | `deterministic` | Write results: `deterministic` = no model call |
-| `MAX_TOOL_OUTPUT_CHARS` | `20000` | Compact tool outputs larger than this |
-| `UPSTREAM_FIRST_BYTE_TIMEOUT_SECONDS` | `30` | Timeout for first byte from upstream |
-| `UPSTREAM_IDLE_TIMEOUT_SECONDS` | `30` | Timeout for upstream idle during processing |
-| `DEGRADED_COMPLETION_ON_TIMEOUT` | `1` | Return degraded report on timeout |
-| `EXPOSE_EMPTY_REASONING_ITEM` | `1` | Include empty reasoning item in output for Codex compatibility |
-| `STRIP_TOOLS` | `0` | Set to `1` to strip ALL tools (force text-only responses) |
-
-## Supported models
-
-| Codex model ID | Upstream model | Best for |
-|---|---|---|
-| `ocg-deepseek-v4-pro` | deepseek-v4-pro | Bounded implementation, debugging, reasoning-heavy analysis |
-| `ocg-kimi-k2.6` | kimi-k2.6 | Fast repo navigation, scouting, review |
-| `ocg-deepseek-v4-flash` | deepseek-v4-flash | Docs, summaries, mechanical low-risk tasks |
-| `ocg-kimi-k2.5` | kimi-k2.5 | (untested) |
-| `ocg-qwen3.6-plus` | qwen3.6-plus | (untested) |
-| `ocg-glm-5.1` | glm-5.1 | (untested) |
-| `ocg-minimax-m2.7` | minimax-m2.7 | (untested) |
-
-Also accepts OpenCode-style `opencode-go/<model>` model IDs.
-
-## Bridge: OSS subagent runtime
-
-OSS agents are bounded transactions with deterministic finalization, managed autonomy, and context-pack mode for prep tasks. The bridge can reject or alias accidental GPT-family traffic according to `GPT_MODEL_STRATEGY`, but correct Codex orchestration still requires OSS agents to be spawned with `fork_turns: "none"` so the child does not inherit the parent GPT model/provider context.
-
-### Execution modes
-
-The bridge selects the right mode based on the task handoff:
-
-- **`invalid_handoff`** — malformed `OSS_HANDOFF_JSON` blocks fail closed before delegated work is trusted.
-- **`no_tool_exact`** — exact output tasks (guardrail tests, control probes). No model decisions needed.
-- **`context_pack_report`** — read/report tasks with explicit `READ-ONLY PATHS` + `DELIVERABLE`. Bridge gathers all files internally, sends one no-tools synthesis call, and validates that the final text includes the requested structured deliverable fields. Command-aware: `grep X in Y` steps get grep output, not full files.
-- **`managed_autonomy`** — discovery tasks where the model chooses what to inspect. Budget-capped, duplicate-suppressed, evidence-ledger-injected.
-- **`bounded_write_exact`** — writes to explicit `OWNED PATHS` only when `exact_content` is present. Bridge writes the file directly, reads it back, and returns PASS only when observed content matches the declared exact content. No model call needed.
-- **`bounded_write_patch`** — model-assisted edits to explicit `OWNED PATHS` when no `exact_content` is present, including `docs_support` tasks. Permission fields define scope; they do not by themselves select exact-write mode.
-
-### Guarantees
-
-- **Exact writes**: Deterministic — bridge writes declared exact content, reads back, and reports PASS only on exact match. No model self-report dependency.
-- **Patch/docs writes**: Scope-bounded — owned paths constrain the edit lane. The bridge checks changed owned paths, rejects no-change or out-of-scope writes, and gives the agent a bounded verification turn before the orchestrator treats the patch as accepted.
-- **Reads/reports**: Context-pack or managed autonomy with deadline control. Grep-directed searches include only grep output instead of full files. Transport success and task success are separate: if synthesis is unavailable or required deliverable fields are missing, the bridge returns `PARTIAL` with evidence and caveats instead of pretending the delegated task passed.
-- **Evidence coverage**: Requested read paths and search terms must be represented in the evidence pack as read, searched, errored, or rejected. A confident report with incomplete evidence coverage is rejected or downgraded to `PARTIAL`.
-- **Verification ledger**: Verification is an observed tool/result, not a prose claim. Reports that request or claim verification are rejected or downgraded unless the bridge observed the verification turn.
-- **Intent rejection**: "I will", "Running...", "Starting..." rejected as non-terminal. Internal retry once, then deterministic report from gathered evidence.
-- **Timeout recovery**: Request-level deadline prevents serial timeout stacking. Deterministic PARTIAL report within deadline instead of client disconnect.
-- **Terminal guarantee**: Every path emits `response.completed` or `response.failed` before closing the SSE stream.
-
-### Structured handoff contract
-
-Prefer a machine-readable block before human prose. The bridge validates this block and uses it instead of guessing from accumulated conversation history:
+## How It Works
 
 ```text
-OSS_HANDOFF_JSON:
-{"schema_version":1,"role":"Read-only repo scout","goal":"Find exact evidence for a blocker","task_type":"scout","owned_paths":[],"read_only_paths":["scripts","docs"],"forbidden_actions":["edit files","print secrets"],"verification_steps":["Search for blocker_name"],"deliverable_fields":["confidence","evidence","caveats"],"completion_rule":"stop after the report","escalation_rule":"stop if a critical path appears"}
+Codex / GPT orchestrator
+  |
+  | spawns a configured OSS subagent
+  v
+OpenCode Bridge on localhost:4000
+  |
+  | validates a MissionV1 contract
+  v
+Mission runtime
+  |
+  | owns tools, paths, evidence, validation, audit, and closure
+  v
+OSS model: Kimi, DeepSeek, or Flash
+  |
+  | returns actions or narrative under runtime control
+  v
+Evidence-backed report for GPT review
 ```
 
-If the JSON is malformed or missing required fields, the bridge returns `FAIL` instead of guessing a mode from prose. You can validate a handoff before spawning an OSS subagent:
+The important split is simple:
+
+- **Runtime owns execution.** It decides which tools may run, checks scope, records evidence, validates reports, and closes safely.
+- **OSS model owns reasoning.** It proposes the next action, explains why it wants that action, and drafts findings.
+- **GPT owns judgment.** Treat OSS output as evidence, not final authority.
+
+## Quick Start
+
+### 1. Clone the Repo
 
 ```bash
-python3 ~/bridge/bin/codex-oss validate-handoff /path/to/handoff.md
+git clone https://github.com/goldtetsola/opencode-bridge.git
+cd opencode-bridge
 ```
 
-### Protocol conformance
+### 2. Add Your OpenCode Go Key
 
-Run the protocol conformance suite before trusting a bridge release:
+Create the local env file:
 
 ```bash
-python3 tests/test_protocol_conformance.py
+mkdir -p .codex-oss/env
+cp opencode-go.env.example .codex-oss/env/opencode-go.env
 ```
 
-It covers malformed structured handoffs, exact-write routing, no-match search evidence, incomplete evidence coverage, bounded patch acceptance, verification claims, verification output failure detection, and scope-boundary checks.
+Edit `.codex-oss/env/opencode-go.env`:
 
-### Runtime environment variables
+```bash
+OPENCODE_GO_API_KEY=sk-...
+```
 
-| Variable | Default | Description |
+Do not commit this file.
+
+### 3. Install the Bridge into a Codex Project
+
+Run this from the bridge repo:
+
+```bash
+bin/codex-oss install --project /path/to/your/codex/project
+```
+
+This adds:
+
+- a local `opencode_bridge` provider block
+- runtime-controlled OSS agent TOMLs
+- raw OSS agent TOMLs for experiments
+- safety rules for subagent handoffs
+
+### 4. Start the Bridge
+
+```bash
+bin/codex-oss up --daemon
+```
+
+The bridge listens on:
+
+```text
+http://127.0.0.1:4000/v1
+```
+
+### 5. Check Your Setup
+
+```bash
+bin/codex-oss doctor --network
+```
+
+For JSON output:
+
+```bash
+bin/codex-oss doctor --network --json
+```
+
+### 6. Check the Current Claim Surface
+
+```bash
+bin/codex-oss claim-status --project . --json
+```
+
+This tells you which runtime claims are currently supported by fresh artifacts.
+
+## The Most Important Rule
+
+Do **not** set `model_provider = "opencode_bridge"` as your top-level Codex provider.
+
+Keep GPT native as the parent session. Only OSS subagent TOMLs should use the bridge provider.
+
+Why: GPT requests must stay with OpenAI. The bridge is for OSS workers and MissionV1 runtime aliases.
+
+## Agents
+
+After installation, your Codex project can use these agents.
+
+### Runtime-Controlled Agents
+
+Use these for normal work.
+
+| Agent | Model alias | Best for |
 |---|---|---|
-| `OSS_NATIVE_MAX_TOOL_EXCHANGES` | `1` | Max tool calls per OSS subagent turn |
-| `CONTINUATION_TOOLS` | `none` | Tools for continuation turns (`none` = no tools) |
-| `CONTINUATION_MODEL` | `kimi-k2.6` | Model for read finalizer |
-| `CONTINUATION_FALLBACK_MODELS` | `deepseek-v4-flash` | Fallback finalizer models |
-| `CONTINUATION_DEADLINE_SECONDS` | `60` | Deadline for finalizer calls |
-| `WRITE_RESULT_MODE` | `deterministic` | Write handling: `deterministic` = no model call |
-| `MAX_TOOL_OUTPUT_CHARS` | `20000` | Compact outputs larger than this |
-| `FORCE_SINGLE_TOOL_INSTRUCTIONS` | `1` | Enforce single-tool-per-turn (prevents parallel-call repair failures) |
-| `DEGRADED_COMPLETION_ON_TIMEOUT` | `1` | Return degraded report on timeout |
-| `REQUEST_DEADLINE_SECONDS` | `90` | Hard deadline for entire request |
-| `CONTEXT_PACK_MAX_CHARS` | `24000` | Max chars in context-pack source bundle |
-| `GPT_MODEL_STRATEGY` | `error` | GPT handling: `error` (reject top-level misuse, auto-alias subagent forks), `oss` (alias all), `openai` (passthrough) |
+| `oss_kimi_investigator` | `mission-a3-kimi` | General read-only investigations |
+| `oss_deepseek_investigator` | `mission-a3-deepseek` | Deeper read-only investigations |
+| `oss_flash_context` | `mission-a2-flash` | Cheap context gathering and lookups |
 
-## Model-task matrix
+Runtime-controlled agents require a MissionV1 handoff:
 
-| Model | Best for | Real example | Rate limit |
-|---|---|---|---|
-| DeepSeek V4 Flash | Docs, summaries, mechanical edits, test inventories | "Write a changelog entry for the last 3 commits" | 31K req/5hr |
-| DeepSeek V4 Pro | Bounded implementation, debugging, feature work | "Add a test for the validateToken function following existing patterns" | 3.4K req/5hr |
-| Kimi K2.6 | Repo exploration, scouting, code review, fast navigation | "Find every place that calls formatName and summarize the call patterns" | 1.1K req/5hr |
-| GPT-5.4 | Implementation where blast radius matters, cross-module changes | "Refactor the publish-bundle hydration to use the new artifact reader" | Usage-based |
-| GPT-5.5 | Architecture, final review, critical paths | "Review this recovery path change for safety" | Usage-based |
-
-## Orchestration
-
-### How routing works
-
-Codex's orchestrator (GPT-5.5) reads `AGENTS.md` and agent `description` fields from `.codex/agents/` to decide which worker handles each task:
-
-```
-You: "Find all callers of formatName"
-         │
-         ▼
-   GPT-5.5 reads AGENTS.md routing rules
-         │
-         │  Safety check: auth? No
-         │  Task type: exploration → Kimi
-         │
-         ▼
-   GPT-5.5 spawns oss_kimi_rapid (fork_turns: "none")
-         │  Handoff: task scope, allowed paths, output format
-         ▼
-   Kimi returns file paths + line numbers + confidence
-         │
-         ▼
-   GPT-5.5 synthesizes result. Done.
+```text
+<OSS_HANDOFF_JSON>
+{ ... MissionV1 JSON ... }
+</OSS_HANDOFF_JSON>
 ```
 
-### Safety boundaries
+Use `fork_turns: "none"` or the equivalent "do not fork context" option when spawning OSS agents. Full-history forks can inherit GPT settings that conflict with OSS model routing.
 
-OSS agents have explicit "DO NOT USE FOR" descriptions and developer instructions that prevent them from touching critical paths. If the orchestrator routes an auth/schema/recovery task to an OSS agent, the agent should refuse.
+### Raw OSS Agents
 
-Critical paths that must stay on GPT-5.5/5.4:
-- Authentication, authorization, session management
-- Recovery paths, error recovery, state repair
-- Schema authority, database migrations
-- CI gates, build pipelines, deployment
-- Cross-module invariants (>2 modules affected)
-- Any path where failure = data loss or security breach
+These are useful for experiments and low-stakes support work, but they do not get the full MissionV1 runtime control plane.
 
-### Fork mode
+| Agent | Model |
+|---|---|
+| `oss_kimi_rapid` | `ocg-kimi-k2.6` |
+| `oss_deepseek_pro` | `ocg-deepseek-v4-pro` |
+| `oss_flash_support` | `ocg-deepseek-v4-flash` |
 
-OSS subagents must be spawned with `fork_turns: "none"`. Full-history forks inherit the parent GPT-5.5 model and reasoning effort, which conflicts with the model/provider overrides OSS agents need. This is a known Codex limitation ([issue #20077](https://github.com/openai/codex/issues/20077)).
+For serious read-only investigations, prefer the runtime-controlled agents.
 
-The AGENTS.md handoff template includes this requirement. See `orchestration/ROUTING.md` for details.
+## Mission Lanes
 
-### Orchestration files
+| Lane | What it does | Current use |
+|---|---|---|
+| A2 | Fast deterministic lookup and extraction | Use today |
+| A3 | Managed read-only investigation | Use today |
+| A3-open | Ambiguous investigation with evidence obligations | Use today, monitored |
+| A4 | Patch proposal without workspace apply | Use for low-risk patches |
+| A5 | Isolated implementation and verification | Use for bounded low-risk work |
+| A6 | Critical-path simulation | Proof/simulation only |
+| Raw OSS | Prompt-only worker behavior | Research lane |
+
+## A Minimal MissionV1 Example
+
+Use this shape when asking a runtime-controlled investigator to inspect a file:
+
+```text
+<OSS_HANDOFF_JSON>
+{
+  "schema_version": "oss_agent_mission.v1",
+  "mission_id": "mission_find_runtime_streaming",
+  "tier": "A3",
+  "mode": "managed_investigation",
+  "objective": "Inspect bridge.py and report where managed runtime streaming starts.",
+  "risk_tier": "low",
+  "write_allowed": false,
+  "allowed_roots": [],
+  "allowed_paths": ["bridge.py"],
+  "tool_budget": 3,
+  "time_budget_seconds": 60,
+  "allowed_tool_classes": ["read", "search"],
+  "stop_conditions": ["valid_report", "budget_exhausted", "deadline_reached"],
+  "report_schema": "managed_investigation_report.v1",
+  "required_outputs": [
+    "files_inspected",
+    "commands_run",
+    "findings",
+    "uncertainties",
+    "confidence",
+    "caveats",
+    "escalation_recommendation"
+  ]
+}
+</OSS_HANDOFF_JSON>
+```
+
+For reusable handoffs, validate before sending:
+
+```bash
+bin/codex-oss validate-handoff path/to/handoff.md
+```
+
+## Visible Progress
+
+Runtime-backed OSS agents now stream public progress commentary. This is not hidden chain-of-thought. It is safe working narration generated from runtime state and model-declared action rationale.
+
+You should see updates like:
+
+```text
+I'm loading the compiled MissionV1 contract.
+I'm asking the OSS model for the next safe investigation action.
+The model chose rtk_read on bridge.py as the next investigation step.
+I'm running rtk_read on bridge.py.
+I finished rtk_read; exit_code=0. The runtime refreshed coverage from the new evidence.
+Current phase is REPORT. Evidence refs now available: file:bridge.py#extract:1, command:0.
+```
+
+The runtime does **not** stream:
+
+- raw hidden chain-of-thought
+- provider `reasoning_content`
+- full file contents
+- long command output
+- secrets or tokens
+- system/developer prompts
+
+If the UI does not show progress, inspect the artifact:
+
+```bash
+bin/codex-oss show-trace MISSION_ID
+bin/codex-oss show-summary MISSION_ID
+```
+
+## Mission Artifacts
+
+Each runtime mission writes artifacts under:
+
+```text
+.codex-oss/missions/<mission_id>/
+```
+
+Common files:
 
 | File | Purpose |
 |---|---|
-| `orchestration/AGENTS.md` | Routing rules for GPT-5.5. Merge into your project's AGENTS.md. |
-| `orchestration/ROUTING.md` | Reference: decision flowchart, capability matrix, handoff examples, troubleshooting. |
-| `orchestration/agents/*.toml` | Recommended agent TOMLs with explicit routing descriptions and safety boundaries. |
+| `report.json` | Final structured report |
+| `summary.md` | Human-readable mission summary |
+| `visible_commentary.jsonl` | User-facing progress events |
+| `trace.jsonl` | Runtime action trace |
+| `decision_trace.json` | Policy and closure decisions |
+| `ledger.json` | Files inspected, commands run, budget, redaction state |
+| `claim_graph.json` | Investigation claim/evidence state |
+| `answer_graph.json` | Open-investigation obligation state, when applicable |
+| `implementation_report.json` | Patch/apply/verify result for A4/A5 |
+| `semantic_review.json` | Patch review result for implementation missions |
 
-## Agent TOMLs
-
-Three pre-built agent files are provided in `orchestration/agents/` (recommended) and `agents/` (minimal):
-
-| Agent TOML | Model | Reasoning | Sandbox | Use case |
-|---|---|---|---|---|
-| `oss-deepseek-pro.toml` | deepseek-v4-pro | high | workspace-write | Bounded impl, debugging, analysis |
-| `oss-kimi-rapid.toml` | kimi-k2.6 | medium | read-only | Repo navigation, scouting, review |
-| `oss-flash-support.toml` | deepseek-v4-flash | medium | read-only | Docs, summaries, changelog, mechanical |
-
-### Creating your own agent
-
-You can create agents for any model OpenCode Go supports:
-
-1. **Pick a model ID**. Run `curl https://opencode.ai/zen/go/v1/models -H "Authorization: Bearer $OPENCODE_GO_API_KEY"` to see the full catalog. Use the model name with an `ocg-` prefix (e.g. `qwen3.6-plus` → `ocg-qwen3.6-plus`).
-
-2. **Create a `.toml` file** in your project's `.codex/agents/`:
-
-```toml
-name = "oss_my_worker"
-description = "What this agent does. USE ME WHEN: <criteria>. DO NOT USE FOR: <boundaries>."
-
-model_provider = "opencode_bridge"       # always this
-model = "ocg-<model-id>"                 # e.g. ocg-qwen3.6-plus
-model_reasoning_effort = "high"          # high / medium / low
-sandbox_mode = "workspace-write"         # or "read-only"
-
-developer_instructions = """
-Your instructions. Rules, scope, output format, escalation criteria.
-Include: confidence marker (HIGH/MEDIUM/LOW), files inspected, caveats.
-"""
-```
-
-3. **Set the right reasoning effort**:
-
-| Effort | When to use | Example models |
-|---|---|---|
-| `high` | Implementation, debugging, analysis | deepseek-v4-pro |
-| `medium` | Navigation, docs, summaries, mechanical | kimi-k2.6, deepseek-v4-flash |
-| `low` | Trivial text generation | Any fast model |
-
-4. **Choose the right sandbox mode**:
-
-| Mode | Permissions | Best for |
-|---|---|---|
-| `workspace-write` | Read and edit project files | Implementation, debugging, refactoring |
-| `read-only` | Read files, run safe commands | Exploration, review, docs, analysis |
-
-5. **Write good descriptions**. The `description` field is Codex's routing signal. Include both "use me when" AND "do NOT use for" criteria. Example:
-
-```
-"Bounded implementation worker. USE ME WHEN: single file change, tests exist, requirements clear. DO NOT USE FOR: auth, schema, recovery, cross-module changes."
-```
-
-6. **Register in AGENTS.md**. Add your agent to the routing rules so the orchestrator knows when to delegate to it.
-
-7. **Use `fork_turns: "none"`**. OSS agents use different models/providers than GPT-5.5, so they must not inherit the parent session via full-history fork.
-
-### Tested models
-
-| Agent | Model | Reasoning | Sandbox | Status |
-|---|---|---|---|---|
-| `oss-deepseek-pro.toml` | deepseek-v4-pro | high | workspace-write | Working |
-| `oss-kimi-rapid.toml` | kimi-k2.6 | medium | read-only | Working |
-| `oss-flash-support.toml` | deepseek-v4-flash | medium | read-only | Working |
-| `oss-qwen3.6-plus` (custom) | qwen3.6-plus | — | — | Untested |
-| `oss-glm-5.1` (custom) | glm-5.1 | — | — | Untested |
-| `oss-minimax-m2.7` (custom) | minimax-m2.7 | — | — | Untested |
-
-Untested models may need adjustments — some providers are stricter about tool schemas (shape failures) or message format requirements (relational failures). The bridge strips unsupported tool types and maps `developer` → `system`, but provider-specific quirks may still surface. If you test an untested model, open an issue with your findings.
-
-## External OSS workers (fallback)
-
-The `bin/` directory includes four wrapper scripts for running OSS models as external workers (via `opencode run` directly, without the proxy):
-
-| Script | Default model | Purpose |
-|---|---|---|
-| `oss-scout` | kimi-k2.6 | Read-only repo exploration, file mapping, summaries |
-| `oss-review` | kimi-k2.6 | First-pass review, missing-test detection |
-| `oss-docs` | deepseek-v4-flash | Docs, changelog, low-stakes text |
-| `oss-patch` | deepseek-v4-pro | Isolated patch drafts in separate worktree |
-
-Use these when the proxy is down, rate-limited, or you need an isolated worktree for write tasks.
-
-## Model routing lanes
-
-```
-Lane A — GPT-5.5
-  Orchestration, architecture, final acceptance, critical review
-
-Lane B — GPT-5.4
-  Trusted bounded implementation and review
-
-Lane C — GPT-5.4-mini
-  Cheap read-heavy exploration and support
-
-Lane D — OSS native subagents (through this bridge)
-  oss-deepseek-pro: bounded implementation, debugging, analysis
-  oss-kimi-rapid: repo navigation, scouting, review
-  oss-flash-support: docs, summaries, mechanical
-
-Lane E — OSS external workers (fallback)
-  Direct opencode run when proxy is unavailable
-```
-
-## Limitations
-
-- **Not production-grade**: This is a local development tool. It uses a single-threaded Python HTTP server (though concurrent via ThreadingHTTPServer) and no authentication beyond a shared key (configurable; disable entirely for localhost).
-- **Single machine only**: Bind to localhost. Do not expose publicly.
-- **Subagent-only provider**: The bridge is NOT a session-wide Codex provider. GPT-5.5 must remain native. Only OSS agents in `.codex/agents/` should route through the bridge.
-- **DeepSeek thinking mode costs tokens**: DeepSeek V4 Pro's reasoning_content is preserved internally but counts against your OpenCode Go usage. Expect ~300-400K tokens for multi-turn coding tasks.
-- **True upstream streaming** (v5+): The bridge uses `stream=true` against OpenCode Go and translates chunks live. This reduces latency compared to v3's fake SSE but depends on OpenCode Go's streaming behavior.
-- **Subagent spawning**: OSS agents must use `fork_turns: "none"` (full-history forks conflict with model/provider overrides). The orchestrator needs to include explicit task context in handoffs since the child doesn't inherit parent conversation history.
-
-## Self-test
+Audit a mission:
 
 ```bash
-python3 bridge.py --self-test
+bin/codex-oss audit-mission MISSION_ID --project . --json
 ```
 
-Expected output:
+Explain why a mission ended the way it did:
 
+```bash
+bin/codex-oss explain MISSION_ID --project . --json
 ```
-self-test passed
+
+## Safety Model
+
+The runtime blocks or downgrades work when evidence is weak.
+
+For investigations:
+
+- allowed paths and roots are enforced
+- secrets are redacted before returning observations to the model
+- critical paths are blocked unless explicitly allowed
+- missing required sources block `COMPLETE`
+- unsupported tool arguments are rejected or repaired
+- duplicate reads are suppressed or served from cached evidence
+- contradictions and blocked sources escalate to GPT review
+- hollow `COMPLETE` reports are repaired or downgraded
+
+For implementation:
+
+- patches are validated before apply
+- raw model diffs are not trusted blindly
+- PatchRecipe and PatchIntent can be turned into runtime-built diffs
+- `git apply --check` runs before apply
+- secret scans and semantic review run before apply
+- A5 applies in an isolated worktree by default
+- verification commands must be allowlisted
+- rollback artifacts are recorded
+
+## CLI Reference
+
+### Setup and Health
+
+```bash
+bin/codex-oss install --project PATH
+bin/codex-oss up --daemon
+bin/codex-oss start --port 4000
+bin/codex-oss stop
+bin/codex-oss restart --port 4000
+bin/codex-oss status
+bin/codex-oss doctor --network
 ```
+
+### Missions and Artifacts
+
+```bash
+bin/codex-oss mission template --tier A3
+bin/codex-oss mission compile --help
+bin/codex-oss mission run --project .
+bin/codex-oss validate-handoff path/to/handoff.md
+bin/codex-oss show-trace MISSION_ID
+bin/codex-oss show-summary MISSION_ID
+bin/codex-oss audit-mission MISSION_ID --project . --json
+bin/codex-oss explain MISSION_ID --project . --json
+```
+
+### Proof and Certification
+
+```bash
+bin/codex-oss claim-status --project . --json
+bin/codex-oss refresh-proofs --project . --suite all --json
+bin/codex-oss burnin --project . --suite operational --json
+bin/codex-oss certify --project . --target open_investigation --json
+```
+
+### Raw Research Lane
+
+```bash
+bin/codex-oss raw-probe --help
+bin/codex-oss raw-claim-status --project . --json
+```
+
+## Environment Variables
+
+| Variable | Purpose | Default |
+|---|---|---|
+| `OPENCODE_GO_API_KEY` | OpenCode Go API key for upstream OSS models | Required |
+| `PROXY_PORT` | Local bridge port | `4000` |
+| `PROXY_API_KEY` | Local auth key expected by the bridge | `sk-local-codex-bridge` |
+| `GPT_MODEL_STRATEGY` | What to do if a GPT request hits the bridge | `error` |
+| `MODEL_MAP_JSON` | Override bridge model mapping | built-in map |
+| `FALLBACK_MODEL_MAP_JSON` | Override fallback chains | built-in chains |
+| `UPSTREAM_STREAM` | Use upstream streaming where supported | `1` |
+| `OSS_VISIBLE_TRACE` | Visible commentary mode: `off`, `summary`, `detailed` | `summary` |
+| `OSS_VISIBLE_TRACE_STREAM` | Stream visible commentary to Codex | `1` |
+| `OSS_VISIBLE_TRACE_MAX_EVENTS` | Max visible commentary events per mission | `40` |
+| `REQUEST_DEADLINE_SECONDS` | Default request deadline | `90` |
+| `MAX_GLOBAL_UPSTREAM_CONCURRENCY` | Global upstream request cap | `5` |
+| `MODEL_CONCURRENCY_JSON` | Per-model concurrency caps | built-in defaults |
+
+## Local Development
+
+This is a Python project with no required package install for the core test suite.
+
+Run core tests:
+
+```bash
+python3 tests/test_runtime_contracts.py
+python3 tests/test_burnin_harness.py
+python3 tests/test_patch_pipeline.py
+python3 tests/test_mission_cli.py
+```
+
+Run the bridge in the foreground:
+
+```bash
+bin/codex-oss up
+```
+
+Run the bridge as a daemon:
+
+```bash
+bin/codex-oss up --daemon
+```
+
+Restart after code changes:
+
+```bash
+bin/codex-oss restart --port 4000
+```
+
+Verify the running process matches the source on disk:
+
+```bash
+bin/codex-oss doctor --network --json
+```
+
+## Project Structure
+
+```text
+agents/                 Codex agent TOMLs for runtime and raw OSS workers
+bin/codex-oss           Main CLI entry point
+bridge.py               Responses-compatible bridge server
+codex_oss/              Runtime, policy, mission, audit, and implementation code
+docs/                   Runtime spec, continuity log, raw-lane notes
+examples/               Example inputs and handoffs
+orchestration/          Supporting orchestration files
+tests/                  Runtime, bridge, mission, and burn-in tests
+config.toml.example     Provider config to merge into Codex config
+opencode-go.env.example API key env template
+```
+
+Key modules:
+
+| Module | Role |
+|---|---|
+| `codex_oss/managed_bridge.py` | Turns Responses requests into MissionV1 runtime runs |
+| `codex_oss/runtime/loop.py` | A2/A3 plan-act-observe loop and visible commentary |
+| `codex_oss/answer_graph.py` | Open-investigation obligations and sufficiency |
+| `codex_oss/implementation.py` | A4/A5 patch proposal, validation, apply, verify |
+| `codex_oss/visible_commentary.py` | Safe user-facing progress events |
+| `codex_oss/audit.py` | Mission artifact checks |
+| `codex_oss/transport/emitter.py` | Responses JSON/SSE output |
 
 ## Troubleshooting
 
-**First step for any issue:** run `codex-oss doctor`. It checks 24 invariants and tells you exactly what to fix.
+### Bridge is not running
 
-Common issues the doctor catches:
-
-| Problem | Doctor check | What it means |
-|---|---|---|
-| GPT requests timing out | `bridge.gpt_rejection` FAIL | Bridge set as session-wide provider. Remove `model_provider = "opencode_bridge"` from config. |
-| OSS agents can't spawn | `agents.*.provider` FAIL | Agent TOML missing `model_provider = "opencode_bridge"`. Run `codex-oss install --force`. |
-| Bridge won't start | Fatal at launch | `OPENCODE_GO_API_KEY` not set in production mode. Set key or `ALLOW_MISSING_OPENCODE_KEY=1`. |
-| State lost after reboot | `bridge.state_db` WARN | State DB in `/tmp`. `codex-oss start` now uses `.codex-oss/state/` by default. |
-| Recursive codex exec | `rules.recursive_block` WARN | No blocking rule installed. Run `codex-oss install`. |
-| Full-history fork error | `agreements.fork_turns` WARN | AGENTS.md doesn't specify `fork_turns: none`. Run `codex-oss install`. |
-
-For advanced debugging, use the JSON output:
+Run:
 
 ```bash
-codex-oss doctor --json
+bin/codex-oss up --daemon
+bin/codex-oss doctor --network
+```
+
+### Bridge is running stale code
+
+Restart it:
+
+```bash
+bin/codex-oss restart --port 4000
+```
+
+Then confirm:
+
+```bash
+bin/codex-oss doctor --network --json
+```
+
+Look for:
+
+```text
+bridge.source_hash: PASS
+runtime.identity: PASS
+```
+
+### Runtime agent says MissionV1 is missing
+
+Runtime-controlled agents need exactly one tagged block:
+
+```text
+<OSS_HANDOFF_JSON>
+{ "schema_version": "oss_agent_mission.v1", ... }
+</OSS_HANDOFF_JSON>
+```
+
+The older lightweight `OSS_HANDOFF_JSON:` handoff is for raw/legacy delegation, not MissionV1 runtime agents.
+
+### Codex routes GPT through the bridge
+
+Remove any session-wide setting like:
+
+```toml
+model_provider = "opencode_bridge"
+```
+
+Use the bridge provider only inside OSS agent TOMLs.
+
+### No live commentary appears
+
+First check the artifact:
+
+```bash
+bin/codex-oss show-trace MISSION_ID
+```
+
+Then check streaming config:
+
+```bash
+echo "$OSS_VISIBLE_TRACE"
+echo "$OSS_VISIBLE_TRACE_STREAM"
+```
+
+Expected defaults:
+
+```text
+OSS_VISIBLE_TRACE=summary
+OSS_VISIBLE_TRACE_STREAM=1
+```
+
+### Provider auth fails
+
+Check the key file:
+
+```bash
+sed -n '1,20p' .codex-oss/env/opencode-go.env
+```
+
+Do not paste the key into issues, logs, or chat. Redact it before sharing output.
+
+## Current Status
+
+The runtime-backed path is the supported product path for bounded OSS delegation. Raw OSS editing remains a research lane.
+
+Use `claim-status`, `audit-mission`, and `doctor` when you need proof rather than vibes:
+
+```bash
+bin/codex-oss claim-status --project . --json
+bin/codex-oss audit-mission MISSION_ID --project . --json
+bin/codex-oss doctor --network --json
 ```
 
 ## License
 
-Apache 2.0 — see LICENSE file.
+See [LICENSE](LICENSE).
