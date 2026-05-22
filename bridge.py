@@ -2755,7 +2755,22 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
             # ── v1 spec: A2/A3 managed investigation via runtime loop ──
-            from codex_oss.managed_bridge import run_managed_mission_from_body
+            from codex_oss.managed_bridge import run_managed_mission_from_body, should_handle_managed_mission_body
+            managed_emitter = None
+            commentary_callback = None
+            visible_stream_enabled = os.getenv("OSS_VISIBLE_TRACE_STREAM", "1") != "0"
+            if body.get("stream") and visible_stream_enabled and should_handle_managed_mission_body(body, raw_model_alias):
+                managed_emitter = ResponseEmitter(self, new_id("resp"), raw_model_alias, True)
+                managed_emitter.start()
+
+                def commentary_callback(event):
+                    if not isinstance(event, dict) or event.get("safe_for_user") is not True:
+                        return
+                    text = str(event.get("message") or "").strip()
+                    if not text:
+                        return
+                    managed_emitter.emit_commentary_message(text)
+
             managed = run_managed_mission_from_body(
                 body=body,
                 raw_model_alias=raw_model_alias,
@@ -2763,11 +2778,12 @@ class Handler(BaseHTTPRequestHandler):
                 call_payload_fn=APP.call_continuation_with_deadline,
                 map_model_fn=lambda model: map_model(model, APP.model_map),
                 request_deadline=float(os.getenv("REQUEST_DEADLINE_SECONDS", "90")),
+                commentary_callback=commentary_callback,
             )
             if managed.handled:
-                emitter = ResponseEmitter(self, new_id("resp"), raw_model_alias, bool(body.get("stream")))
+                emitter = managed_emitter or ResponseEmitter(self, new_id("resp"), raw_model_alias, bool(body.get("stream")))
                 try:
-                    emitter.emit_text_message(managed.report_text)
+                    emitter.emit_text_message(managed.report_text, phase="final_answer")
                     emitter.complete()
                 except (BrokenPipeError, ConnectionResetError, OSError) as e:
                     APP.log(
@@ -2777,6 +2793,14 @@ class Handler(BaseHTTPRequestHandler):
                         error=str(e),
                     )
                     self.close_connection = True
+                return
+            if managed_emitter is not None:
+                APP.log("managed_runtime_predicate_miss", model_alias=raw_model_alias)
+                managed_emitter.emit_text_message(
+                    "The managed runtime stream could not route this mission. Start a fresh OSS subagent task with a valid MissionV1 handoff.",
+                    phase="final_answer",
+                )
+                managed_emitter.complete()
                 return
 
             # ── v8: Check for continuation BEFORE prepare_chat_payload ──

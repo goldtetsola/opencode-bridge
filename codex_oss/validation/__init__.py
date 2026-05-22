@@ -334,6 +334,8 @@ def render_report(report: dict) -> str:
     caveats = report.get("caveats", [])
     escalation = report.get("escalation_recommendation", "")
     missing = report.get("missing_fields", [])
+    visible_commentary_path = report.get("visible_commentary_path", "")
+    summary_path = report.get("summary_path", "")
 
     parts = [
         "OSS_REPORT_BEGIN",
@@ -384,6 +386,13 @@ def render_report(report: dict) -> str:
         parts.append("Caveats:")
         for c in caveats:
             parts.append(f"- {c}")
+
+    if visible_commentary_path or summary_path:
+        parts.append("Visible work:")
+        if visible_commentary_path:
+            parts.append(f"- Trace: {visible_commentary_path}")
+        if summary_path:
+            parts.append(f"- Summary: {summary_path}")
 
     if escalation:
         parts.append(f"Escalation:\n{escalation}")

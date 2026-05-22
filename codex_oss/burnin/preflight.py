@@ -21,6 +21,7 @@ class PreflightResult:
     warnings: list[str] = field(default_factory=list)
     runtime_identity: JSON = field(default_factory=dict)
     required_aliases: dict[str, bool] = field(default_factory=dict)
+    model_inference: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> JSON:
         return {
@@ -29,6 +30,7 @@ class PreflightResult:
             "warnings": self.warnings,
             "runtime_identity": self.runtime_identity,
             "required_aliases": self.required_aliases,
+            "model_inference": self.model_inference,
         }
 
 
@@ -85,6 +87,14 @@ def run_burnin_preflight(
             result.required_aliases[alias] = False
             result.failures.append(f"Required model alias {alias} not found")
 
+    if not os.getenv("OSS_BURNIN_SKIP_LIVE_MODEL_PREFLIGHT"):
+        ok, message = _check_live_model_inference(bridge_url, auth)
+        result.model_inference = {"ok": ok, "message": message}
+        if not ok:
+            result.failures.append(f"Live OSS model inference failed: {message}")
+    else:
+        result.warnings.append("Skipped live OSS model inference preflight")
+
     result.ok = not result.failures
     return result
 
@@ -134,3 +144,26 @@ def _fetch_health(bridge_url: str, auth: str) -> JSON | None:
             return json.loads(resp.read().decode())
     except Exception:
         return None
+
+
+def _check_live_model_inference(bridge_url: str, auth: str) -> tuple[bool, str]:
+    bearer = auth or os.getenv("LITELLM_MASTER_KEY", "sk-local-codex-bridge")
+    api_url = bridge_url.rstrip("/") + "/v1/responses"
+    payload = {
+        "model": "ocg-kimi-k2.6",
+        "input": [{"role": "user", "content": "Say OK"}],
+        "stream": False,
+    }
+    try:
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(api_url, data=data, method="POST")
+        req.add_header("Authorization", f"Bearer {bearer}")
+        req.add_header("Content-Type", "application/json")
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+        status = str(body.get("status", "") or "")
+        if status == "completed":
+            return True, "OSS model inference works"
+        return False, f"unexpected status {status or 'unknown'}"
+    except Exception as exc:
+        return False, str(exc)

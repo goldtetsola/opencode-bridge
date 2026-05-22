@@ -45,6 +45,39 @@ class ModelAction:
         return self.action_type == "final_report" and self.report is not None
 
 
+def _tool_target_text(tool_name: str, arguments: Any) -> str:
+    if not isinstance(arguments, dict):
+        return tool_name or "tool"
+    path = str(arguments.get("path", "") or "")
+    pattern = str(arguments.get("pattern", "") or "")
+    if path and pattern:
+        return f"{tool_name} on {path} for `{pattern}`"
+    if path:
+        return f"{tool_name} on {path}"
+    return tool_name or "tool"
+
+
+def _model_action_commentary(action: ModelAction) -> str:
+    target = _tool_target_text(action.tool_name, action.arguments)
+    message = f"The model chose {target} as the next investigation step."
+    reason = str(getattr(action, "reason", "") or "").strip()
+    hypothesis = str(getattr(action, "hypothesis", "") or "").strip()
+    expected = str(getattr(action, "expected_information_gain", "") or "").strip()
+    why_not = str(getattr(action, "why_not_report_yet", "") or "").strip()
+    details = []
+    if reason:
+        details.append(f"Reason: {reason}")
+    if hypothesis:
+        details.append(f"Hypothesis: {hypothesis}")
+    if expected:
+        details.append(f"Expected gain: {expected}")
+    if why_not:
+        details.append(f"Not reporting yet: {why_not}")
+    if details:
+        message += " " + " ".join(details)
+    return message
+
+
 def parse_action(text: str, strict: bool = True) -> Optional[ModelAction]:
     """Parse a model response into EXACTLY ONE action.
 
@@ -233,6 +266,16 @@ def run_loop(mission: Any, ledger: Any, call_model_fn, tools, emitter,
             initial_phase,
             "initial mission phase established",
         )
+        if commentary is not None:
+            mode = str(getattr(mission, "evidence_collection_mode", "prefetch_floor") or "prefetch_floor")
+            required_count = len(list((initial_answer_graph.get("evidence_agenda", {}) or {}).get("items", []) or []))
+            style = str(getattr(mission, "objective_style", "") or "")
+            commentary.emit(
+                "mission_started", "Mission accepted",
+                f"I'm loading the compiled MissionV1 contract{f' ({required_count} required source(s))' if required_count else ''}.",
+                phase="PLAN", source="runtime", model=str(getattr(mission, "runtime_model_alias", "") or ""),
+                metadata={"mode": mode, "objective_style": style, "required_sources": required_count},
+            )
         if str(getattr(mission, "objective_style", "") or "") == "open_investigation" and str(getattr(mission, "evidence_collection_mode", "prefetch_floor") or "prefetch_floor") == "prefetch_floor":
             initial_answer_graph = _runtime_prefetch_required_sources(
                 mission,
@@ -240,6 +283,7 @@ def run_loop(mission: Any, ledger: Any, call_model_fn, tools, emitter,
                 initial_answer_graph,
                 allowed_tool_names,
                 deadline,
+                commentary=commentary,
             )
         _record_phase_transition(
             mission,
@@ -248,17 +292,6 @@ def run_loop(mission: Any, ledger: Any, call_model_fn, tools, emitter,
             "phase recomputed after runtime prefetch",
         )
         context = _build_context(mission, ledger, allowed_tool_names)
-
-        if commentary is not None:
-            mode = str(getattr(mission, "evidence_collection_mode", "prefetch_floor") or "prefetch_floor")
-            required_count = len(list(getattr(mission, "must_inspect", []) or []))
-            style = str(getattr(mission, "objective_style", "") or "")
-            commentary.emit(
-                "mission_started", "Mission accepted",
-                f"I'm loading the compiled MissionV1 contract{f' ({required_count} required source(s))' if required_count else ''}.",
-                phase="PLAN", source="runtime", model=str(getattr(mission, "runtime_model_alias", "") or ""),
-                metadata={"mode": mode, "objective_style": style, "required_sources": required_count},
-            )
 
         while True:
             elapsed = _time.time() - start
@@ -324,9 +357,28 @@ def run_loop(mission: Any, ledger: Any, call_model_fn, tools, emitter,
                         skeleton_findings_count=len(list(skeleton.get("required_findings", []) or [])),
                     )
             try:
+                if commentary is not None:
+                    commentary.emit(
+                        "model_action_requested",
+                        "Requesting next action",
+                        "I'm asking the OSS model for the next safe investigation action.",
+                        phase=_mission_phase(ledger),
+                        source="runtime",
+                        model=str(getattr(mission, "last_reasoning_model", "") or getattr(mission, "runtime_model_alias", "") or ""),
+                        metadata={"forced_final_requested": forced_final_requested, "timeout_seconds": model_timeout},
+                    )
                 response = call_model_fn(context, tools, model_timeout)
                 deadline.record_call()
             except Exception as e:
+                if commentary is not None:
+                    commentary.emit(
+                        "model_action_failed",
+                        "Model action failed",
+                        f"The OSS model call failed before returning the next action: {str(e)[:160]}.",
+                        phase=_mission_phase(ledger),
+                        source="runtime",
+                        severity="warning",
+                    )
                 return _partial(mission, ledger, f"model_call_failed: {e}", deadline)
 
             text = _extract_model_text(response)
@@ -338,6 +390,15 @@ def run_loop(mission: Any, ledger: Any, call_model_fn, tools, emitter,
 
             action = parse_action(text)
             if not action:
+                if commentary is not None:
+                    commentary.emit(
+                        "model_action_invalid",
+                        "Model action invalid",
+                        "The OSS model response did not contain one valid ManagedInvestigationActionV1 object, so I'm asking for a repair.",
+                        phase=_mission_phase(ledger),
+                        source="runtime",
+                        severity="warning",
+                    )
                 repair_count += 1
                 if repair_count <= max_repair:
                     context.append({"role": "user", "content": REPAIR_PROMPT.format(reason="no valid action found")})
@@ -345,6 +406,15 @@ def run_loop(mission: Any, ledger: Any, call_model_fn, tools, emitter,
                 return _partial(mission, ledger, "action_parse_failed", deadline)
 
             if not action.is_valid:
+                if commentary is not None:
+                    commentary.emit(
+                        "model_action_invalid",
+                        "Model action invalid",
+                        f"The OSS model returned an invalid `{action.action_type or 'unknown'}` action, so I'm asking for a corrected action.",
+                        phase=_mission_phase(ledger),
+                        source="runtime",
+                        severity="warning",
+                    )
                 repair_count += 1
                 if repair_count <= max_repair:
                     context.append({"role": "user", "content": REPAIR_PROMPT.format(reason=f"invalid action: {text[:200]}")})
@@ -352,6 +422,14 @@ def run_loop(mission: Any, ledger: Any, call_model_fn, tools, emitter,
                 return _partial(mission, ledger, "invalid_action", deadline)
 
             if action.is_final_report:
+                if commentary is not None:
+                    commentary.emit(
+                        "model_report_received",
+                        "Report draft received",
+                        "The OSS model returned a final report draft. I'm validating it against the runtime evidence contract before accepting it.",
+                        phase="REPORT",
+                        source="model_action",
+                    )
                 from codex_oss.validation import validate_report
                 report = action.report
                 if isinstance(report, dict):
@@ -555,6 +633,20 @@ def run_loop(mission: Any, ledger: Any, call_model_fn, tools, emitter,
                 return _partial(mission, ledger, "report_not_dict", deadline)
 
             if action.is_tool_call:
+                if commentary is not None:
+                    commentary.emit(
+                        "tool_action_planned",
+                        "Tool action planned",
+                        _model_action_commentary(action),
+                        phase=str(getattr(action, "phase", "") or _mission_phase(ledger)),
+                        source="model_action",
+                        model=str(getattr(mission, "last_reasoning_model", "") or getattr(mission, "runtime_model_alias", "") or ""),
+                        metadata={
+                            "tool_name": action.tool_name,
+                            "arguments": dict(action.arguments) if isinstance(action.arguments, dict) else {},
+                            "target_question": str(getattr(action, "target_question", "") or ""),
+                        },
+                    )
                 if forced_final_requested:
                     _record_action_trace(
                         mission, ledger, action, _mission_phase(ledger), "blocked",
@@ -664,6 +756,7 @@ def run_loop(mission: Any, ledger: Any, call_model_fn, tools, emitter,
                                 current_answer_graph,
                                 allowed_tool_names,
                                 deadline,
+                                commentary=commentary,
                             )
                             context.append({"role": "user", "content": (
                                 "Runtime prefetched the still-pending required source because coverage remained incomplete. "
@@ -877,6 +970,18 @@ def run_loop(mission: Any, ledger: Any, call_model_fn, tools, emitter,
                     context.append({"role": "user", "content": f"Tool not allowed for this mission: {tool_name}"})
                     continue
 
+                if commentary is not None:
+                    commentary.emit(
+                        "tool_action_started",
+                        "Tool running",
+                        f"I'm running {_tool_target_text(tool_name, action.arguments)}.",
+                        phase=_mission_phase(ledger),
+                        source="tool",
+                        metadata={
+                            "tool_name": tool_name,
+                            "arguments": dict(action.arguments) if isinstance(action.arguments, dict) else {},
+                        },
+                    )
                 ledger.spend_budget()
                 result = _exec_tool(tool_name, executor, action.arguments, path)
 
@@ -900,9 +1005,10 @@ def run_loop(mission: Any, ledger: Any, call_model_fn, tools, emitter,
                         )})
 
                 # Record
+                turn = len(ledger.commands_run)
                 if tool_name == "rtk_read" and path:
-                    ledger.add_file(path, result, len(ledger.commands_run))
-                ledger.add_command(tool_name, action.arguments, result, len(ledger.commands_run))
+                    ledger.add_file(path, result, turn)
+                ledger.add_command(tool_name, action.arguments, result, turn)
                 _record_action_trace(
                     mission, ledger, action, _mission_phase(ledger), "allowed",
                     "tool executed",
@@ -934,6 +1040,44 @@ def run_loop(mission: Any, ledger: Any, call_model_fn, tools, emitter,
                     list(answer_graph.get("required_obligations", []) or []) + list(answer_graph.get("optional_obligations", []) or []),
                     ledger=ledger,
                 ) if str(getattr(mission, "objective_style", "") or "") == "open_investigation" else None
+                if commentary is not None:
+                    summary = _tool_result_summary(result)
+                    exit_code = summary.get("exit_code", getattr(result, "exit_code", ""))
+                    phase_after = str(answer_graph.get("investigation_state", {}).get("phase", "") or claim_graph.get("phase", "") or _mission_phase(ledger))
+                    commentary.emit(
+                        "tool_result_summary",
+                        "Tool result received",
+                        f"I finished {tool_name}; exit_code={exit_code}. The runtime refreshed coverage from the new evidence.",
+                        phase=phase_after,
+                        source="tool",
+                        evidence_refs=[f"command:{turn}"],
+                        metadata={
+                            "tool_name": tool_name,
+                            "path": path,
+                            "exit_code": exit_code,
+                            "stdout_chars": summary.get("stdout_chars", 0),
+                            "stderr_chars": summary.get("stderr_chars", 0),
+                            "matches_count": summary.get("matches_count"),
+                        },
+                    )
+                    claim_suff = claim_graph.get("sufficiency", {}) if isinstance(claim_graph, dict) else {}
+                    answer_suff = answer_graph.get("sufficiency", {}) if isinstance(answer_graph, dict) else {}
+                    commentary.emit(
+                        "coverage_update",
+                        "Coverage updated",
+                        (
+                            f"Current phase is {phase_after}. "
+                            f"Evidence refs now available: {_evidence_ref_summary(ledger) or 'none yet'}."
+                        ),
+                        phase=phase_after,
+                        source="coverage",
+                        metadata={
+                            "claim_main_count": claim_suff.get("main_claim_count", 0),
+                            "missing_requirements": claim_suff.get("missing_requirements", []),
+                            "required_answered": answer_suff.get("required_answered", 0),
+                            "required_total": answer_suff.get("required_total", 0),
+                        },
+                    )
                 objective_text = ""
                 if objective_satisfied:
                     forced_final_requested = True
@@ -1083,6 +1227,9 @@ def _runtime_prefetch_required_sources(
     answer_graph: dict[str, Any],
     allowed_tool_names: set[str],
     deadline: Any,
+    *,
+    include_non_prefetch: bool = False,
+    commentary: Any | None = None,
 ) -> dict[str, Any]:
     if "rtk_read" not in allowed_tool_names and "rtk_grep" not in allowed_tool_names:
         return answer_graph
@@ -1095,12 +1242,9 @@ def _runtime_prefetch_required_sources(
         return answer_graph
     pending = [
         item for item in pending_required_agenda_items(answer_graph)
-        if bool(item.get("prefetch", True))
+        if include_non_prefetch or bool(item.get("prefetch", True))
     ]
     if not pending:
-        return answer_graph
-    executor = TOOL_EXECUTORS.get("rtk_read")
-    if not executor:
         return answer_graph
     for item in pending:
         if ledger.tool_budget_remaining <= 0 or deadline.must_return_partial():
@@ -1124,6 +1268,8 @@ def _runtime_prefetch_required_sources(
         action_args: dict = {"path": resolved}
         if pattern:
             action_args["pattern"] = pattern
+        if tool_name == "rtk_grep" and not pattern:
+            continue
         synthetic_action = type("RuntimePrefetchAction", (), {
             "action_type": "tool_call",
             "tool_name": tool_name,
@@ -1135,15 +1281,32 @@ def _runtime_prefetch_required_sources(
             "expected_information_gain": "Satisfy a pending required source requirement.",
             "why_not_report_yet": "Required source coverage is incomplete.",
         })()
+        if commentary is not None:
+            verb = "searching" if tool_name == "rtk_grep" else "reading"
+            detail = f" for `{pattern}`" if pattern else ""
+            commentary.emit(
+                "tool_action_started",
+                "Inspecting required source",
+                f"I'm {verb} {resolved}{detail} because this required source is needed before coverage can complete.",
+                phase=_mission_phase(ledger),
+                source="runtime",
+                metadata={
+                    "tool_name": tool_name,
+                    "path": resolved,
+                    "obligation_id": str(item.get("obligation_id", "") or ""),
+                },
+            )
         ledger.spend_budget()
-        result = executor(resolved, max_bytes=100000)
+        result = _exec_tool(tool_name, executor, action_args, resolved)
         if result and result.stdout:
             result.stdout, found_secret = scan_secrets(result.stdout)
             if found_secret:
                 result.redactions_applied = True
                 ledger.redactions_applied = True
-        ledger.add_file(resolved, result, len(ledger.commands_run))
-        ledger.add_command("rtk_read", {"path": resolved}, result, len(ledger.commands_run))
+        turn = len(ledger.commands_run)
+        if tool_name == "rtk_read":
+            ledger.add_file(resolved, result, turn)
+        ledger.add_command(tool_name, action_args, result, turn)
         _record_action_trace(
             mission,
             ledger,
@@ -1152,12 +1315,28 @@ def _runtime_prefetch_required_sources(
             "runtime_prefetch",
             f"required source prefetched for obligation {item.get('obligation_id', '')}",
             deadline,
-            {"path": raw_path},
-            {"path": resolved},
+            {"path": raw_path, **({"pattern": pattern} if pattern else {})},
+            {"path": resolved, **({"pattern": pattern} if pattern else {})},
             [],
             result=_tool_result_summary(result),
         )
         answer_graph = refresh_answer_graph(mission, ledger, reason="runtime_prefetch", persist=True)
+        if commentary is not None:
+            summary = _tool_result_summary(result)
+            exit_code = summary.get("exit_code", getattr(result, "exit_code", ""))
+            commentary.emit(
+                "tool_result_summary",
+                "Required source inspected",
+                f"I finished {tool_name} on {resolved}; exit_code={exit_code}. Coverage will be recomputed from this evidence.",
+                phase=str((answer_graph.get("investigation_state", {}) or {}).get("phase", "") or _mission_phase(ledger)),
+                source="tool",
+                evidence_refs=[f"command:{turn}"],
+                metadata={
+                    "tool_name": tool_name,
+                    "path": resolved,
+                    "exit_code": exit_code,
+                },
+            )
     return answer_graph
 
 
@@ -1284,7 +1463,7 @@ def _partial_dict(mission, ledger, reason: str) -> dict:
                 def remaining(self):
                     return 999
             answer_graph = _runtime_prefetch_required_sources(
-                mission, ledger, answer_graph, _allowed_tool_names(mission), _NoDeadline(),
+                mission, ledger, answer_graph, _allowed_tool_names(mission), _NoDeadline(), include_non_prefetch=True,
             )
         report = build_runtime_report_from_answer_graph(mission, ledger, answer_graph, reason=_sanitize_fallback_reason(reason), report_source="runtime_answer_graph")
         report["semantic_gate_evaluated"] = False

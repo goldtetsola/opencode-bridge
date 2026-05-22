@@ -18,7 +18,7 @@ sys.path.insert(0, ROOT)
 from codex_oss.ledger import EvidenceLedger
 from codex_oss.health import build_health_status
 from codex_oss.audit import audit_mission
-from codex_oss.managed_bridge import run_managed_mission_from_body
+from codex_oss.managed_bridge import run_managed_mission_from_body, should_handle_managed_mission_body
 from codex_oss.mission import InvalidHandoffError, _build_mission
 from codex_oss.runtime import ToolResult, resolve_path
 from codex_oss.runtime.loop import (
@@ -33,6 +33,8 @@ from codex_oss.runtime.objectives import classify_objective, synthesize_objectiv
 from codex_oss.validation import validate_report
 from codex_oss.runtime.policy import acquire_mission_slot, release_mission_slot
 from codex_oss.runtime.closure import record_closure_telemetry
+from codex_oss.answer_graph import pending_required_agenda_items, refresh_answer_graph
+from codex_oss.transport.emitter import ResponseEmitter
 
 
 def mission(**overrides):
@@ -541,6 +543,8 @@ def assert_readonly_mission_writes_artifact_bundle():
                 }
             ]
         }
+        live_events = []
+        assert should_handle_managed_mission_body(body, "mission-a3-kimi") is True
         result = run_managed_mission_from_body(
             body,
             "mission-a3-kimi",
@@ -548,24 +552,101 @@ def assert_readonly_mission_writes_artifact_bundle():
             call_payload,
             lambda model: model,
             request_deadline=30,
+            commentary_callback=live_events.append,
         )
         assert result.handled, result
         assert result.status == "COMPLETE", result
         artifact_dir = os.path.join(root, ".codex-oss", "missions", "mission_artifact_test")
-        for name in ("mission.json", "ledger.json", "report.json", "claim_graph.json", "summary.md", "trace.jsonl", "trace_grading.json"):
+        for name in ("mission.json", "ledger.json", "report.json", "claim_graph.json", "summary.md", "trace.jsonl", "trace_grading.json", "visible_commentary.jsonl"):
             assert os.path.exists(os.path.join(artifact_dir, name)), name
+        with open(os.path.join(artifact_dir, "report.json"), encoding="utf-8") as handle:
+            report_json = json.load(handle)
+        assert report_json["visible_commentary_path"].endswith("/visible_commentary.jsonl"), report_json
+        assert report_json["summary_path"].endswith("/summary.md"), report_json
+        assert "Visible work:" in result.report_text, result.report_text
         with open(os.path.join(artifact_dir, "trace_grading.json"), encoding="utf-8") as handle:
             grading = json.load(handle)
         assert "productive_exploration" in grading["labels"], grading
+        with open(os.path.join(artifact_dir, "visible_commentary.jsonl"), encoding="utf-8") as handle:
+            visible_events = [json.loads(line) for line in handle if line.strip()]
+        assert visible_events, visible_events
+        assert visible_events[0]["event_type"] == "mission_started", visible_events
+        assert visible_events[-1]["event_type"] == "mission_completed", visible_events
+        assert all(event.get("safe_for_user") is True for event in visible_events), visible_events
+        assert [event["event_type"] for event in live_events] == [event["event_type"] for event in visible_events], live_events
+        event_types = [event["event_type"] for event in visible_events]
+        assert "model_action_requested" in event_types, event_types
+        assert "tool_action_planned" in event_types, event_types
+        assert "tool_action_started" in event_types, event_types
+        assert "tool_result_summary" in event_types, event_types
+        assert "coverage_update" in event_types, event_types
+        assert "model_report_received" in event_types, event_types
         with open(os.path.join(artifact_dir, "summary.md"), encoding="utf-8") as handle:
             summary = handle.read()
-        assert "Mission mission_artifact_test" in summary, summary
-        assert "artifact smoke" in summary, summary
+        assert "Mission Summary: mission_artifact_test" in summary, summary
+        assert "Visible trace:" in summary, summary
         audited = audit_mission(root, "mission_artifact_test")
         assert audited["ok"] is True, audited
     finally:
         os.chdir(cwd)
         shutil.rmtree(root)
+
+
+def assert_response_emitter_streams_commentary_and_final_phases():
+    class FakeWFile:
+        def __init__(self):
+            self.data = bytearray()
+
+        def write(self, chunk):
+            self.data.extend(chunk)
+
+        def flush(self):
+            pass
+
+    class FakeHandler:
+        def __init__(self):
+            self.wfile = FakeWFile()
+            self.statuses = []
+            self.headers = []
+
+        def send_response(self, status):
+            self.statuses.append(status)
+
+        def send_header(self, key, value):
+            self.headers.append((key, value))
+
+        def end_headers(self):
+            pass
+
+    handler = FakeHandler()
+    emitter = ResponseEmitter(handler, "resp_stream_test", "mission-a3-kimi", True)
+    emitter.start()
+    emitter.emit_commentary_message("I'm reading the required source before closure.")
+    emitter.emit_text_message("Final report text.", phase="final_answer")
+    emitter.complete()
+
+    frames = []
+    for raw_frame in handler.wfile.data.decode("utf-8").split("\n\n"):
+        if not raw_frame.strip() or "data: [DONE]" in raw_frame:
+            continue
+        event = ""
+        data = ""
+        for line in raw_frame.splitlines():
+            if line.startswith("event: "):
+                event = line[len("event: "):]
+            elif line.startswith("data: "):
+                data = line[len("data: "):]
+        if data:
+            frames.append((event, json.loads(data)))
+
+    added = [payload["item"] for event, payload in frames if event == "response.output_item.added"]
+    done = [payload["item"] for event, payload in frames if event == "response.output_item.done"]
+    completed = [payload["response"] for event, payload in frames if event == "response.completed"]
+    assert added[0]["phase"] == "commentary", added
+    assert added[1]["phase"] == "final_answer", added
+    assert done[0]["phase"] == "commentary", done
+    assert done[1]["phase"] == "final_answer", done
+    assert [item["phase"] for item in completed[-1]["output"]] == ["commentary", "final_answer"], completed
 
 
 def assert_runtime_mission_time_budget_extends_internal_deadline():
@@ -1676,6 +1757,53 @@ def assert_objective_specs_handle_generic_config_function_and_zero_match():
     zero_finding = synthesize_objective_finding(zero_mission, zero_ledger)
     assert "No matches for 'unsafe_command'" in zero_finding["claim"], zero_finding
     assert zero_finding["evidence_refs"] == ["command:0#zero_match"], zero_finding
+
+
+def assert_answer_graph_preserves_command_result_requirements():
+    m = mission(
+        objective="Search for a non-existent function name 'definitely_not_in_codebase' in codex_oss/. Verify zero-match evidence.",
+        objective_style="open_investigation",
+        allowed_tool_classes=["read", "search"],
+        allowed_paths=["codex_oss/runtime/loop.py"],
+        answer_obligations=[{
+            "id": "q1",
+            "question": "Does 'definitely_not_in_codebase' appear anywhere in codex_oss/?",
+            "required": True,
+            "source_requirements": [{
+                "path": "codex_oss/runtime/loop.py",
+                "evidence_kind": "zero_match",
+                "evidence_plane": "command_result",
+                "required": True,
+                "prefetch": False,
+                "required_shapes": ["zero_match"],
+            }],
+        }],
+    )
+    ledger = EvidenceLedger(mission_id=m.mission_id, tool_budget_remaining=1)
+    graph = refresh_answer_graph(m, ledger, reason="test", persist=False)
+    pending = pending_required_agenda_items(graph)
+    assert pending, graph
+    item = pending[0]
+    assert item["kind"] == "required_grep_zero_match", item
+    assert item["tool_name"] == "rtk_grep", item
+    assert item["evidence_plane"] == "command_result", item
+    assert item["pattern"] == "definitely_not_in_codebase", item
+    action = graph["coverage_graph"]["next_required_actions"][0]
+    assert action["tool_name"] == "rtk_grep", action
+    assert action["arguments"]["pattern"] == "definitely_not_in_codebase", action
+
+    zero_result = ToolResult(
+        tool="rtk_grep",
+        args={"pattern": "definitely_not_in_codebase", "path": "codex_oss/runtime/loop.py"},
+        stdout="0 matches for definitely_not_in_codebase\n",
+        stderr="",
+        exit_code=1,
+        complete=True,
+    )
+    ledger.add_command("rtk_grep", zero_result.args, zero_result, 0)
+    graph = refresh_answer_graph(m, ledger, reason="test", persist=False)
+    assert graph["sufficiency"]["can_close"], graph["sufficiency"]
+    assert graph["coverage_graph"]["coverage_status"]["coverage_complete"], graph["coverage_graph"]
 
 
 def assert_config_value_extraction_uses_target_block_not_first_fields():
@@ -2969,8 +3097,8 @@ def assert_open_investigation_redirects_to_pending_required_source():
 
     result = run_loop(m, ledger, fake_model, [], None, m.allowed_roots, m.allowed_paths, request_deadline=30)
     assert result["status"] == "PARTIAL", result
-    assert list(ledger.files_inspected.keys()) == ["codex_oss/managed_bridge.py"], ledger.files_inspected
-    assert any("audit.py" in missing.lower() for missing in result["report"]["missing_required_sources"]), result
+    assert list(ledger.files_inspected.keys()) == ["codex_oss/managed_bridge.py", "codex_oss/audit.py"], ledger.files_inspected
+    assert not any("audit.py" in missing.lower() for missing in result["report"]["missing_required_sources"]), result
     assert any(
         entry.runtime_decision == "redirected" and "required source still pending" in entry.decision_reason
         for entry in ledger.action_trace
@@ -4034,6 +4162,7 @@ def main():
     assert_runtime_model_alias_requires_mission_and_maps_reasoning_model()
     assert_runtime_model_alias_uses_fallback_on_model_failure()
     assert_readonly_mission_writes_artifact_bundle()
+    assert_response_emitter_streams_commentary_and_final_phases()
     assert_runtime_mission_time_budget_extends_internal_deadline()
     assert_tool_classes_are_enforced_and_aliases_normalize()
     assert_duplicate_searches_are_suppressed()
@@ -4054,6 +4183,7 @@ def main():
     assert_deterministic_finalizer_mines_alias_mapping_from_file_evidence()
     assert_deterministic_finalizer_mines_validator_module_evidence()
     assert_objective_specs_handle_generic_config_function_and_zero_match()
+    assert_answer_graph_preserves_command_result_requirements()
     assert_config_value_extraction_uses_target_block_not_first_fields()
     assert_mission_accepts_explicit_objective_spec_and_strict_mode()
     assert_explicit_objective_spec_overrides_prose_classifier()

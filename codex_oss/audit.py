@@ -33,6 +33,7 @@ def audit_mission(project_root: str, mission_id: str) -> dict[str, Any]:
     investigation_plan = _read_json_if_exists(os.path.join(mission_dir, "investigation_plan.json"))
     summary_path = os.path.join(mission_dir, "summary.md")
     trace_path = os.path.join(mission_dir, "trace.jsonl")
+    visible_commentary_path = os.path.join(mission_dir, "visible_commentary.jsonl")
     patch_path = os.path.join(mission_dir, "patch.diff")
     rollback_path = os.path.join(mission_dir, "rollback.diff")
     readiness_path = os.path.join(mission_dir, "implementation_readiness_graph.json")
@@ -59,6 +60,24 @@ def audit_mission(project_root: str, mission_id: str) -> dict[str, Any]:
         checks.append(_check("ledger_json", isinstance(ledger, dict), "ledger.json present"))
         checks.append(_check("trace_jsonl", os.path.exists(trace_path), "trace.jsonl present"))
         checks.append(_check("summary_md", os.path.exists(summary_path), "summary.md present"))
+        if isinstance(report, dict) and report.get("visible_commentary_path"):
+            visible_events = _read_jsonl_if_exists(visible_commentary_path)
+            checks.append(_check(
+                "visible_commentary_jsonl",
+                bool(visible_events),
+                "visible_commentary.jsonl present with at least one event",
+            ))
+            checks.append(_check(
+                "visible_commentary_safe",
+                bool(visible_events) and all(isinstance(event, dict) and event.get("safe_for_user") is True for event in visible_events),
+                "visible commentary events are marked safe_for_user",
+            ))
+            event_types = [str(event.get("event_type", "") or "") for event in visible_events if isinstance(event, dict)]
+            checks.append(_check(
+                "visible_commentary_lifecycle",
+                "mission_started" in event_types and any(item in event_types for item in ("mission_completed", "mission_failed", "mission_partial", "mission_escalated")),
+                "visible commentary records mission lifecycle events",
+            ))
         checks.append(_check("trace_grading_json", isinstance(trace_grading, dict), "trace_grading.json present"))
         checks.append(_check("claim_graph_json", isinstance(claim_graph, dict), "claim_graph.json present"))
         if str((mission or {}).get("objective_style", "") or "") == "open_investigation":
@@ -297,6 +316,24 @@ def _read_json_if_exists(path: str) -> Any:
             return json.load(handle)
     except (OSError, json.JSONDecodeError):
         return None
+
+
+def _read_jsonl_if_exists(path: str) -> list[Any]:
+    if not os.path.exists(path):
+        return []
+    events: list[Any] = []
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                try:
+                    events.append(json.loads(line))
+                except json.JSONDecodeError:
+                    events.append({"safe_for_user": False, "event_type": "invalid_json"})
+    except OSError:
+        return []
+    return events
 
 
 def _check(name: str, ok: bool, message: str) -> dict[str, Any]:

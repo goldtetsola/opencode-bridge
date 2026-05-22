@@ -435,7 +435,7 @@ def pending_required_agenda_items(answer_graph: dict[str, Any]) -> list[dict[str
     return [
         dict(item)
         for item in ((answer_graph.get("evidence_agenda", {}) or {}).get("items", []) or [])
-        if item.get("kind") == "required_read" and item.get("status") != "done"
+        if str(item.get("kind", "") or "").startswith("required_") and item.get("status") != "done"
     ]
 
 
@@ -467,6 +467,8 @@ def _normalize_obligation(raw: dict[str, Any]) -> dict[str, Any]:
                 "evidence_kind": str(item.get("evidence_kind", "source_read") or "source_read"),
                 "required": bool(item.get("required", True)),
                 "prefetch": bool(item.get("prefetch", True)),
+                "pattern": str(item.get("pattern", "") or ""),
+                "command_requirement": dict(item.get("command_requirement", {}) or {}),
                 "required_shapes": [str(shape) for shape in (item.get("required_shapes", []) or []) if str(shape)],
                 "contradiction_markers": [str(marker) for marker in (item.get("contradiction_markers", []) or []) if str(marker)],
                 "completeness_policy": str(item.get("completeness_policy", "") or "") or "shape_sufficient",
@@ -507,11 +509,17 @@ def _fallback_obligations(mission: Any) -> list[dict[str, Any]]:
 
 def _source_requirement_view(requirement: dict[str, Any], inspected_paths: set[str], command_refs: list[dict[str, Any]]) -> dict[str, Any]:
     path = str(requirement.get("path", "") or "")
+    evidence_plane = _evidence_plane(requirement)
+    command_requirement = dict(requirement.get("command_requirement", {}) or {})
+    pattern = str(requirement.get("pattern", "") or command_requirement.get("pattern", "") or "")
     evidence_refs = []
     failed_reads = []
     successful_read = False
     for item in command_refs:
         if path and path == item.get("path"):
+            if evidence_plane == "command_result":
+                evidence_refs.append(str(item.get("ref")))
+                continue
             if int(item.get("exit_code", 0) or 0) == 0:
                 successful_read = True
                 evidence_refs.append(str(item.get("ref")))
@@ -520,7 +528,7 @@ def _source_requirement_view(requirement: dict[str, Any], inspected_paths: set[s
     if successful_read and path in inspected_paths:
         evidence_refs.append(f"file:{path}#extract:1")
     required_shapes = [str(shape) for shape in (requirement.get("required_shapes", []) or []) if str(shape)]
-    detected_shapes = _detected_shapes_for_path(path) if _evidence_plane(requirement) != "command_result" else _detected_command_shapes(path, command_refs)
+    detected_shapes = _detected_shapes_for_path(path) if evidence_plane != "command_result" else _detected_command_shapes(path, command_refs)
     shape_match_policy = str(requirement.get("shape_match_policy", "") or "") or "all"
     contradiction_markers = [str(marker) for marker in (requirement.get("contradiction_markers", []) or []) if str(marker)]
     matched_contradictions = _matched_contradiction_markers(path, contradiction_markers)
@@ -544,6 +552,9 @@ def _source_requirement_view(requirement: dict[str, Any], inspected_paths: set[s
     return {
         "path": path,
         "evidence_kind": str(requirement.get("evidence_kind", "source_read") or "source_read"),
+        "evidence_plane": evidence_plane,
+        "pattern": pattern,
+        "command_requirement": command_requirement,
         "required": bool(requirement.get("required", True)),
         "prefetch": bool(requirement.get("prefetch", True)),
         "required_shapes": required_shapes,
@@ -677,20 +688,20 @@ def _obligation_confidence(status: str, evidence_refs: list[str]) -> str:
 
 
 def _agenda_items_for_obligation(obligation: dict[str, Any]) -> list[dict[str, Any]]:
-    from codex_oss.answer_graph import _evidence_plane
     items: list[dict[str, Any]] = []
     for requirement in list(obligation.get("source_requirements", []) or []):
         path = str(requirement.get("path", "") or "")
         if not path or not bool(requirement.get("required", True)):
             continue
-        plane = _evidence_plane(requirement) if '_evidence_plane' in globals() else str(requirement.get("evidence_plane", "") or "file_content")
+        plane = _evidence_plane(requirement)
         kind, tool_name = _agenda_kind_for_requirement(requirement, plane)
+        pattern = _command_pattern_for_requirement(requirement, obligation)
         items.append({
             "id": f"agenda_{obligation.get('id', 'q')}_{_slug(path)}",
             "kind": kind,
             "tool_name": tool_name,
             "path": path,
-            "pattern": str(requirement.get("pattern", "") or requirement.get("command_requirement", {}).get("pattern", "") or ""),
+            "pattern": pattern,
             "obligation_id": str(obligation.get("id", "") or ""),
             "priority": "high",
             "status": "done" if requirement.get("status") == "satisfied" else "pending",
@@ -700,6 +711,26 @@ def _agenda_items_for_obligation(obligation: dict[str, Any]) -> list[dict[str, A
             "evidence_plane": plane,
         })
     return items
+
+
+def _command_pattern_for_requirement(requirement: dict[str, Any], obligation: dict[str, Any]) -> str:
+    command_requirement = dict(requirement.get("command_requirement", {}) or {})
+    explicit = str(requirement.get("pattern", "") or command_requirement.get("pattern", "") or "")
+    if explicit:
+        return explicit
+    if _evidence_plane(requirement) != "command_result":
+        return ""
+    evidence_kind = str(requirement.get("evidence_kind", "") or "").lower()
+    if "zero_match" not in evidence_kind:
+        return ""
+    for text in (
+        str(obligation.get("question", "") or ""),
+        str(obligation.get("objective", "") or ""),
+    ):
+        match = re.search(r"['\"]([^'\"]+)['\"]", text)
+        if match:
+            return match.group(1)
+    return ""
 
 
 def _agenda_kind_for_requirement(requirement: dict[str, Any], plane: str) -> tuple[str, str]:
@@ -732,7 +763,7 @@ def _coverage_status(obligations: list[dict[str, Any]], agenda_items: list[dict[
     missing_sources = [
         str(item.get("path", "") or "")
         for item in agenda_items
-        if item.get("kind") == "required_read" and item.get("status") != "done"
+        if str(item.get("kind", "") or "").startswith("required_") and item.get("status") != "done"
     ]
     coverage_complete = len(answered) == len(required) and not missing_sources and not contradicted and not blocked and not insufficient
     if contradicted or blocked:
@@ -814,7 +845,7 @@ def _phase_from_obligations(obligations: list[dict[str, Any]], agenda_items: lis
     if not ((getattr(ledger, "commands_run", []) or []) or (getattr(ledger, "files_inspected", {}) or {})):
         return "PLAN"
     pending_required = any(
-        item.get("kind") == "required_read" and item.get("status") != "done"
+        str(item.get("kind", "") or "").startswith("required_") and item.get("status") != "done"
         for item in agenda_items
     )
     required = [item for item in obligations if item.get("required", True)]

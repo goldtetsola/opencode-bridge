@@ -27,6 +27,7 @@ from codex_oss.runtime.policy import (
     release_mission_slot,
 )
 from codex_oss.validation import render_report
+from codex_oss.visible_commentary import VisibleCommentarySink
 
 JSON = Dict[str, Any]
 
@@ -110,6 +111,34 @@ def extract_handoff_from_body(body: JSON) -> str:
     return text
 
 
+def should_handle_managed_mission_body(body: JSON, raw_model_alias: str) -> bool:
+    """Return whether the runtime entrypoint will own this request.
+
+    The HTTP bridge uses this as a preflight so it can start SSE before the
+    synchronous mission loop begins, without stealing ordinary upstream turns.
+    Keep this predicate in lockstep with run_managed_mission_from_body().
+    """
+    handoff = extract_handoff_from_body(body)
+    runtime_alias = raw_model_alias in RUNTIME_MODEL_ALIASES
+    try:
+        mission_block = extract_single_handoff_block(handoff) if handoff else None
+    except ValueError:
+        return True
+
+    if not mission_block or "oss_agent_mission.v1" not in mission_block:
+        return runtime_alias
+
+    try:
+        raw = json.loads(mission_block)
+    except Exception:
+        return True
+
+    tier = str(raw.get("tier") or "")
+    if tier in ("A2", "A3", "A4", "A5", "A6"):
+        return True
+    return runtime_alias
+
+
 def run_managed_mission_from_body(
     body: JSON,
     raw_model_alias: str,
@@ -117,6 +146,7 @@ def run_managed_mission_from_body(
     call_payload_fn: Callable[[JSON, float], JSON],
     map_model_fn: Callable[[str], str],
     request_deadline: float,
+    commentary_callback: Callable[[JSON], None] | None = None,
 ) -> ManagedMissionResult:
     """Run an A2/A3 MissionV1 if present; return handled=False otherwise."""
     handoff = extract_handoff_from_body(body)
@@ -280,6 +310,38 @@ def run_managed_mission_from_body(
             )
             report = fast_path_result.get("report", {})
             if isinstance(report, dict):
+                artifact_dir = os.path.join(os.getcwd(), ".codex-oss", "missions", mission.mission_id)
+                commentary = VisibleCommentarySink(
+                    mission.mission_id,
+                    artifact_dir,
+                    mode=os.getenv("OSS_VISIBLE_TRACE", "summary"),
+                    stream_callback=commentary_callback,
+                    max_events=int(os.getenv("OSS_VISIBLE_TRACE_MAX_EVENTS", "40") or 40),
+                    max_event_chars=int(os.getenv("OSS_VISIBLE_TRACE_MAX_EVENT_CHARS", "500") or 500),
+                )
+                commentary.emit(
+                    "mission_started",
+                    "Mission accepted",
+                    "I'm loading the compiled MissionV1 contract and checking for deterministic answers first.",
+                    phase="PLAN",
+                    source="runtime",
+                )
+                commentary.emit(
+                    "deterministic_fast_path_used",
+                    "Deterministic answer found",
+                    "The runtime answered this objective from a deterministic fast path, so no exploratory model loop was needed.",
+                    phase="REPORT",
+                    source="runtime",
+                )
+                _attach_visible_commentary_paths(mission, report)
+                commentary.emit(
+                    "mission_completed",
+                    "Mission completed",
+                    f"Final status: {fast_path_result.get('status', 'PARTIAL')}. Final report and evidence artifacts have been persisted.",
+                    phase="REPORT",
+                    source="runtime",
+                )
+                commentary.close(report)
                 _write_readonly_mission_artifacts(mission, ledger, report, str(fast_path_result.get("status", "PARTIAL")))
             return ManagedMissionResult(
                 handled=True,
@@ -288,6 +350,15 @@ def run_managed_mission_from_body(
                 report_text=render_report(report),
             )
 
+        artifact_dir = os.path.join(os.getcwd(), ".codex-oss", "missions", mission.mission_id)
+        commentary = VisibleCommentarySink(
+            mission.mission_id,
+            artifact_dir,
+            mode=os.getenv("OSS_VISIBLE_TRACE", "summary"),
+            stream_callback=commentary_callback,
+            max_events=int(os.getenv("OSS_VISIBLE_TRACE_MAX_EVENTS", "40") or 40),
+            max_event_chars=int(os.getenv("OSS_VISIBLE_TRACE_MAX_EVENT_CHARS", "500") or 500),
+        )
         result = run_loop(
             mission,
             ledger,
@@ -297,9 +368,12 @@ def run_managed_mission_from_body(
             mission.allowed_roots,
             mission.allowed_paths,
             request_deadline=effective_deadline,
+            commentary=commentary,
         )
         report = result.get("report", {})
         if isinstance(report, dict):
+            _attach_visible_commentary_paths(mission, report)
+            commentary.close(report)
             _write_readonly_mission_artifacts(mission, ledger, report, str(result.get("status", "PARTIAL")))
         report_text = render_report(report) if isinstance(report, dict) else str(report)
         return ManagedMissionResult(
@@ -353,6 +427,12 @@ def _failure_report(mission_id: str, reason: str) -> JSON:
 class _MissionStub:
     def __init__(self, mission_id: str):
         self.mission_id = mission_id
+
+
+def _attach_visible_commentary_paths(mission: Any, report: dict) -> None:
+    mission_id = str(getattr(mission, "mission_id", "mission_unknown") or "mission_unknown")
+    report["visible_commentary_path"] = f".codex-oss/missions/{mission_id}/visible_commentary.jsonl"
+    report["summary_path"] = f".codex-oss/missions/{mission_id}/summary.md"
 
 
 def _write_readonly_mission_artifacts(mission: Any, ledger: Any, report: dict, status: str) -> None:
@@ -477,7 +557,9 @@ def _write_readonly_mission_artifacts(mission: Any, ledger: Any, report: dict, s
     _write_json(os.path.join(artifact_dir, "evidence_agenda.json"), evidence_agenda)
     _write_json(os.path.join(artifact_dir, "trace_grading.json"), trace_grading)
     _write_text(os.path.join(artifact_dir, "trace.jsonl"), _readonly_trace_jsonl(ledger, report))
-    _write_text(os.path.join(artifact_dir, "summary.md"), "\n".join(summary_lines) + "\n")
+    visible_trace_path = os.path.join(artifact_dir, "visible_commentary.jsonl")
+    if not os.path.exists(visible_trace_path):
+        _write_text(os.path.join(artifact_dir, "summary.md"), "\n".join(summary_lines) + "\n")
 
 
 def _readonly_trace_jsonl(ledger: Any, report: dict) -> str:

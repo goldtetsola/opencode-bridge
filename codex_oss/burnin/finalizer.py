@@ -60,6 +60,7 @@ def finalize_burnin_run(project_root: str, run_id: str) -> JSON:
     cleanup_ratings: dict[str, int] = {}
     scenario_fidelity_failures: list[str] = []
     scenario_fidelity_passes = 0
+    provider_failure_cases: list[str] = []
 
     for case in expected_cases:
         case_id = case.get("case_id", "")
@@ -93,6 +94,9 @@ def finalize_burnin_run(project_root: str, run_id: str) -> JSON:
         status = report.get("status", "")
         closure = report.get("closure_source", "")
         caveats = " ".join(report.get("caveats", []) or [])
+        provider_failure = _mission_has_provider_auth_failure(found_mission_dir, report) and status != "COMPLETE"
+        if provider_failure:
+            provider_failure_cases.append(case_id)
 
         # Read answer graph for sufficiency
         sufficiency = {}
@@ -183,7 +187,9 @@ def finalize_burnin_run(project_root: str, run_id: str) -> JSON:
         expected_outcome = case.get("expected_outcome", "")
         tolerance = bool(case.get("tolerance", False))
 
-        if expected_outcome and envelope:
+        if provider_failure and expected_outcome:
+            pass
+        elif expected_outcome and envelope:
             # Multi-axis comparison
             expected_answer = _parse_expected_set(case, "expected_answer_statuses", expected_outcome)
             expected_verify = _parse_expected_set(case, "expected_verification_statuses", expected_outcome)
@@ -234,6 +240,7 @@ def finalize_burnin_run(project_root: str, run_id: str) -> JSON:
     summary.truthful_partial_count = truthful_partials
     summary.raw_dump_incidents = raw_dumps
     summary.evidence_ref_failures = evidence_failures
+    summary.provider_failures = len(provider_failure_cases)
     summary.model_self_close_rate = _rate(model_closures, max(completed, 1))
     summary.model_narrated_close_rate = _rate(narrated_closures, max(completed, 1))
     summary.runtime_rescue_rate = _rate(runtime_closures, max(completed, 1))
@@ -272,6 +279,9 @@ def finalize_burnin_run(project_root: str, run_id: str) -> JSON:
         if truth_safe_ok and scenario_fidelity_passes > 0:
             # Scenario fidelity matters for canary trust
             summary.result = "FAIL"
+    if provider_failure_cases:
+        summary.result_reasons.append(f"provider_auth_fail:{','.join(provider_failure_cases[:5])}")
+        summary.result = "FAIL"
 
     result_dict = summary.to_dict()
 
@@ -289,6 +299,7 @@ def finalize_burnin_run(project_root: str, run_id: str) -> JSON:
         "pass": scenario_fidelity_ok,
         "failures": scenario_fidelity_failures[:10],
         "passes": scenario_fidelity_passes,
+        "infra_blocked": provider_failure_cases[:10],
     }
     result_dict["native_feeling"] = {
         "pass": native_feeling_ok,
@@ -319,6 +330,30 @@ def _cleanup_rating(report: JSON) -> str:
     if caveats <= 4:
         return "moderate"
     return "major"
+
+
+def _mission_has_provider_auth_failure(mission_dir: Path, report: JSON) -> bool:
+    texts: list[str] = []
+    texts.extend(str(item) for item in (report.get("caveats", []) or []))
+    texts.extend(str(item) for item in (report.get("uncertainties", []) or []))
+    attempts_path = mission_dir / "closure_attempts.jsonl"
+    if attempts_path.exists():
+        try:
+            with open(attempts_path, "r", encoding="utf-8") as handle:
+                for line in handle:
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    texts.append(str(event.get("error_message", "") or ""))
+                    texts.append(str(event.get("error_type", "") or ""))
+        except OSError:
+            pass
+    joined = "\n".join(texts).lower()
+    return (
+        "model_call_failed" in joined
+        and ("401" in joined or "unauthorized" in joined or "invalid api key" in joined)
+    )
 
 
 def _is_deterministic(report: JSON, closure: str) -> bool:

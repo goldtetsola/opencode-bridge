@@ -64,16 +64,20 @@ class ResponseEmitter:
                 }
             })
 
-    def emit_text_message(self, text: str, status: str = "completed"):
+    def emit_text_message(self, text: str, status: str = "completed", phase: Optional[str] = None):
         msg_id = _new_id("msg")
         idx = self._next_index()
         message_item = {"type": "message", "id": msg_id, "status": status, "role": "assistant",
                         "content": [{"type": "output_text", "text": text, "annotations": []}]}
+        if phase:
+            message_item["phase"] = phase
 
         if self.stream:
             if not self._sse_headers_sent:
                 self.start()
             item = {"type": "message", "id": msg_id, "status": "in_progress", "role": "assistant", "content": []}
+            if phase:
+                item["phase"] = phase
             self._write_sse("response.output_item.added", {
                 "type": "response.output_item.added", "output_index": idx, "item": item})
             self._write_sse("response.content_part.added", {
@@ -101,6 +105,9 @@ class ResponseEmitter:
                 "metadata": {},
             }
         self._emitted_output.append(message_item)
+
+    def emit_commentary_message(self, text: str):
+        self.emit_text_message(text, phase="commentary")
 
     def emit_error(self, message: str, status_code: int = 400, error_type: str = "invalid_request_error"):
         if self.stream and self._sse_headers_sent:
