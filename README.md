@@ -424,7 +424,7 @@ agents/                 Codex agent TOMLs for runtime and raw OSS workers
 bin/codex-oss           Main CLI entry point
 bridge.py               Responses-compatible bridge server
 codex_oss/              Runtime, policy, mission, audit, and implementation code
-docs/                   Runtime spec, continuity log, raw-lane notes
+docs/                   Optional local notes and generated docs (ignored by git)
 examples/               Example inputs and handoffs
 orchestration/          Supporting orchestration files
 tests/                  Runtime, bridge, mission, and burn-in tests
