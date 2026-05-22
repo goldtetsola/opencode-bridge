@@ -1,323 +1,547 @@
 # OpenCode Bridge
 
-Runtime-backed OSS subagents for Codex. Spawn DeepSeek, Kimi, and Flash workers that inspect files, gather evidence, propose patches, apply changes in isolation, verify, and report — governed by a MissionV1 runtime rather than prompt-only discipline.
+OpenCode Bridge lets Codex use open-source models as governed subagents. It routes OSS workers through a local Responses-compatible bridge, gives them scoped runtime tools, records what they did, and returns evidence-backed reports for GPT review.
 
-## Architecture
+Use it when you want cheaper or parallel OSS help without handing an OSS model the keys to your repo.
 
+## What You Get
+
+- **Runtime-controlled investigations**: OSS agents can read and search only the paths their mission allows.
+- **Evidence-backed reports**: final answers include files inspected, commands run, findings, caveats, and confidence.
+- **Visible progress**: spawned OSS agents stream safe working commentary such as planned actions, tool runs, coverage updates, and closure decisions.
+- **Patch safety rails**: bounded implementation missions validate patches, apply them in an isolated worktree, verify them, and record rollback data.
+- **Auditable artifacts**: every runtime mission writes JSON reports, traces, summaries, ledgers, and decision logs under `.codex-oss/missions/`.
+- **Fail-closed behavior**: missing evidence, invalid reports, blocked paths, contradictions, and provider failures downgrade or escalate instead of pretending success.
+
+## Who This Is For
+
+OpenCode Bridge is for Codex users who want to delegate bounded work to OSS models while keeping GPT in charge of final judgment.
+
+Good uses:
+
+- Ask an OSS investigator to inspect a few files and summarize what it found.
+- Run a low-risk repo scout in parallel while GPT continues the main task.
+- Generate or validate a small patch in an isolated worktree.
+- Burn in runtime behavior with deterministic proof packs.
+
+Avoid it for:
+
+- Authentication, authorization, migrations, recovery paths, CI gates, deployment, or schema authority.
+- Any task where an OSS model's mistake could cause data loss or a security issue.
+- Raw, open-ended "go change the repo" work.
+
+## How It Works
+
+```text
+Codex / GPT orchestrator
+  |
+  | spawns a configured OSS subagent
+  v
+OpenCode Bridge on localhost:4000
+  |
+  | validates a MissionV1 contract
+  v
+Mission runtime
+  |
+  | owns tools, paths, evidence, validation, audit, and closure
+  v
+OSS model: Kimi, DeepSeek, or Flash
+  |
+  | returns actions or narrative under runtime control
+  v
+Evidence-backed report for GPT review
 ```
-GPT-5.5 Orchestrator (Codex)
-  |
-  +- Custom subagent -> opencode_bridge provider -> /v1/responses
-  |
-  +- MissionV1 Runtime
-  |    +- Path / secret / critical-path policy
-  |    +- Evidence ledger + claim/answer/coverage graphs
-  |    +- Semantic review with structured reason codes
-  |    +- PatchRecipe / PatchIntent builder
-  |    +- Isolated worktree apply + verification + rollback
-  |    +- Decision trace + audit
-  |
-  +- OSS model (Kimi / DeepSeek / Flash)
-  |
-  +- GPT-5.5 final review
-```
 
-**Core principle:** runtime owns execution; model owns reasoning; GPT owns judgment. The model is a reasoning engine inside a governed control plane, not the entire agent.
+The important split is simple:
 
-## Quick start
+- **Runtime owns execution.** It decides which tools may run, checks scope, records evidence, validates reports, and closes safely.
+- **OSS model owns reasoning.** It proposes the next action, explains why it wants that action, and drafts findings.
+- **GPT owns judgment.** Treat OSS output as evidence, not final authority.
+
+## Quick Start
+
+### 1. Clone the Repo
 
 ```bash
-git clone <repo-url>
+git clone https://github.com/goldtetsola/opencode-bridge.git
 cd opencode-bridge
+```
 
-# Set your OpenCode Go API key
-echo 'OPENCODE_GO_API_KEY=sk-...' > .codex-oss/env/opencode-go.env
+### 2. Add Your OpenCode Go Key
 
-# Install into a Codex project
-python3 bin/codex-oss install --project /path/to/your-codex-project
+Create the local env file:
 
-# Start the bridge
+```bash
+mkdir -p .codex-oss/env
+cp opencode-go.env.example .codex-oss/env/opencode-go.env
+```
+
+Edit `.codex-oss/env/opencode-go.env`:
+
+```bash
+OPENCODE_GO_API_KEY=sk-...
+```
+
+Do not commit this file.
+
+### 3. Install the Bridge into a Codex Project
+
+Run this from the bridge repo:
+
+```bash
+bin/codex-oss install --project /path/to/your/codex/project
+```
+
+This adds:
+
+- a local `opencode_bridge` provider block
+- runtime-controlled OSS agent TOMLs
+- raw OSS agent TOMLs for experiments
+- safety rules for subagent handoffs
+
+### 4. Start the Bridge
+
+```bash
 bin/codex-oss up --daemon
+```
 
-# Verify
-bin/codex-oss doctor
+The bridge listens on:
+
+```text
+http://127.0.0.1:4000/v1
+```
+
+### 5. Check Your Setup
+
+```bash
+bin/codex-oss doctor --network
+```
+
+For JSON output:
+
+```bash
+bin/codex-oss doctor --network --json
+```
+
+### 6. Check the Current Claim Surface
+
+```bash
 bin/codex-oss claim-status --project . --json
 ```
 
-After install, your Codex project has agent TOMLs and an `opencode_bridge` provider block. Codex can spawn `oss_kimi_investigator`, `oss_deepseek_investigator`, and `oss_flash_context`.
+This tells you which runtime claims are currently supported by fresh artifacts.
 
-## Mission tiers
+## The Most Important Rule
 
-| Tier | Name | What it does | Status |
-|------|------|-------------|--------|
-| A2 | Deterministic lookup | Function location, config extraction, mapping lookup, zero-match evidence — no model call needed | Green |
-| A3 | Managed investigation | Read files, search, form hypotheses, return evidence-backed reports | Green |
-| A3-open | Open investigation | Ambiguous questions, multi-file exploration, evidence obligations, agenda-guided | Green |
-| A4 | Patch proposal | Propose bounded patches via raw diff, PatchIntent, or PatchRecipe | Viable |
-| A5 | Bounded implementation | Apply validated patches in isolated worktree, verify, report | Viable |
-| A6 | Critical implementation | Critical-path simulation, certified apply with multi-review | Proof |
+Do **not** set `model_provider = "opencode_bridge"` as your top-level Codex provider.
 
-## Capability matrix
+Keep GPT native as the parent session. Only OSS subagent TOMLs should use the bridge provider.
 
-| Lane | Status | Use today? |
-|------|--------|------------|
-| A2/A3 deterministic lookup | Green | Yes |
-| A3-open investigation | Green — 25 live burn-in cases, 0 false COMPLETE | Yes, monitored |
-| A4 PatchRecipe proposal | Green in scoped cases | Yes, low-risk |
-| A4 PatchIntent proposal | Green in scoped cases | Yes, low-risk |
-| A5 isolated PatchRecipe apply | Green — VERIFIED, no workspace mutation | Yes, low-risk |
-| A5 isolated PatchIntent apply | Green — VERIFIED, no workspace mutation | Yes, low-risk |
-| A5 workspace apply | Pilot only | Not default |
-| A6 critical-path simulation | Isolated only | Read/propose/simulate |
-| Critical-path workspace apply | Not supported | No |
-| Raw OSS free editing | Research | Not for serious work |
+Why: GPT requests must stay with OpenAI. The bridge is for OSS workers and MissionV1 runtime aliases.
 
-## What the runtime guarantees
+## Agents
 
-### Investigations (A2/A3)
+After installation, your Codex project can use these agents.
 
-- Files inspected are scope-checked against allowed paths
-- Secret content is detected and redacted
-- Critical paths are blocked unless explicitly allowed
-- Required evidence sources are tracked; missing evidence blocks COMPLETE
-- Contradictory or blocked evidence escalates to GPT review
-- Evidence shapes (function definitions, config values, test assertions, etc.) must match requirements
-- Reports list answered/unanswered obligations, missing sources, blocked sources, contradictions
+### Runtime-Controlled Agents
 
-### Implementations (A4/A5)
+Use these for normal work.
 
-- Patches validated: path policy, secret scan, git apply --check, base hash match
-- Semantic review with structured reason codes (blocking, repairable, non-blocking)
-- File roles classify changes as production source, test code, test fixture, docs, or config
-- Coverage graph assesses target knowledge, source evidence, change intent, verification, risk, semantic quality
-- A5 applies in isolated worktree — main workspace never mutated
-- Rollback artifacts generated for every apply
-- Verification commands must be mission-allowlisted
+| Agent | Model alias | Best for |
+|---|---|---|
+| `oss_kimi_investigator` | `mission-a3-kimi` | General read-only investigations |
+| `oss_deepseek_investigator` | `mission-a3-deepseek` | Deeper read-only investigations |
+| `oss_flash_context` | `mission-a2-flash` | Cheap context gathering and lookups |
 
-## Runtime model aliases
+Runtime-controlled agents require a MissionV1 handoff:
 
-Runtime-backed agents use these aliases (maps to upstream model with autonomy profile):
+```text
+<OSS_HANDOFF_JSON>
+{ ... MissionV1 JSON ... }
+</OSS_HANDOFF_JSON>
+```
 
-| Alias | Upstream | Typical use |
-|-------|----------|-------------|
-| `mission-a2-flash` | DeepSeek V4 Flash | Fast deterministic lookups |
-| `mission-a3-kimi` | Kimi K2.6 | Primary investigation |
-| `mission-a3-deepseek` | DeepSeek V4 Pro | Deeper investigation reasoning |
-| `mission-a3-flash` | DeepSeek V4 Flash | Support/fallback investigation |
-| `mission-a4-kimi` | Kimi K2.6 | Patch proposal |
-| `mission-a4-deepseek` | DeepSeek V4 Pro | Complex patch reasoning |
-| `mission-a5-kimi` | Kimi K2.6 | Isolated implementation |
-| `mission-a5-deepseek` | DeepSeek V4 Pro | Complex implementation |
-| `mission-a6-kimi` | Kimi K2.6 | Critical-path simulation |
+Use `fork_turns: "none"` or the equivalent "do not fork context" option when spawning OSS agents. Full-history forks can inherit GPT settings that conflict with OSS model routing.
 
-Raw (non-runtime) aliases: `ocg-kimi-k2.6`, `ocg-deepseek-v4-pro`, `ocg-deepseek-v4-flash`.
+### Raw OSS Agents
 
-## CLI reference
+These are useful for experiments and low-stakes support work, but they do not get the full MissionV1 runtime control plane.
+
+| Agent | Model |
+|---|---|
+| `oss_kimi_rapid` | `ocg-kimi-k2.6` |
+| `oss_deepseek_pro` | `ocg-deepseek-v4-pro` |
+| `oss_flash_support` | `ocg-deepseek-v4-flash` |
+
+For serious read-only investigations, prefer the runtime-controlled agents.
+
+## Mission Lanes
+
+| Lane | What it does | Current use |
+|---|---|---|
+| A2 | Fast deterministic lookup and extraction | Use today |
+| A3 | Managed read-only investigation | Use today |
+| A3-open | Ambiguous investigation with evidence obligations | Use today, monitored |
+| A4 | Patch proposal without workspace apply | Use for low-risk patches |
+| A5 | Isolated implementation and verification | Use for bounded low-risk work |
+| A6 | Critical-path simulation | Proof/simulation only |
+| Raw OSS | Prompt-only worker behavior | Research lane |
+
+## A Minimal MissionV1 Example
+
+Use this shape when asking a runtime-controlled investigator to inspect a file:
+
+```text
+<OSS_HANDOFF_JSON>
+{
+  "schema_version": "oss_agent_mission.v1",
+  "mission_id": "mission_find_runtime_streaming",
+  "tier": "A3",
+  "mode": "managed_investigation",
+  "objective": "Inspect bridge.py and report where managed runtime streaming starts.",
+  "risk_tier": "low",
+  "write_allowed": false,
+  "allowed_roots": [],
+  "allowed_paths": ["bridge.py"],
+  "tool_budget": 3,
+  "time_budget_seconds": 60,
+  "allowed_tool_classes": ["read", "search"],
+  "stop_conditions": ["valid_report", "budget_exhausted", "deadline_reached"],
+  "report_schema": "managed_investigation_report.v1",
+  "required_outputs": [
+    "files_inspected",
+    "commands_run",
+    "findings",
+    "uncertainties",
+    "confidence",
+    "caveats",
+    "escalation_recommendation"
+  ]
+}
+</OSS_HANDOFF_JSON>
+```
+
+For reusable handoffs, validate before sending:
 
 ```bash
-# Setup
-bin/codex-oss install [--project PATH] [--force]
-bin/codex-oss doctor [--json] [--runtime-models] [--offline]
-bin/codex-oss up --daemon
-bin/codex-oss start [--port PORT]
-bin/codex-oss stop
-bin/codex-oss status
-
-# Missions
-bin/codex-oss mission template --tier A3
-bin/codex-oss mission compile [20+ flags]
-bin/codex-oss mission run [--project PATH]
-
-# Audit and explain
-bin/codex-oss audit-mission MISSION_ID [--project PATH] [--json]
-bin/codex-oss explain MISSION_ID [--project PATH] [--json]
-bin/codex-oss claim-status [--project PATH] [--json]
-
-# Proof and certification
-bin/codex-oss refresh-proofs --suite all [--project PATH] [--json]
-bin/codex-oss burnin --suite operational [--project PATH] [--json]
-bin/codex-oss certify --target open_investigation [--project PATH] [--json]
-
-# Handoff validation
 bin/codex-oss validate-handoff path/to/handoff.md
 ```
 
-## Investigation flow (A3)
+## Visible Progress
 
-A MissionV1 contract compiled from a handoff:
+Runtime-backed OSS agents now stream public progress commentary. This is not hidden chain-of-thought. It is safe working narration generated from runtime state and model-declared action rationale.
 
-```json
-{
-  "tier": "A3",
-  "objective_style": "open_investigation",
-  "answer_obligations": [{
-    "question": "Where is run_loop defined?",
-    "source_requirements": [{
-      "path": "codex_oss/runtime/loop.py",
-      "evidence_kind": "function_definition",
-      "required_shapes": ["function_definition"]
-    }]
-  }],
-  "must_inspect": ["codex_oss/runtime/loop.py"],
-  "evidence_collection_mode": "agenda_guided",
-  "exploration_policy": {
-    "after_required_floor": "allow_model_exploration",
-    "min_optional_actions_after_floor": 1,
-    "require_contradiction_search": true
-  }
-}
+You should see updates like:
+
+```text
+I'm loading the compiled MissionV1 contract.
+I'm asking the OSS model for the next safe investigation action.
+The model chose rtk_read on bridge.py as the next investigation step.
+I'm running rtk_read on bridge.py.
+I finished rtk_read; exit_code=0. The runtime refreshed coverage from the new evidence.
+Current phase is REPORT. Evidence refs now available: file:bridge.py#extract:1, command:0.
 ```
 
-The runtime:
-1. Schedules through the read pool
-2. Refreshes claim graph, answer graph, evidence agenda
-3. Runs plan-act-observe loop with the OSS model
-4. Enforces scope, redirects to pending sources, tracks evidence shapes
-5. Closes from runtime answer graph or accepts model final report
-6. Persists: report.json, claim_graph.json, answer_graph.json, coverage_graph.json, evidence_agenda.json, decision_trace.json, trace.jsonl
+The runtime does **not** stream:
 
-## Implementation flow (A4/A5)
+- raw hidden chain-of-thought
+- provider `reasoning_content`
+- full file contents
+- long command output
+- secrets or tokens
+- system/developer prompts
 
-```json
-{
-  "tier": "A5",
-  "mode": "bounded_implementation",
-  "apply_mode": "isolated_worktree",
-  "objective_spec": {
-    "objective_type": "documentation_patch",
-    "target": {"required_changed_files": ["tests/fixtures/target.py"]}
-  }
-}
-```
-
-The runtime:
-1. Validates the patch (path policy, secret scan, semantic review, coverage)
-2. PatchRecipe: extracts anchor candidates, model selects anchor + content, runtime builds diff
-3. PatchIntent: model returns structured intent, runtime builds diff
-4. Applies in isolated worktree (never main workspace)
-5. Runs mission-allowlisted verification
-6. Generates rollback artifact
-7. Produces: implementation_report.json, semantic_review.json, implementation_coverage_graph.json
-
-## Evidence shape detection
-
-The runtime detects code patterns in inspected files:
-
-| Shape | Detects |
-|-------|---------|
-| `function_definition` | `def name(...):` |
-| `class_definition` | `class Name...:` |
-| `mapping_assignment` | `name = {...}` |
-| `config_value` | `"key": value` entries |
-| `flag_parameter` | `flag_*`, `allow_*`, `require_*` variables |
-| `flag_read` | `.get("flag_*")` access patterns |
-| `behavior_derivation` | `derive`, `observed behavior` keywords |
-| `zero_match` | grep returning "0 matches" |
-| `test_assertion` | `assert` statements |
-| `verification_command` | pytest, unittest, verify references |
-
-Required shapes can be specified per source requirement; missing shapes block COMPLETE.
-
-## Exploration policy modes
-
-| Mode | Behavior |
-|------|----------|
-| `prefetch_floor` | Runtime reads required sources upfront, closes from answer graph |
-| `agenda_guided` | Runtime tells model pending sources, redirects if ignored, prefetches after threshold |
-| `model_led` | No prefetch, minimal steering — experimental |
-
-After the evidence floor is covered, `exploration_policy` controls what happens next:
-
-| Policy | Effect |
-|--------|--------|
-| `close_immediately` | Force closure; no further exploration |
-| `allow_model_exploration` | Bounded optional exploration with min/max actions and contradiction search |
-
-## Explanation and audit
-
-Every mission produces auditable artifacts. The decision explainer surfaces the full reasoning:
+If the UI does not show progress, inspect the artifact:
 
 ```bash
-bin/codex-oss explain mission_open_blocked_source --project . --json
+bin/codex-oss show-trace MISSION_ID
+bin/codex-oss show-summary MISSION_ID
 ```
 
-Output includes: status, closure source, phase path, evidence coverage, contradictions, blocked obligations, semantic review decisions, coverage gaps, and a human-readable summary of why the mission ended with its final status.
+## Mission Artifacts
 
-## Semantic review reason codes
+Each runtime mission writes artifacts under:
 
-Patches are reviewed with structured reason codes:
+```text
+.codex-oss/missions/<mission_id>/
+```
 
-**Blocking:** `forbidden_path`, `critical_path_write`, `test_removal`, `function_deletion`, `full_file_rewrite`, `dependency_change`, `secret_introduced`, `objective_mismatch`, `patch_noop`, `patch_does_not_apply`
+Common files:
 
-**Repairable:** `anchor_not_found`, `empty_change`, `missing_required_symbol`, `missing_required_test`, `verification_plan_missing`, `wrong_insertion_location`
+| File | Purpose |
+|---|---|
+| `report.json` | Final structured report |
+| `summary.md` | Human-readable mission summary |
+| `visible_commentary.jsonl` | User-facing progress events |
+| `trace.jsonl` | Runtime action trace |
+| `decision_trace.json` | Policy and closure decisions |
+| `ledger.json` | Files inspected, commands run, budget, redaction state |
+| `claim_graph.json` | Investigation claim/evidence state |
+| `answer_graph.json` | Open-investigation obligation state, when applicable |
+| `implementation_report.json` | Patch/apply/verify result for A4/A5 |
+| `semantic_review.json` | Patch review result for implementation missions |
 
-**Non-blocking:** `formatting_change_detected`, `partial_objective_coverage`, `source_change_without_test`
-
-File roles (`production_source`, `test_code`, `test_fixture`, `docs`, `config`) determine whether a source change requires a test change.
-
-## Agent configuration
-
-After install, your Codex project has these agents:
-
-### Runtime-controlled (recommended)
-
-| Agent | Model | Use |
-|-------|-------|-----|
-| `oss_kimi_investigator` | `mission-a3-kimi` | Primary investigation and structured patch |
-| `oss_deepseek_investigator` | `mission-a3-deepseek` | Deeper investigation and implementation reasoning |
-| `oss_flash_context` | `mission-a2-flash` | Fast context and fallback summarization |
-
-### Raw experimental (research)
-
-| Agent | Model |
-|-------|-------|
-| `oss_deepseek_pro` | `ocg-deepseek-v4-pro` |
-| `oss_kimi_rapid` | `ocg-kimi-k2.6` |
-| `oss_flash_support` | `ocg-deepseek-v4-flash` |
-
-Raw agents use prompt-only discipline with broad tools. Runtime-controlled agents use MissionV1 contracts with governed tool access. Runtime-controlled is the product path; raw is research.
-
-## Testing
+Audit a mission:
 
 ```bash
-# Core contract tests (no bridge needed)
-python3 tests/test_runtime_contracts.py
-python3 tests/test_patch_pipeline.py
-python3 tests/test_mission_cli.py
-python3 tests/test_mission_v1_http.py
+bin/codex-oss audit-mission MISSION_ID --project . --json
+```
 
-# Claim surface check
+Explain why a mission ended the way it did:
+
+```bash
+bin/codex-oss explain MISSION_ID --project . --json
+```
+
+## Safety Model
+
+The runtime blocks or downgrades work when evidence is weak.
+
+For investigations:
+
+- allowed paths and roots are enforced
+- secrets are redacted before returning observations to the model
+- critical paths are blocked unless explicitly allowed
+- missing required sources block `COMPLETE`
+- unsupported tool arguments are rejected or repaired
+- duplicate reads are suppressed or served from cached evidence
+- contradictions and blocked sources escalate to GPT review
+- hollow `COMPLETE` reports are repaired or downgraded
+
+For implementation:
+
+- patches are validated before apply
+- raw model diffs are not trusted blindly
+- PatchRecipe and PatchIntent can be turned into runtime-built diffs
+- `git apply --check` runs before apply
+- secret scans and semantic review run before apply
+- A5 applies in an isolated worktree by default
+- verification commands must be allowlisted
+- rollback artifacts are recorded
+
+## CLI Reference
+
+### Setup and Health
+
+```bash
+bin/codex-oss install --project PATH
+bin/codex-oss up --daemon
+bin/codex-oss start --port 4000
+bin/codex-oss stop
+bin/codex-oss restart --port 4000
+bin/codex-oss status
+bin/codex-oss doctor --network
+```
+
+### Missions and Artifacts
+
+```bash
+bin/codex-oss mission template --tier A3
+bin/codex-oss mission compile --help
+bin/codex-oss mission run --project .
+bin/codex-oss validate-handoff path/to/handoff.md
+bin/codex-oss show-trace MISSION_ID
+bin/codex-oss show-summary MISSION_ID
+bin/codex-oss audit-mission MISSION_ID --project . --json
+bin/codex-oss explain MISSION_ID --project . --json
+```
+
+### Proof and Certification
+
+```bash
 bin/codex-oss claim-status --project . --json
-
-# Opt-in live burn-in (requires running bridge + API key)
-LIVE_BURNIN=1 python3 tests/test_a3_open_burnin_pack.py
-LIVE_BURNIN=1 python3 tests/test_a5_ladder_burnin.py
-LIVE_BURNIN=1 python3 tests/test_a4a5_burnin_pack.py
+bin/codex-oss refresh-proofs --project . --suite all --json
+bin/codex-oss burnin --project . --suite operational --json
+bin/codex-oss certify --project . --target open_investigation --json
 ```
 
-## Environment variables
+### Raw Research Lane
+
+```bash
+bin/codex-oss raw-probe --help
+bin/codex-oss raw-claim-status --project . --json
+```
+
+## Environment Variables
 
 | Variable | Purpose | Default |
-|----------|---------|---------|
-| `OPENCODE_GO_API_KEY` | OpenCode Go API key | Required |
-| `PROXY_API_KEY` | Codex auth key for bridge | `sk-local-codex-bridge` |
-| `MODEL_MAP_JSON` | Override model name mapping | Built-in map |
-| `FALLBACK_MODEL_MAP_JSON` | Per-model fallback chains | Built-in chains |
-| `GPT_MODEL_STRATEGY` | How to handle GPT requests | `error` |
-| `GPT_MODEL_OSS_FALLBACK` | OSS model for GPT fallback | `deepseek-v4-pro` |
-| `MAX_GLOBAL_UPSTREAM_CONCURRENCY` | Concurrency cap | `5` |
-| `MODEL_CONCURRENCY_JSON` | Per-model concurrency caps | Built-in defaults |
-| `UPSTREAM_STREAM` | Enable SSE streaming | `1` |
-| `SSE_UPSTREAM_HEARTBEAT_SECONDS` | SSE keepalive interval | `15` |
+|---|---|---|
+| `OPENCODE_GO_API_KEY` | OpenCode Go API key for upstream OSS models | Required |
+| `PROXY_PORT` | Local bridge port | `4000` |
+| `PROXY_API_KEY` | Local auth key expected by the bridge | `sk-local-codex-bridge` |
+| `GPT_MODEL_STRATEGY` | What to do if a GPT request hits the bridge | `error` |
+| `MODEL_MAP_JSON` | Override bridge model mapping | built-in map |
+| `FALLBACK_MODEL_MAP_JSON` | Override fallback chains | built-in chains |
+| `UPSTREAM_STREAM` | Use upstream streaming where supported | `1` |
+| `OSS_VISIBLE_TRACE` | Visible commentary mode: `off`, `summary`, `detailed` | `summary` |
+| `OSS_VISIBLE_TRACE_STREAM` | Stream visible commentary to Codex | `1` |
+| `OSS_VISIBLE_TRACE_MAX_EVENTS` | Max visible commentary events per mission | `40` |
+| `REQUEST_DEADLINE_SECONDS` | Default request deadline | `90` |
+| `MAX_GLOBAL_UPSTREAM_CONCURRENCY` | Global upstream request cap | `5` |
+| `MODEL_CONCURRENCY_JSON` | Per-model concurrency caps | built-in defaults |
 
-## Supported upstream models
+## Local Development
 
-| Model ID | Status |
-|----------|--------|
-| `deepseek-v4-pro` | Tested |
-| `deepseek-v4-flash` | Tested |
-| `kimi-k2.6` | Tested |
-| `kimi-k2.5` | Available |
-| `qwen3.6-plus` | Available |
-| `glm-5.1` | Available |
-| `minimax-m2.7` | Available |
+This is a Python project with no required package install for the core test suite.
+
+Run core tests:
+
+```bash
+python3 tests/test_runtime_contracts.py
+python3 tests/test_burnin_harness.py
+python3 tests/test_patch_pipeline.py
+python3 tests/test_mission_cli.py
+```
+
+Run the bridge in the foreground:
+
+```bash
+bin/codex-oss up
+```
+
+Run the bridge as a daemon:
+
+```bash
+bin/codex-oss up --daemon
+```
+
+Restart after code changes:
+
+```bash
+bin/codex-oss restart --port 4000
+```
+
+Verify the running process matches the source on disk:
+
+```bash
+bin/codex-oss doctor --network --json
+```
+
+## Project Structure
+
+```text
+agents/                 Codex agent TOMLs for runtime and raw OSS workers
+bin/codex-oss           Main CLI entry point
+bridge.py               Responses-compatible bridge server
+codex_oss/              Runtime, policy, mission, audit, and implementation code
+docs/                   Runtime spec, continuity log, raw-lane notes
+examples/               Example inputs and handoffs
+orchestration/          Supporting orchestration files
+tests/                  Runtime, bridge, mission, and burn-in tests
+config.toml.example     Provider config to merge into Codex config
+opencode-go.env.example API key env template
+```
+
+Key modules:
+
+| Module | Role |
+|---|---|
+| `codex_oss/managed_bridge.py` | Turns Responses requests into MissionV1 runtime runs |
+| `codex_oss/runtime/loop.py` | A2/A3 plan-act-observe loop and visible commentary |
+| `codex_oss/answer_graph.py` | Open-investigation obligations and sufficiency |
+| `codex_oss/implementation.py` | A4/A5 patch proposal, validation, apply, verify |
+| `codex_oss/visible_commentary.py` | Safe user-facing progress events |
+| `codex_oss/audit.py` | Mission artifact checks |
+| `codex_oss/transport/emitter.py` | Responses JSON/SSE output |
+
+## Troubleshooting
+
+### Bridge is not running
+
+Run:
+
+```bash
+bin/codex-oss up --daemon
+bin/codex-oss doctor --network
+```
+
+### Bridge is running stale code
+
+Restart it:
+
+```bash
+bin/codex-oss restart --port 4000
+```
+
+Then confirm:
+
+```bash
+bin/codex-oss doctor --network --json
+```
+
+Look for:
+
+```text
+bridge.source_hash: PASS
+runtime.identity: PASS
+```
+
+### Runtime agent says MissionV1 is missing
+
+Runtime-controlled agents need exactly one tagged block:
+
+```text
+<OSS_HANDOFF_JSON>
+{ "schema_version": "oss_agent_mission.v1", ... }
+</OSS_HANDOFF_JSON>
+```
+
+The older lightweight `OSS_HANDOFF_JSON:` handoff is for raw/legacy delegation, not MissionV1 runtime agents.
+
+### Codex routes GPT through the bridge
+
+Remove any session-wide setting like:
+
+```toml
+model_provider = "opencode_bridge"
+```
+
+Use the bridge provider only inside OSS agent TOMLs.
+
+### No live commentary appears
+
+First check the artifact:
+
+```bash
+bin/codex-oss show-trace MISSION_ID
+```
+
+Then check streaming config:
+
+```bash
+echo "$OSS_VISIBLE_TRACE"
+echo "$OSS_VISIBLE_TRACE_STREAM"
+```
+
+Expected defaults:
+
+```text
+OSS_VISIBLE_TRACE=summary
+OSS_VISIBLE_TRACE_STREAM=1
+```
+
+### Provider auth fails
+
+Check the key file:
+
+```bash
+sed -n '1,20p' .codex-oss/env/opencode-go.env
+```
+
+Do not paste the key into issues, logs, or chat. Redact it before sharing output.
+
+## Current Status
+
+The runtime-backed path is the supported product path for bounded OSS delegation. Raw OSS editing remains a research lane.
+
+Use `claim-status`, `audit-mission`, and `doctor` when you need proof rather than vibes:
+
+```bash
+bin/codex-oss claim-status --project . --json
+bin/codex-oss audit-mission MISSION_ID --project . --json
+bin/codex-oss doctor --network --json
+```
+
+## License
+
+See [LICENSE](LICENSE).

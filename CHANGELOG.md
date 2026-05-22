@@ -1,5 +1,17 @@
 # Changelog
 
+## v13 - May 2026
+
+### Runtime-backed OSS subagent UX
+
+Runtime missions now stream safe, native-style progress commentary while they run.
+
+- **Visible commentary streaming**: managed MissionV1 requests start SSE before the runtime loop begins. Commentary messages stream with `phase="commentary"` and final reports stream with `phase="final_answer"`.
+- **Richer middle narration**: A2/A3 missions now emit model action requests, model-declared action rationale, tool start, tool result summaries, coverage updates, report validation, and model-call failure events.
+- **Visible artifacts**: every current runtime mission writes `visible_commentary.jsonl` and `summary.md`; final reports link both.
+- **Safe by design**: commentary exposes public progress, not hidden chain-of-thought, provider reasoning content, full file dumps, secrets, or system/developer prompts.
+- **Docs refresh**: README rewritten around user outcomes, setup, MissionV1 usage, visible progress, safety boundaries, artifacts, and troubleshooting.
+
 ## v12 — May 2026
 
 ### Acceptance model
