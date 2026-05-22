@@ -11,6 +11,8 @@ __pycache__/
 *.pyc
 .DS_Store
 CONTEXT.md
+# Internal agent/session memory. Never publish continuity logs.
+docs/CONTINUITY.md
 tmp/
 test-project/
 docs/
