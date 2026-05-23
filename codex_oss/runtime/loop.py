@@ -490,10 +490,13 @@ def run_loop(mission: Any, ledger: Any, call_model_fn, tools, emitter,
                     except Exception:
                         pass
                     if detect_critical_finality(rendered):
+                        report["status"] = "ESCALATE"
                         report["escalation_recommendation"] = "GPT-5.5 review required — critical finality claim detected"
                         report["caveats"] = report.get("caveats", []) + ["critical finality claim requires GPT review"]
                         report["confidence"] = min_confidence(report.get("confidence", "LOW"), "LOW")
                         _annotate_report_provenance(mission, report, "model_report")
+                        report["semantic_gate_evaluated"] = False
+                        report["semantic_gate_decision"] = "BLOCKED_BY_CRITICAL_FINALITY"
                         return {"status": "ESCALATE", "report": report}
 
                     result = validate_report(report, ledger)
@@ -598,13 +601,23 @@ def run_loop(mission: Any, ledger: Any, call_model_fn, tools, emitter,
                         report["semantic_gate_evaluated"] = True
                         report["semantic_gate_decision"] = "ACCEPT"
                         report["closure_status"] = "MODEL_NARRATED_RUNTIME_CLOSED" if forced_final_requested else "MODEL_CLOSED"
+                        report["optional_exploration_actions"] = getattr(ledger, "optional_exploration_actions", 0)
+                        report["contradiction_search_done"] = bool(getattr(ledger, "contradiction_search_done", False))
                         from codex_oss.completion import build_completion_envelope, default_completion_contract
                         contract = getattr(mission, "completion_contract", {}) or default_completion_contract(mission)
                         report["completion_envelope"] = build_completion_envelope(mission, report, refreshed_answer_graph, answer_sufficiency, None)
+                        report["status"] = report["completion_envelope"]["final_status"]
+                        if str(result.status).upper() != str(report["status"]).upper() and commentary is not None:
+                            commentary.emit(
+                                "report_downgraded", "Report status downgraded",
+                                f"Runtime completion envelope changed model status from {result.status} to {report['status']}.",
+                                phase="REPORT", source="report_acceptance", severity="warning",
+                                metadata={"completion_envelope": report["completion_envelope"]},
+                            )
                         _record_closer_attempt(
                             mission,
                             "model",
-                            result.status,
+                            report["status"],
                             attempt_type="closer_draft" if forced_final_requested else "full_report",
                             elapsed=0,
                             payload_chars=len(str(context[-1].get("content", "") or "")) if context else 0,
@@ -615,7 +628,7 @@ def run_loop(mission: Any, ledger: Any, call_model_fn, tools, emitter,
                             deadline_remaining_seconds=deadline.remaining(),
                             repair_attempted=repair_count > 0,
                         )
-                        return {"status": result.status, "report": report}
+                        return {"status": report["status"], "report": report}
                     if repair_count < max_repair:
                         repair_count += 1
                         # Build targeted repair prompt with exact ledger command IDs
@@ -1511,6 +1524,8 @@ def _partial_dict(mission, ledger, reason: str) -> dict:
         )
 
         # Build authoritative envelope AFTER all caps are applied
+        report["optional_exploration_actions"] = getattr(ledger, "optional_exploration_actions", 0)
+        report["contradiction_search_done"] = bool(getattr(ledger, "contradiction_search_done", False))
         from codex_oss.completion import build_completion_envelope, default_completion_contract
         contract = getattr(mission, "completion_contract", {}) or default_completion_contract(mission)
         envelope = build_completion_envelope(mission, report, answer_graph, sufficiency=answer_graph.get("sufficiency", {}) if isinstance(answer_graph, dict) else {}, closure_attempts=None)

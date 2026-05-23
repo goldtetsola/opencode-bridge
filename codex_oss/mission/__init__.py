@@ -153,8 +153,25 @@ def _extract_handoff_json_block(text: str) -> Optional[str]:
     blocks = re.findall(r"<OSS_HANDOFF_JSON>(.*?)</OSS_HANDOFF_JSON>", text, re.DOTALL)
     if not blocks:
         return None
-    if len(blocks) > 1:
+
+    mission_blocks: list[str] = []
+    for block in blocks:
+        candidate = block.strip()
+        try:
+            raw = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(raw, dict) and raw.get("schema_version") == "oss_agent_mission.v1":
+            mission_blocks.append(candidate)
+
+    if len(mission_blocks) == 1:
+        return mission_blocks[0]
+    if len(mission_blocks) > 1:
         raise InvalidHandoffError("Multiple OSS_HANDOFF_JSON blocks found — exactly one required")
+
+    if len(blocks) > 1:
+        raise InvalidHandoffError("No valid MissionV1 OSS_HANDOFF_JSON block found among multiple candidates")
+
     return blocks[0].strip()
 
 

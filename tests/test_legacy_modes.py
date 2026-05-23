@@ -138,6 +138,119 @@ def assert_context_pack_falls_back_on_intent_text():
     assert len(calls) == 2, calls
 
 
+def assert_context_pack_repairs_model_report_missing_required_field():
+    class Session:
+        required_outputs = ["summary", "evidence", "confidence"]
+        read_paths = {}
+        required_paths = ["README.md"]
+        verification_steps = []
+        required_commands = []
+        handoff_text = "handoff"
+
+    calls = []
+
+    def call(payload, timeout):
+        calls.append(payload)
+        if len(calls) == 1:
+            return {"choices": [{"message": {"content": "PARTIAL\nSummary: read the file.\nConfidence: MEDIUM\nCaveats: none"}}]}
+        return {"choices": [{"message": {"content": "PARTIAL\nSummary: read the file.\nEvidence: README.md\nConfidence: MEDIUM\nCaveats: none"}}]}
+
+    events = []
+
+    decision = handle_context_pack_report(
+        body={"input": []},
+        envelope={"read_only_paths": ["README.md"], "verification_steps": [], "deliverable_fields": ["summary", "evidence"]},
+        handoff_text="handoff",
+        prev_id="resp",
+        prev_state_messages=[],
+        mode="context_pack_report",
+        tool_output_text="",
+        request_deadline=90,
+        request_start=time.time(),
+        project_root=ROOT,
+        continuation_model="kimi",
+        model_map={},
+        continuation_deadline=5,
+        continuation_fallbacks=[],
+        max_tool_output_chars=1000,
+        log_fn=lambda event, **kwargs: events.append((event, kwargs)),
+        map_model=lambda model, model_map: model,
+        call_continuation_with_deadline=call,
+        build_task_session=lambda body, text, response_id: Session(),
+        extract_read_paths_from_history=lambda messages: set(),
+        build_context_pack=lambda session, root: "=== README.md (10 chars) ===\nhello",
+        evaluate_evidence_coverage=lambda envelope, pack: (True, [], ["README.md"], []),
+        is_intent_or_status=lambda text: text.startswith("I will"),
+        validate_report_output=lambda text, *args, **kwargs: (("evidence" in text.lower()), [] if "evidence" in text.lower() else ["evidence"]),
+        build_context_pack_deterministic_report=lambda session, pack, output: "PARTIAL\nfallback context report",
+    )
+    assert decision.handled, decision
+    assert "Synthesis status: FALLBACK" not in decision.text, decision.text
+    assert "Evidence: README.md" in decision.text, decision.text
+    assert len(calls) == 2, calls
+    assert any(event == "context_pack_report_repair_ok" for event, _ in events), events
+
+
+def assert_context_pack_synthesis_uses_compacted_pack():
+    class Session:
+        required_outputs = ["summary", "evidence", "confidence"]
+        read_paths = {}
+        required_paths = ["README.md"]
+        verification_steps = []
+        required_commands = []
+        handoff_text = "handoff"
+
+    calls = []
+    events = []
+    old_limit = os.environ.get("CONTEXT_PACK_SYNTHESIS_MAX_CHARS")
+    os.environ["CONTEXT_PACK_SYNTHESIS_MAX_CHARS"] = "1200"
+    try:
+        def call(payload, timeout):
+            calls.append(payload)
+            return {"choices": [{"message": {"content": "PARTIAL\nSummary: read compact source.\nEvidence: README.md\nConfidence: MEDIUM\nCaveats: source pack was compacted for synthesis"}}]}
+
+        large_pack = "=== README.md (30000 chars) ===\n" + ("alpha\n" * 6000)
+        decision = handle_context_pack_report(
+            body={"input": []},
+            envelope={"read_only_paths": ["README.md"], "verification_steps": [], "deliverable_fields": ["summary", "evidence"]},
+            handoff_text="handoff",
+            prev_id="resp",
+            prev_state_messages=[],
+            mode="context_pack_report",
+            tool_output_text="",
+            request_deadline=90,
+            request_start=time.time(),
+            project_root=ROOT,
+            continuation_model="kimi",
+            model_map={},
+            continuation_deadline=5,
+            continuation_fallbacks=[],
+            max_tool_output_chars=1000,
+            log_fn=lambda event, **kwargs: events.append((event, kwargs)),
+            map_model=lambda model, model_map: model,
+            call_continuation_with_deadline=call,
+            build_task_session=lambda body, text, response_id: Session(),
+            extract_read_paths_from_history=lambda messages: set(),
+            build_context_pack=lambda session, root: large_pack,
+            evaluate_evidence_coverage=lambda envelope, pack: (True, [], [("README.md", len(pack))], []),
+            is_intent_or_status=lambda text: text.startswith("I will"),
+            validate_report_output=lambda text, *args, **kwargs: ((("evidence" in text.lower()) and ("confidence" in text.lower())), []),
+            build_context_pack_deterministic_report=lambda session, pack, output: "PARTIAL\nfallback context report",
+        )
+    finally:
+        if old_limit is None:
+            os.environ.pop("CONTEXT_PACK_SYNTHESIS_MAX_CHARS", None)
+        else:
+            os.environ["CONTEXT_PACK_SYNTHESIS_MAX_CHARS"] = old_limit
+
+    assert decision.handled, decision
+    assert "fallback context report" not in decision.text, decision.text
+    source_message = calls[0]["messages"][0]["content"]
+    assert len(source_message) < 1800, len(source_message)
+    assert "Source pack truncated for synthesis" in source_message, source_message
+    assert any(event == "context_pack_synthesis_compacted" for event, _ in events), events
+
+
 def assert_read_finalizer_returns_response_object():
     def build_response_object(body, chat_resp, messages, model_alias, model_used, reverse_name_map):
         text = chat_resp["choices"][0]["message"]["content"]
@@ -177,13 +290,69 @@ def assert_read_finalizer_returns_response_object():
     assert decision.response_obj["output"][0]["content"][0]["text"] == "summary: done"
 
 
+def assert_read_finalizer_repairs_invalid_report_before_accepting():
+    def build_response_object(body, chat_resp, messages, model_alias, model_used, reverse_name_map):
+        text = chat_resp["choices"][0]["message"]["content"]
+        return {"output": [{"type": "message", "content": [{"type": "output_text", "text": text}]}]}
+
+    calls = []
+    events = []
+
+    def call(payload, timeout):
+        calls.append(payload)
+        if len(calls) == 1:
+            return {"choices": [{"message": {"content": "I will inspect README now."}}]}
+        return {"choices": [{"message": {"content": "summary: inspected README\nconfidence: medium"}}]}
+
+    decision = handle_read_finalizer(
+        body={"input": []},
+        prev_state_messages=[
+            {"role": "user", "content": "Read README"},
+            {"role": "assistant", "content": "ok"},
+        ],
+        tool_outputs=[{"role": "tool", "tool_call_id": "x", "content": "README"}],
+        tool_kind="read",
+        compacted_output="README contents",
+        model_alias="ocg-kimi-k2.6",
+        reverse_name_map={},
+        continuation_model="kimi",
+        model_map={},
+        continuation_tools="none",
+        continuation_deadline=5,
+        continuation_fallbacks=[],
+        max_tool_output_chars=1000,
+        degraded_completion_on_timeout=True,
+        log_fn=lambda event, **kwargs: events.append((event, kwargs)),
+        map_model=lambda model, model_map: model,
+        repair_chat_history=lambda messages, outputs: list(messages) + list(outputs),
+        merge_new_user_messages=lambda messages, new: messages,
+        extract_handoff_text=lambda messages: "DELIVERABLE: summary, confidence",
+        extract_required_deliverables=lambda text: ["summary", "confidence"],
+        validate_report=lambda text, required: (
+            all(field in text.lower() for field in required),
+            [field for field in required if field not in text.lower()],
+        ),
+        call_continuation_with_deadline=call,
+        build_response_object=build_response_object,
+        build_degraded_completion=lambda model, reason, kind: {"content": [{"text": "degraded"}]},
+    )
+    assert decision.handled, decision
+    assert decision.log_event == "continuation_finalizer_repair_ok", decision
+    assert decision.text == "summary: inspected README\nconfidence: medium", decision.text
+    assert len(calls) == 2, calls
+    assert any(event == "report_invalid" for event, _ in events), events
+
+
 def main():
     assert_legacy_mode_decision_defaults_are_initialized()
     assert_exact_write_creates_and_reads_back()
     assert_patch_shell_verification_returns_observed_report()
     assert_patch_write_can_continue_for_verification()
     assert_context_pack_falls_back_on_intent_text()
+    assert_context_pack_repairs_model_report_missing_required_field()
+    assert_context_pack_synthesis_uses_compacted_pack()
     assert_read_finalizer_returns_response_object()
+    assert_read_finalizer_repairs_invalid_report_before_accepting()
     print("PASS: legacy mode helper suite")
 
 

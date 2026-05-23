@@ -19,7 +19,7 @@ from codex_oss.ledger import EvidenceLedger
 from codex_oss.health import build_health_status
 from codex_oss.audit import audit_mission
 from codex_oss.managed_bridge import run_managed_mission_from_body, should_handle_managed_mission_body
-from codex_oss.mission import InvalidHandoffError, _build_mission
+from codex_oss.mission import InvalidHandoffError, _build_mission, parse_mission_v1
 from codex_oss.runtime import ToolResult, resolve_path
 from codex_oss.runtime.loop import (
     _evidence_ref_summary,
@@ -187,6 +187,46 @@ def assert_mission_requires_scope_and_tool_contract():
         raise AssertionError("A3 mission without tool classes should fail closed")
 
 
+def assert_mission_parser_ignores_non_mission_wrapper_examples():
+    valid = {
+        "schema_version": "oss_agent_mission.v1",
+        "mission_id": "real_mission_from_prompt",
+        "tier": "A3",
+        "mode": "managed_investigation",
+        "objective": "Probe parser behavior.",
+        "allowed_paths": ["README.md"],
+        "allowed_tool_classes": ["read"],
+        "required_outputs": ["findings"],
+    }
+    handoff = (
+        "Standing instructions may mention a wrapper example:\n"
+        "<OSS_HANDOFF_JSON>\n"
+        '{"schema_version":1,"role":"example only"}\n'
+        "</OSS_HANDOFF_JSON>\n\n"
+        "Actual runtime mission:\n"
+        "<OSS_HANDOFF_JSON>\n"
+        + json.dumps(valid)
+        + "\n</OSS_HANDOFF_JSON>\n"
+    )
+    parsed = parse_mission_v1(handoff)
+    assert parsed.mission_id == "real_mission_from_prompt", parsed
+
+    two_valid = (
+        "<OSS_HANDOFF_JSON>\n"
+        + json.dumps({**valid, "mission_id": "first_valid"})
+        + "\n</OSS_HANDOFF_JSON>\n"
+        "<OSS_HANDOFF_JSON>\n"
+        + json.dumps({**valid, "mission_id": "second_valid"})
+        + "\n</OSS_HANDOFF_JSON>\n"
+    )
+    try:
+        parse_mission_v1(two_valid)
+    except InvalidHandoffError as exc:
+        assert "Multiple OSS_HANDOFF_JSON" in str(exc), exc
+    else:
+        raise AssertionError("multiple valid MissionV1 blocks should still fail closed")
+
+
 def assert_path_policy_blocks_empty_scope_and_denied_symlink():
     resolved, error = resolve_path("bridge.py", [], [])
     assert resolved is None, resolved
@@ -258,7 +298,7 @@ def assert_file_extract_refs_resolve():
         ],
         "uncertainties": [],
         "caveats": [],
-        "escalation_recommendation": "GPT-5.5 review required",
+        "escalation_recommendation": "Manual review recommended to confirm the answer.",
         "missing_fields": [],
     }
     validation = validate_report(report, ledger)
@@ -279,7 +319,7 @@ def assert_report_validation_rejects_non_object_findings_without_crashing():
         "findings": ["plain string finding from a loose provider"],
         "uncertainties": [],
         "caveats": [],
-        "escalation_recommendation": "GPT-5.5 review required",
+        "escalation_recommendation": "Manual review recommended to confirm the answer.",
         "missing_fields": [],
     }
     validation = validate_report(report, ledger)
@@ -4007,6 +4047,113 @@ def assert_semantic_gate_downgrades_hollow_complete():
     assert result2["ok"] is True, f"Valid COMPLETE should pass: {result2}"
 
 
+def assert_semantic_gate_downgrades_self_negating_complete():
+    from codex_oss.report_semantics import evaluate_report_semantic_completeness, build_published_answer
+
+    self_negating = {
+        "status": "COMPLETE",
+        "findings": [{"claim": "The README likely names the project but clarity cannot be fully confirmed."}],
+        "missing_fields": [],
+        "uncertainties": ["Extracts may not capture full context."],
+        "caveats": ["No full file inspection was possible."],
+        "escalation_recommendation": "Manual review recommended to confirm clarity.",
+        "confidence": "LOW",
+    }
+    m = _build_mission({"schema_version": "oss_agent_mission.v1", "mission_id": "test_self_negating", "tier": "A3", "mode": "managed_investigation", "objective": "test", "risk_tier": "low", "write_allowed": False, "allowed_roots": ["codex_oss/"], "allowed_paths": [], "tool_budget": 3, "time_budget_seconds": 30, "allowed_tool_classes": ["read", "search", "list"], "stop_conditions": ["valid_report", "budget_exhausted", "deadline_reached"], "report_schema": "managed_investigation_report.v1", "required_outputs": ["files_inspected", "commands_run", "findings", "uncertainties", "confidence", "caveats", "escalation_recommendation"], "objective_style": "open_investigation"})
+    answer_graph = {"required_obligations": [{"id": "q1", "question": "Where?", "status": "answered", "evidence_refs": ["file:x"]}], "sufficiency": {"required_answered": 1, "required_total": 1, "can_close": True, "recommended_status": "COMPLETE", "confidence_cap": "MEDIUM", "closure_entitlement": {"can_return_complete": True}}}
+    published = build_published_answer(m, answer_graph, None)
+    result = evaluate_report_semantic_completeness(m, self_negating, published, answer_graph, None)
+    assert result["ok"] is False, result
+    assert "complete_with_negating_uncertainty" in result["reason_codes"], result
+
+
+def assert_semantic_gate_downgrades_complete_requiring_review():
+    from codex_oss.report_semantics import evaluate_report_semantic_completeness, build_published_answer
+
+    report = {
+        "status": "COMPLETE",
+        "findings": [{"claim": "The answer is probably supported."}],
+        "missing_fields": [],
+        "uncertainties": ["The exact content of the extracts is not available in this context."],
+        "caveats": ["Command output is not detailed; evidence refs are assumed sufficient."],
+        "escalation_recommendation": "Manual review recommended to confirm the answer.",
+        "confidence": "LOW",
+    }
+    m = _build_mission({"schema_version": "oss_agent_mission.v1", "mission_id": "test_review_required", "tier": "A3", "mode": "managed_investigation", "objective": "test", "risk_tier": "low", "write_allowed": False, "allowed_roots": ["codex_oss/"], "allowed_paths": [], "tool_budget": 3, "time_budget_seconds": 30, "allowed_tool_classes": ["read", "search", "list"], "stop_conditions": ["valid_report", "budget_exhausted", "deadline_reached"], "report_schema": "managed_investigation_report.v1", "required_outputs": ["files_inspected", "commands_run", "findings", "uncertainties", "confidence", "caveats", "escalation_recommendation"], "objective_style": "open_investigation"})
+    answer_graph = {"required_obligations": [{"id": "q1", "question": "Where?", "status": "answered", "evidence_refs": ["file:x"]}], "sufficiency": {"required_answered": 1, "required_total": 1, "can_close": True, "recommended_status": "COMPLETE", "confidence_cap": "MEDIUM", "closure_entitlement": {"can_return_complete": True}}}
+    published = build_published_answer(m, answer_graph, None)
+    result = evaluate_report_semantic_completeness(m, report, published, answer_graph, None)
+    assert result["ok"] is False, result
+    assert "complete_with_negating_uncertainty" in result["reason_codes"], result
+    assert "complete_with_escalation_required" in result["reason_codes"], result
+
+
+def assert_critical_finality_sets_report_status_to_escalate():
+    m = mission()
+    ledger = EvidenceLedger(mission_id=m.mission_id, tool_budget_remaining=m.tool_budget)
+
+    def fake_model(messages, tools, timeout):
+        return {
+            "choices": [{
+                "message": {
+                    "content": json.dumps({
+                        "action_type": "final_report",
+                        "report": {
+                            "status": "COMPLETE",
+                            "confidence": "HIGH",
+                            "files_inspected": [],
+                            "commands_run": [],
+                            "findings": [{"claim": "This is 100% correct and safe to merge.", "evidence_refs": []}],
+                            "uncertainties": [],
+                            "caveats": [],
+                            "escalation_recommendation": "None required",
+                            "missing_fields": [],
+                        },
+                    })
+                }
+            }]
+        }
+
+    result = run_loop(m, ledger, fake_model, [], None, m.allowed_roots, m.allowed_paths, request_deadline=30)
+    assert result["status"] == "ESCALATE", result
+    assert result["report"]["status"] == "ESCALATE", result
+    assert result["report"]["semantic_gate_decision"] == "BLOCKED_BY_CRITICAL_FINALITY", result
+
+
+def assert_completion_envelope_caps_unanswered_complete():
+    from codex_oss.completion import build_completion_envelope
+
+    m = mission(
+        objective_style="deterministic_lookup",
+        completion_contract={
+            "verification_requirements": {
+                "contradiction_search_required": False,
+                "optional_exploration_required": False,
+            },
+            "closure_requirements": {
+                "runtime_closure_allowed": True,
+                "model_self_closure_required": False,
+            },
+        },
+    )
+    report = {
+        "status": "COMPLETE",
+        "closure_source": "model_report",
+        "findings": [{"claim": "The answer could not be determined."}],
+        "semantic_gate_evaluated": True,
+    }
+    sufficiency = {
+        "required_answered": 0,
+        "required_total": 0,
+        "can_close": False,
+        "closure_entitlement": {"can_return_complete": False},
+    }
+    envelope = build_completion_envelope(m, report, {}, sufficiency, None)
+    assert envelope["answer_status"] == "UNANSWERED", envelope
+    assert envelope["quality_status"] == "FALSE_COMPLETE", envelope
+    assert envelope["final_status"] == "PARTIAL", envelope
+
+
 def assert_run_loop_downgrades_hollow_model_complete():
     """Integration: fake model reads file then returns hollow COMPLETE — runtime must downgrade."""
     with tempfile.TemporaryDirectory(dir=ROOT) as td:
@@ -4153,6 +4300,7 @@ def main():
     assert_deterministic_fast_path_handles_single_file_function_location_without_model_call()
     assert_read_pool_scheduler_allows_multiple_low_risk_missions()
     assert_mission_requires_scope_and_tool_contract()
+    assert_mission_parser_ignores_non_mission_wrapper_examples()
     assert_path_policy_blocks_empty_scope_and_denied_symlink()
     assert_broad_roots_are_exactly_broad()
     assert_critical_finality_uses_word_boundaries()
@@ -4220,6 +4368,10 @@ def main():
     assert_evidence_kind_insufficient_when_some_shapes_missing()
     assert_evidence_kind_multiple_shapes_with_contradiction()
     assert_semantic_gate_downgrades_hollow_complete()
+    assert_semantic_gate_downgrades_self_negating_complete()
+    assert_semantic_gate_downgrades_complete_requiring_review()
+    assert_critical_finality_sets_report_status_to_escalate()
+    assert_completion_envelope_caps_unanswered_complete()
     assert_run_loop_downgrades_hollow_model_complete()
     assert_record_closure_telemetry_persists_error_and_skip_fields()
     print("PASS: runtime contract suite")

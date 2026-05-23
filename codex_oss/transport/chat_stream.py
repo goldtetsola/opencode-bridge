@@ -376,7 +376,11 @@ class ChatStreamAssembler:
                 messages=all_messages,
                 pending_call_ids=[tc["id"] for tc in replay_tool_calls],
                 created_at=self.created_at,
-                task_max_exchanges=self.extract_budget(self.base_messages),
+                tool_exchange_count=int(self.body.get("_codex_oss_tool_exchange_count", 0) or 0),
+                task_max_exchanges=int(
+                    self.body.get("_codex_oss_task_max_exchanges")
+                    or self.extract_budget(self.base_messages)
+                ),
             )
         )
 

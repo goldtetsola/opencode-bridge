@@ -930,7 +930,11 @@ def _start_bridge(port: int, mode: str):
 
 def _stop_bridge(port: int = 4000):
     import os
+    import json
     import signal
+    import subprocess
+    import time
+    import urllib.request
 
     run_dir = os.path.join(os.getcwd(), ".codex-oss", "run")
     pid_file = os.path.join(run_dir, "bridge.pid")
@@ -948,6 +952,7 @@ def _stop_bridge(port: int = 4000):
             os.remove(supervisor_pid_file)
             print("Bridge supervisor was not running (stale PID file removed)")
 
+    stopped_local = False
     if os.path.exists(pid_file):
         with open(pid_file) as f:
             pid = int(f.read().strip())
@@ -955,25 +960,56 @@ def _stop_bridge(port: int = 4000):
             os.kill(pid, signal.SIGTERM)
             os.remove(pid_file)
             os.remove(supervisor_file) if os.path.exists(supervisor_file) else None
+            stopped_local = True
             print(f"Bridge stopped (PID: {pid})")
         except ProcessLookupError:
             os.remove(pid_file)
             os.remove(supervisor_file) if os.path.exists(supervisor_file) else None
             print("Bridge was not running (stale PID file removed)")
-    else:
-        # Fallback: kill by port
-        import subprocess
-        result = subprocess.run(["lsof", "-i", f":{port}", "-t"],
-                                capture_output=True, text=True)
-        if result.stdout.strip():
-            for pid_str in result.stdout.strip().split("\n"):
-                try:
-                    os.kill(int(pid_str), signal.SIGTERM)
-                    print(f"Bridge stopped (PID: {pid_str})")
-                except ProcessLookupError:
-                    pass
-        else:
-            print(f"No bridge found on port {port}")
+
+    # Always clear the requested port. Installed projects and the source checkout
+    # keep separate pid files, so a local stop can otherwise leave another bridge
+    # process bound to the same port and make the next restart look healthy while
+    # serving the wrong project root.
+    killed_remaining = False
+    health_pids: list[int] = []
+    try:
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/health")
+        key = os.getenv("LITELLM_MASTER_KEY", "sk-local-codex-bridge")
+        req.add_header("Authorization", f"Bearer {key}")
+        health = json.loads(urllib.request.urlopen(req, timeout=2).read().decode())
+        pid = int(health.get("pid") or 0)
+        ppid = int(health.get("ppid") or 0)
+        supervisor = health.get("supervisor") or {}
+        if supervisor.get("mode") in ("daemon-supervisor", "service", "container", "external_verified"):
+            if ppid > 1:
+                health_pids.append(ppid)
+        if pid > 1:
+            health_pids.append(pid)
+    except Exception:
+        pass
+    for pid in health_pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+            killed_remaining = True
+            print(f"Bridge stopped (PID: {pid})")
+        except ProcessLookupError:
+            pass
+    if health_pids:
+        time.sleep(0.5)
+
+    result = subprocess.run(["lsof", "-i", f":{port}", "-t"],
+                            capture_output=True, text=True)
+    remaining = [p for p in result.stdout.strip().split("\n") if p.strip()]
+    for pid_str in remaining:
+        try:
+            os.kill(int(pid_str), signal.SIGTERM)
+            killed_remaining = True
+            print(f"Bridge stopped (PID: {pid_str})")
+        except ProcessLookupError:
+            pass
+    if not stopped_local and not killed_remaining:
+        print(f"No bridge found on port {port}")
 
 
 def _show_trace(project_root: str, mission_id: str, *, json_output: bool = False) -> int:

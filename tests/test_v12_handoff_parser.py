@@ -11,7 +11,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from bridge import extract_allowed_paths, extract_required_deliverables, parse_task_envelope, select_mode
 from bridge import build_context_pack, build_context_pack_deterministic_report, build_task_session
-from bridge import build_patch_contract_report, collect_owned_path_changes, validate_report_output
+from bridge import build_patch_contract_report, collect_owned_path_changes, is_intent_or_status, validate_report_output
 from bridge import evaluate_evidence_coverage, tool_output_indicates_failure, verification_contract_requested
 from bridge import _extract_handoff_text, extract_search_terms_from_step
 from codex_oss.handoff import validate_handoff_text
@@ -166,6 +166,15 @@ DELIVERABLE: Return findings.
     generic_report_lower = generic_report.lower()
     for field in generic_envelope["deliverable_fields"]:
         assert f"{field.lower()}:" in generic_report_lower, generic_report
+    first_person_structured_report = (
+        "PARTIAL\n"
+        "Summary: I inspected README.md and extracted the project purpose.\n"
+        "Evidence: README.md says Rorschach provides automated diagnostics for ad creatives.\n"
+        "Files gathered: README.md\n"
+        "Confidence: MEDIUM\n"
+        "Caveats: Only README.md was inspected.\n"
+    )
+    assert not is_intent_or_status(first_person_structured_report), first_person_structured_report
     thin_report = (
         "PASS\n"
         "Summary: gathered the requested source files and produced a short note from available context.\n"

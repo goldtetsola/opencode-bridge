@@ -80,9 +80,12 @@ def build_completion_envelope(
     # ── answer_status ──
     required_answered = sufficiency.get("required_answered", 0)
     required_total = sufficiency.get("required_total", 0)
+    can_close = bool(sufficiency.get("can_close", False))
     blocked_obligations = sufficiency.get("blocked_obligations", []) or []
     if blocked_obligations:
         answer_status = AnswerStatus.BLOCKED
+    elif required_total == 0 and can_close:
+        answer_status = AnswerStatus.ANSWERED
     elif required_total > 0 and required_answered >= required_total:
         answer_status = AnswerStatus.ANSWERED
     elif required_answered > 0:
@@ -103,6 +106,8 @@ def build_completion_envelope(
         evidence_status = EvidenceStatus.INSUFFICIENT
     elif missing_sources:
         evidence_status = EvidenceStatus.PARTIAL
+    elif required_total == 0 and can_close:
+        evidence_status = EvidenceStatus.SUFFICIENT
     elif required_answered >= required_total and required_total > 0:
         evidence_status = EvidenceStatus.SUFFICIENT
     else:
@@ -143,7 +148,6 @@ def build_completion_envelope(
 
     # ── quality_status ──
     status = str(report.get("status", "") or "").upper()
-    can_close = sufficiency.get("can_close", False)
     entitlement = sufficiency.get("closure_entitlement", {}) or {}
     can_return = entitlement.get("can_return_complete", can_close)
     is_model_closed = closure_status == ClosureStatus.MODEL_CLOSED
@@ -151,14 +155,18 @@ def build_completion_envelope(
     is_deterministic = closure_status == ClosureStatus.DETERMINISTIC_FAST_PATH
 
     # False COMPLETE checks
-    if status == "COMPLETE" and not can_return:
+    if status == "COMPLETE" and answer_status != AnswerStatus.ANSWERED:
+        quality_status = QualityStatus.FALSE_COMPLETE
+    elif status == "COMPLETE" and evidence_status != EvidenceStatus.SUFFICIENT:
+        quality_status = QualityStatus.FALSE_COMPLETE
+    elif status == "COMPLETE" and not can_return:
         quality_status = QualityStatus.FALSE_COMPLETE
     elif status == "COMPLETE" and missing_sources:
         quality_status = QualityStatus.FALSE_COMPLETE
     elif status == "COMPLETE" and insufficient:
         quality_status = QualityStatus.FALSE_COMPLETE
     # Suspicious checks
-    elif status == "COMPLETE" and report.get("semantic_gate_evaluated") is False and not is_deterministic:
+    elif status == "COMPLETE" and report.get("semantic_gate_evaluated") is False and not is_deterministic and not is_runtime_closed:
         quality_status = QualityStatus.SUSPICIOUS_COMPLETE
     elif status == "COMPLETE" and not report.get("findings"):
         quality_status = QualityStatus.SUSPICIOUS_COMPLETE
@@ -178,15 +186,20 @@ def build_completion_envelope(
     else:
         quality_status = QualityStatus.TRUTHFUL_PARTIAL
 
-    return {
+    envelope = {
         "schema_version": "completion_envelope.v1",
         "answer_status": answer_status,
         "evidence_status": evidence_status,
         "verification_status": verification_status,
         "closure_status": closure_status,
         "quality_status": quality_status,
-        "final_status": status,
     }
+    contract = getattr(mission, "completion_contract", {}) or default_completion_contract(mission)
+    derived_status = derive_final_status(envelope, contract)
+    if status in ("PARTIAL", "ESCALATE", "FAILED") and derived_status == "COMPLETE":
+        derived_status = status
+    envelope["final_status"] = derived_status
+    return envelope
 
 
 def derive_final_status(envelope: JSON, contract: JSON | None) -> str:
@@ -201,11 +214,14 @@ def derive_final_status(envelope: JSON, contract: JSON | None) -> str:
     evidence = envelope.get("evidence_status", "")
     verification = envelope.get("verification_status", "")
     closure = envelope.get("closure_status", "")
+    quality = envelope.get("quality_status", "")
 
     if answer == AnswerStatus.BLOCKED or evidence == EvidenceStatus.BLOCKED:
         return "ESCALATE"
     if evidence == EvidenceStatus.CONTRADICTED:
         return "ESCALATE"
+    if quality in (QualityStatus.FALSE_COMPLETE, QualityStatus.SUSPICIOUS_COMPLETE):
+        return "PARTIAL"
     if answer == AnswerStatus.ANSWERED and evidence == EvidenceStatus.SUFFICIENT:
         if verification_required and verification == VerificationStatus.INCOMPLETE:
             return "PARTIAL"
@@ -215,6 +231,8 @@ def derive_final_status(envelope: JSON, contract: JSON | None) -> str:
     if answer == AnswerStatus.ANSWERED and not runtime_closure_allowed and closure == ClosureStatus.RUNTIME_CLOSED:
         return "PARTIAL"
     if answer in (AnswerStatus.ANSWERED, AnswerStatus.PARTIALLY_ANSWERED):
+        return "PARTIAL"
+    if evidence in (EvidenceStatus.SUFFICIENT, EvidenceStatus.PARTIAL, EvidenceStatus.INSUFFICIENT):
         return "PARTIAL"
     return "FAILED"
 

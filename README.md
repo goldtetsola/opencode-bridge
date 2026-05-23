@@ -161,6 +161,8 @@ Runtime-controlled agents require a MissionV1 handoff:
 </OSS_HANDOFF_JSON>
 ```
 
+Put exactly one of these blocks in the worker prompt you spawn. Do not copy literal `<OSS_HANDOFF_JSON>` examples into project `AGENTS.md` files; every spawned worker inherits those standing instructions, and inherited examples can be mistaken for extra handoff blocks.
+
 Use `fork_turns: "none"` or the equivalent "do not fork context" option when spawning OSS agents. Full-history forks can inherit GPT settings that conflict with OSS model routing.
 
 ### Raw OSS Agents
@@ -175,17 +177,19 @@ These are useful for experiments and low-stakes support work, but they do not ge
 
 For serious read-only investigations, prefer the runtime-controlled agents.
 
-## Mission Lanes
+## Ways To Delegate
 
-| Lane | What it does | Current use |
+The runtime has internal labels because different tasks need different safety rules. You do not need to memorize them.
+
+| Plain name | Internal label | What it does | Current use |
 |---|---|---|
-| A2 | Fast deterministic lookup and extraction | Use today |
-| A3 | Managed read-only investigation | Use today |
-| A3-open | Ambiguous investigation with evidence obligations | Use today, monitored |
-| A4 | Patch proposal without workspace apply | Use for low-risk patches |
-| A5 | Isolated implementation and verification | Use for bounded low-risk work |
-| A6 | Critical-path simulation | Proof/simulation only |
-| Raw OSS | Prompt-only worker behavior | Research lane |
+| Quick lookup | A2 | Fast read/search/extract tasks | Use today |
+| Read-only investigation | A3 | Scoped investigation with evidence requirements | Use today |
+| Open-ended investigation | A3-open | Ambiguous read-only questions with stricter evidence checks | Use today, monitored |
+| Patch proposal | A4 | Build a proposed patch without applying it to the workspace | Use for low-risk patches |
+| Isolated implementation | A5 | Apply and verify a bounded patch in an isolated worktree | Use for bounded low-risk work |
+| Critical-path rehearsal | A6 | Simulate high-risk work without trusting OSS to change critical paths | Proof/simulation only |
+| Raw OSS worker | Raw OSS | Prompt-only worker behavior without the full runtime control plane | Research lane |
 
 ## A Minimal MissionV1 Example
 
@@ -227,6 +231,13 @@ For reusable handoffs, validate before sending:
 bin/codex-oss validate-handoff path/to/handoff.md
 ```
 
+For generated mission files, prefer the CLI:
+
+```bash
+bin/codex-oss mission template --tier A3
+bin/codex-oss mission compile mission.json --handoff
+```
+
 ## Visible Progress
 
 Runtime-backed OSS agents now stream public progress commentary. This is not hidden chain-of-thought. It is safe working narration generated from runtime state and model-declared action rationale.
@@ -257,6 +268,18 @@ If the UI does not show progress, inspect the artifact:
 bin/codex-oss show-trace MISSION_ID
 bin/codex-oss show-summary MISSION_ID
 ```
+
+## Source-Pack Recovery
+
+For direct read-only support agents, the bridge first tries to let the OSS model run a normal live agent loop: inspect sources, gather evidence, and produce the final answer. If the model times out, loops, returns intent text, or produces an invalid final report, the bridge may use a gathered source pack to produce an explicit recovery report.
+
+Recovery reports say:
+
+```text
+Synthesis status: SOURCE_PACK_RECOVERY
+```
+
+That means the bridge preserved useful evidence, but the live OSS synthesis did not complete cleanly. Treat it as a recovery artifact for GPT review, not as a native-feeling successful OSS answer.
 
 ## Mission Artifacts
 
@@ -476,6 +499,17 @@ bridge.source_hash: PASS
 runtime.identity: PASS
 ```
 
+### Doctor says the bridge is serving another project
+
+If `bridge.project_root` points at another repo, a different bridge supervisor still owns the port. Restart from the repo you want to serve:
+
+```bash
+bin/codex-oss restart --port 4000
+bin/codex-oss doctor --network
+```
+
+Current versions clear the port owner during restart so an old source-checkout supervisor cannot quietly serve a target project.
+
 ### Runtime agent says MissionV1 is missing
 
 Runtime-controlled agents need exactly one tagged block:
@@ -487,6 +521,8 @@ Runtime-controlled agents need exactly one tagged block:
 ```
 
 The older lightweight `OSS_HANDOFF_JSON:` handoff is for raw/legacy delegation, not MissionV1 runtime agents.
+
+If this fails with "Multiple OSS_HANDOFF_JSON blocks", check the project's `AGENTS.md`. Standing repo instructions should describe the handoff rule, but they should not contain literal `<OSS_HANDOFF_JSON>` examples.
 
 ### Codex routes GPT through the bridge
 
@@ -525,10 +561,15 @@ OSS_VISIBLE_TRACE_STREAM=1
 Check the key file:
 
 ```bash
-sed -n '1,20p' .codex-oss/env/opencode-go.env
+python3 - <<'PY'
+from pathlib import Path
+path = Path(".codex-oss/env/opencode-go.env")
+print("env file present:", path.exists())
+print("contains OPENCODE_GO_API_KEY:", "OPENCODE_GO_API_KEY=" in path.read_text() if path.exists() else False)
+PY
 ```
 
-Do not paste the key into issues, logs, or chat. Redact it before sharing output.
+Do not paste the key into issues, logs, or chat.
 
 ## Current Status
 

@@ -244,6 +244,14 @@ def _check_agreements(root: Path, report: DoctorReport):
             "AGENTS.md does not mention OSS_HANDOFF_JSON; OSS routing may rely on brittle prose parsing",
             "Add the OSS_HANDOFF_JSON schema to OSS delegation rules in AGENTS.md")
 
+    if "<OSS_HANDOFF_JSON>" in content or "</OSS_HANDOFF_JSON>" in content:
+        report.add("agreements.no_embedded_mission_examples", "FAIL",
+            "AGENTS.md contains literal MissionV1 wrapper examples; spawned workers can inherit them and produce multiple handoff blocks",
+            "Remove literal <OSS_HANDOFF_JSON> examples from standing repo instructions; generate the single runtime handoff at spawn time")
+    else:
+        report.add("agreements.no_embedded_mission_examples", "PASS",
+            "AGENTS.md does not embed literal MissionV1 wrapper examples")
+
     if "recursive" in content.lower() or ("codex exec" in content.lower() and "never" in content.lower()):
         report.add("agreements.no_recursive", "PASS",
             "AGENTS.md warns against recursive codex exec")
@@ -305,7 +313,8 @@ def _check_bridge(url: str, report: DoctorReport, root: Path, live_model: bool =
             "Run `codex-oss stop && codex-oss up --daemon`")
 
     running_hash = str(health.get("source_sha256", ""))
-    bridge_path = root / "bridge.py"
+    reported_source_path = str(health.get("source_path", "") or "")
+    bridge_path = Path(reported_source_path) if reported_source_path else root / "bridge.py"
     disk_hash = _sha256_path(bridge_path) if bridge_path.exists() else ""
     if running_hash and disk_hash and running_hash == disk_hash:
         report.add("bridge.source_hash", "PASS", "Running bridge source matches bridge.py on disk")
@@ -313,6 +322,10 @@ def _check_bridge(url: str, report: DoctorReport, root: Path, live_model: bool =
         report.add("bridge.source_hash", "FAIL",
             "Running bridge source hash differs from bridge.py on disk",
             "Restart the bridge through the supervisor")
+    elif running_hash:
+        report.add("bridge.source_hash", "FAIL",
+            f"Bridge source path is not readable on disk: {bridge_path}",
+            "Restart the bridge through a local bridge checkout")
     else:
         report.add("bridge.source_hash", "FAIL",
             "Bridge health does not expose source_sha256",

@@ -35,6 +35,28 @@ class LegacyModeDecision:
             self.degraded_report = {}
 
 
+def _env_positive_int(name: str, default: int) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
+def _compact_context_pack_for_synthesis(pack: str) -> tuple[str, bool]:
+    """Keep OSS report synthesis small while preserving the full pack elsewhere."""
+    max_chars = _env_positive_int("CONTEXT_PACK_SYNTHESIS_MAX_CHARS", 12000)
+    if len(pack) <= max_chars:
+        return pack, False
+    marker_template = "\n\n[Source pack truncated for synthesis: {omitted} extra chars are available in deterministic artifacts.]\n"
+    marker = marker_template.format(omitted=max(len(pack) - max_chars, 0))
+    head_chars = max_chars - len(marker)
+    if head_chars <= 0:
+        return marker[:max_chars], True
+    marker = marker_template.format(omitted=len(pack) - head_chars)
+    return pack[:head_chars] + marker, True
+
+
 def handle_context_pack_report(
     body: dict,
     envelope: dict,
@@ -68,13 +90,17 @@ def handle_context_pack_report(
     read_paths = extract_read_paths_from_history(prev_state_messages)
     session.read_paths = {path: {"complete": True} for path in read_paths}
     pack = build_context_pack(session, project_root)
+    synthesis_pack, synthesis_compacted = _compact_context_pack_for_synthesis(pack)
+    if synthesis_compacted:
+        log_fn("context_pack_synthesis_compacted",
+               source_len=len(pack), synthesis_len=len(synthesis_pack))
     evidence_coverage_complete, _, _, _ = evaluate_evidence_coverage(envelope, pack)
     finalizer_payload = {
         "model": map_model(continuation_model, model_map),
         "messages": [{"role": "system", "content":
             f"You are producing a report from the provided source pack.\n"
             f"Required outputs: {', '.join(session.required_outputs)}\n\n"
-            f"SOURCE PACK:\n{pack}\n\n"
+            f"SOURCE PACK:\n{synthesis_pack}\n\n"
             f"Do not request tools. Produce a structured report including all required outputs. "
             f"Distinguish source-document claims, planned success criteria, and actually observed verification. "
             f"Do not say tests passed, commands ran, files changed, or routing occurred unless the source pack explicitly contains that executed result."}],
@@ -114,8 +140,41 @@ def handle_context_pack_report(
             is_valid, missing = validate_report_output(
                 text, mode, envelope, evidence_coverage_complete=evidence_coverage_complete)
             if not is_valid:
-                log_fn("context_pack_report_contract_fallback", missing=missing, text_len=len(text))
-                text = build_context_pack_deterministic_report(session, pack, tool_output_text)
+                log_fn("context_pack_report_contract_repair", missing=missing, text_len=len(text))
+                remaining = request_deadline - (time.time() - request_start)
+                if remaining > 10:
+                    repair_payload = {
+                        "model": finalizer_payload["model"],
+                        "messages": finalizer_payload["messages"] + [
+                            {"role": "assistant", "content": text},
+                            {"role": "user", "content":
+                             "Revise the report to satisfy the required output contract. "
+                             f"Missing or invalid sections: {', '.join(str(item) for item in missing)}. "
+                             "Return only the corrected final report. Include PARTIAL rather than PASS "
+                             "when evidence is incomplete, and include confidence, caveats, and every required output field."}
+                        ],
+                        "stream": False,
+                        "tools": [],
+                    }
+                    try:
+                        chat_resp = call_continuation_with_deadline(
+                            repair_payload, min(continuation_deadline * 0.7, remaining - 2))
+                        repaired = chat_resp.get("choices", [{}])[0].get("message", {}).get("content", "")
+                        repaired_valid, repaired_missing = validate_report_output(
+                            repaired, mode, envelope, evidence_coverage_complete=evidence_coverage_complete)
+                        if repaired and repaired_valid and not is_intent_or_status(repaired):
+                            text = repaired
+                            log_fn("context_pack_report_repair_ok", text_len=len(text))
+                        else:
+                            log_fn("context_pack_report_repair_invalid",
+                                   missing=repaired_missing, text_len=len(repaired))
+                            text = build_context_pack_deterministic_report(session, pack, tool_output_text)
+                    except Exception as repair_error:
+                        log_fn("context_pack_report_repair_failed", error=str(repair_error))
+                        text = build_context_pack_deterministic_report(session, pack, tool_output_text)
+                else:
+                    log_fn("context_pack_report_contract_fallback", missing=missing, text_len=len(text))
+                    text = build_context_pack_deterministic_report(session, pack, tool_output_text)
         return LegacyModeDecision(True, text=text, log_event="context_pack_report_complete",
                                   log_fields={"text_len": len(text)})
     except Exception as exc:
@@ -195,6 +254,18 @@ def handle_read_finalizer(
             f"Tool result:\n{compacted_output[:max_tool_output_chars]}"
         )
     })
+    handoff_text = extract_handoff_text(finalizer_messages)
+    required = extract_required_deliverables(handoff_text)
+
+    def _response_from_chat(chat_resp: dict, messages: list) -> dict:
+        return build_response_object(
+            body, chat_resp, messages, model_alias,
+            map_model(model_alias, model_map), reverse_name_map)
+
+    def _valid_response(resp_obj: dict) -> tuple[bool, str, list]:
+        text = _first_response_text(resp_obj)
+        is_valid, missing = validate_report(text, required)
+        return is_valid, text, missing
 
     finalizer_payload = {
         "model": finalizer_model,
@@ -208,19 +279,36 @@ def handle_read_finalizer(
     log_fn("continuation_finalizer", model=finalizer_model, deadline=continuation_deadline)
     try:
         chat_resp = call_continuation_with_deadline(finalizer_payload, continuation_deadline)
-        resp_obj = build_response_object(
-            body, chat_resp, finalizer_messages, model_alias,
-            map_model(model_alias, model_map), reverse_name_map)
-        text = _first_response_text(resp_obj)
-        handoff_text = extract_handoff_text(finalizer_messages)
-        required = extract_required_deliverables(handoff_text)
-        is_valid, missing = validate_report(text, required)
-        if not is_valid and text:
+        resp_obj = _response_from_chat(chat_resp, finalizer_messages)
+        is_valid, text, missing = _valid_response(resp_obj)
+        if is_valid:
+            return LegacyModeDecision(True, text=text or "Finalizer completed.",
+                                      response_obj=resp_obj, log_event="continuation_finalizer_ok")
+        if text:
             log_fn("report_invalid", missing=missing, text_len=len(text))
-        elif not is_valid and not text:
+            repair_messages = list(finalizer_messages)
+            repair_messages.append({"role": "assistant", "content": text})
+            repair_messages.append({
+                "role": "user",
+                "content": (
+                    "Repair the final answer only. Return the requested deliverable, "
+                    "including these missing fields: " + ", ".join(str(item) for item in missing)
+                )
+            })
+            repair_payload = dict(finalizer_payload)
+            repair_payload["messages"] = repair_messages
+            log_fn("continuation_finalizer_repair", model=finalizer_model, missing=missing)
+            repair_resp = call_continuation_with_deadline(repair_payload, continuation_deadline * 0.7)
+            repair_obj = _response_from_chat(repair_resp, repair_messages)
+            repair_valid, repair_text, repair_missing = _valid_response(repair_obj)
+            if repair_valid:
+                return LegacyModeDecision(True, text=repair_text or "Finalizer completed.",
+                                          response_obj=repair_obj,
+                                          log_event="continuation_finalizer_repair_ok")
+            log_fn("continuation_finalizer_repair_invalid",
+                   missing=repair_missing, text_len=len(repair_text))
+        else:
             log_fn("report_empty")
-        return LegacyModeDecision(True, text=text or "Finalizer completed.",
-                                  response_obj=resp_obj, log_event="continuation_finalizer_ok")
     except Exception as exc:
         log_fn("continuation_finalizer_failed", error=str(exc))
 
@@ -230,13 +318,14 @@ def handle_read_finalizer(
         fb_payload["model"] = fb_model
         try:
             chat_resp = call_continuation_with_deadline(fb_payload, continuation_deadline * 0.7)
-            resp_obj = build_response_object(
-                body, chat_resp, finalizer_messages, model_alias,
-                map_model(model_alias, model_map), reverse_name_map)
-            return LegacyModeDecision(True, text=_first_response_text(resp_obj) or "Fallback finalizer completed.",
-                                      response_obj=resp_obj,
-                                      log_event="continuation_fallback_ok",
-                                      log_fields={"fallback_model": fb_model})
+            resp_obj = _response_from_chat(chat_resp, finalizer_messages)
+            is_valid, text, missing = _valid_response(resp_obj)
+            if is_valid:
+                return LegacyModeDecision(True, text=text or "Fallback finalizer completed.",
+                                          response_obj=resp_obj,
+                                          log_event="continuation_fallback_ok",
+                                          log_fields={"fallback_model": fb_model})
+            log_fn("continuation_fallback_invalid", model=fb_model, missing=missing, text_len=len(text))
         except Exception:
             log_fn("continuation_fallback_failed", model=fb_model)
 

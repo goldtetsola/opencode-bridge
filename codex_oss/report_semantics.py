@@ -18,11 +18,68 @@ NEGATING_UNCERTAINTY_PATTERNS: list[str] = [
     "file was not inspected",
     "unable to determine",
     "unable to confirm",
+    "could not",
     "not found",
     "answer was not retrieved",
     "no findings were produced",
     "could not be determined",
     "not directly observed",
+    "not directly inspected",
+    "not directly verify",
+    "not directly verified",
+    "extracts were not directly inspected",
+    "without verification",
+    "without direct verification",
+    "externally without verification",
+    "supplied externally",
+    "firsthand inspection",
+    "prevented firsthand inspection",
+    "exact content of extracts is unknown",
+    "from the extracts alone",
+    "from extracts alone",
+    "might alter interpretation",
+    "did not directly verify",
+    "no actual file inspection",
+    "no actual file inspection was executed",
+    "evidence refs are placeholders",
+    "placeholders provided in the prompt",
+    "no full file inspection",
+    "no full file inspection was possible",
+    "cannot be fully confirmed",
+    "manual review recommended",
+    "human review required",
+    "budget constraints forced closure",
+    "forced closure before thorough",
+]
+
+ESCALATION_REQUIRED_PATTERNS: list[str] = [
+    "human review required",
+    "manual review recommended",
+    "manual review required",
+    "review required to confirm",
+]
+
+EVIDENCE_WEAKENING_SUBJECTS: list[str] = [
+    "evidence",
+    "extract",
+    "extracts",
+    "evidence ref",
+    "evidence refs",
+    "command output",
+    "output",
+]
+
+EVIDENCE_WEAKENING_PREDICATES: list[str] = [
+    "not available",
+    "not detailed",
+    "unknown",
+    "assumed",
+    "suggest",
+    "placeholder",
+    "without verification",
+    "not directly",
+    "could not",
+    "not self-explanatory",
 ]
 
 
@@ -106,14 +163,27 @@ def evaluate_report_semantic_completeness(
 
     # Rule 3: COMPLETE cannot have uncertainties that negate the answer
     if status == "COMPLETE":
+        escalation_text = str(report.get("escalation_recommendation", "") or "").strip().lower()
         all_text = " ".join(
-            str(u) for u in (uncertainties + caveats)
+            [str(u) for u in (uncertainties + caveats)]
+            + [escalation_text]
+            + [str(f.get("claim", f)) for f in findings if isinstance(f, dict)]
         ).lower()
         for pattern in NEGATING_UNCERTAINTY_PATTERNS:
             if pattern in all_text:
                 reason_codes.append("complete_with_negating_uncertainty")
                 required_repairs.append(f"Remove or qualify the uncertainty: '{pattern}' is incompatible with COMPLETE.")
                 break
+        for item in [str(u).lower() for u in (uncertainties + caveats)]:
+            if any(subject in item for subject in EVIDENCE_WEAKENING_SUBJECTS) and any(predicate in item for predicate in EVIDENCE_WEAKENING_PREDICATES):
+                if "complete_with_negating_uncertainty" not in reason_codes:
+                    reason_codes.append("complete_with_negating_uncertainty")
+                    required_repairs.append("Resolve evidence-weakening caveats before claiming COMPLETE.")
+                break
+        if escalation_text and escalation_text not in ("none", "none required", "no escalation", "not required"):
+            if any(pattern in escalation_text for pattern in ESCALATION_REQUIRED_PATTERNS):
+                reason_codes.append("complete_with_escalation_required")
+                required_repairs.append("A COMPLETE report cannot require GPT, human, or manual review to confirm the answer.")
 
     # Rule 4: COMPLETE must have canonical answer evidence
     if status == "COMPLETE" and is_open:

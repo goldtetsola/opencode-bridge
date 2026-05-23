@@ -56,6 +56,7 @@ import json
 import os
 import queue
 import re
+import shlex
 import signal
 import subprocess
 import sqlite3
@@ -482,9 +483,29 @@ def normalize_tool_args(args, tool_name: str) -> tuple:
         for key in ("command", "args", "cmd", "arguments"):
             val = args.get(key)
             if val:
-                return (None, str(val) if isinstance(val, str) else json.dumps(val))
+                command = str(val) if isinstance(val, str) else json.dumps(val)
+                return (_read_path_from_shell_command(command), command)
 
     return (None, json.dumps(args))
+
+
+def _read_path_from_shell_command(command: str) -> Optional[str]:
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return None
+    if len(parts) >= 3 and parts[0] == "rtk" and parts[1] == "read":
+        path = parts[2]
+    elif len(parts) >= 2 and parts[0] == "cat":
+        path = parts[1]
+    elif len(parts) >= 3 and parts[0] == "sed" and parts[-1] != "-n":
+        path = parts[-1]
+    else:
+        return None
+    cwd = os.getcwd()
+    if os.path.isabs(path) and path.startswith(cwd + os.sep):
+        return os.path.relpath(path, cwd)
+    return path
 
 
 def inject_evidence_ledger(messages: list, ledger: ReadLedger, required_paths: list,
@@ -525,7 +546,7 @@ def _extract_read_paths_from_history(messages: list) -> set:
         for tc in tool_calls:
             func = tc.get("function", {})
             name = func.get("name", "")
-            if name in ("rtk_read", "read", "cat"):
+            if name in ("rtk_read", "read", "cat", "exec_command", "rtk_exec"):
                 args = func.get("arguments", "{}")
                 path, _ = normalize_tool_args(args, name)
                 if path:
@@ -534,11 +555,23 @@ def _extract_read_paths_from_history(messages: list) -> set:
         codex_tc = msg.get("codex")
         if codex_tc and isinstance(codex_tc, dict):
             codex_name = codex_tc.get("name", "")
-            if codex_name in ("rtk_read", "read", "cat"):
+            if codex_name in ("rtk_read", "read", "cat", "exec_command", "rtk_exec"):
                 path, _ = normalize_tool_args(codex_tc.get("arguments", "{}"), codex_name)
                 if path:
                     paths.add(path)
     return paths
+
+
+def _count_tool_result_messages(messages: list) -> int:
+    count = 0
+    for msg in messages:
+        role = msg.get("role")
+        if role in ("tool", "function"):
+            count += 1
+            continue
+        if msg.get("type") in ("function_call_output", "tool_result"):
+            count += 1
+    return count
 
 
 def _extract_handoff_text(messages: list) -> str:
@@ -1063,7 +1096,7 @@ def build_context_pack_deterministic_report(session: TaskSession, pack: str, too
         "PARTIAL\n"
         "Transport status: PASS\n"
         "Evidence-gathering status: PASS\n"
-        "Synthesis status: FALLBACK\n"
+        "Synthesis status: SOURCE_PACK_RECOVERY\n"
         "Task status: PARTIAL\n"
         f"Command used: {command}\n"
         f"Files gathered: {files}\n"
@@ -1073,7 +1106,7 @@ def build_context_pack_deterministic_report(session: TaskSession, pack: str, too
         f"{evidence_coverage}\n"
         f"{deliverable_sections}\n"
         "Confidence: MEDIUM\n"
-        "Caveats: deterministic bridge fallback produced this report from the gathered source pack because model synthesis was unavailable; task completion is not certified."
+        "Caveats: source-pack recovery produced this report because live model synthesis was unavailable or invalid; task completion is not certified."
     )
 
 
@@ -1309,6 +1342,38 @@ def select_mode(envelope: dict) -> str:
     return "managed_autonomy"
 
 
+def should_use_direct_agent_loop(mode: str, evidence_ledger_present: bool, enabled: bool = True) -> bool:
+    """Return true when direct read-only utility work should stay in the live agent loop."""
+    return bool(
+        enabled
+        and mode in ("context_pack", "context_pack_report")
+        and not evidence_ledger_present
+    )
+
+
+def _path_satisfies_required_path(path: str, required_path: str) -> bool:
+    if not path or not required_path:
+        return False
+    if path == required_path:
+        return True
+    cwd = os.getcwd()
+    path_abs = path if os.path.isabs(path) else os.path.abspath(os.path.join(cwd, path))
+    required_abs = required_path if os.path.isabs(required_path) else os.path.abspath(os.path.join(cwd, required_path))
+    return path_abs == required_abs
+
+
+def direct_loop_required_sources_satisfied(required_paths: list, read_paths: set, current_path: str) -> bool:
+    if not required_paths:
+        return False
+    for required in required_paths:
+        if any(_path_satisfies_required_path(path, required) for path in read_paths):
+            continue
+        if _path_satisfies_required_path(current_path, required):
+            continue
+        return False
+    return True
+
+
 def is_intent_or_status(text: str) -> bool:
     if len(text) < MIN_REPORT_LENGTH:
         return True
@@ -1316,8 +1381,12 @@ def is_intent_or_status(text: str) -> bool:
     intent_match = re.search(INTENT_PATTERNS, text, re.IGNORECASE)
     if intent_match:
         # Evidence markers must be report-structure indicators, not just common words
-        report_markers = ("oss_report_begin", "pass\n", "fail\n", "status:", "confidence:", "caveat:",
-                          "files inspected:", "commands run:", "commands used:")
+        report_markers = (
+            "oss_report_begin", "pass\n", "fail\n", "partial\n", "status:", "task status:",
+            "summary:", "evidence:", "evidence snippets:", "evidence table:", "confidence:",
+            "caveat:", "caveats:", "files inspected:", "files gathered:",
+            "commands run:", "commands used:", "command used:",
+        )
         has_report_structure = any(marker in text.lower() for marker in report_markers)
         if not has_report_structure:
             return True
@@ -2082,6 +2151,7 @@ class ProxyApp:
         # OpenCode Go quota, but it can route around model-specific congestion.
         self.fallback_model_map = json.loads(os.getenv("FALLBACK_MODEL_MAP_JSON", "{}") or "{}")
         self.upstream_streaming = os.getenv("UPSTREAM_STREAM", "1") != "0"
+        self.direct_agent_loop_v2 = os.getenv("DIRECT_AGENT_LOOP_V2", "1") != "0"
 
         # ── Bridge v7 hardening ──
 
@@ -2289,6 +2359,9 @@ class ProxyApp:
 
     def call_continuation_with_deadline(self, payload: JSON, deadline: float) -> JSON:
         """Call upstream with a hard deadline. Returns response or raises."""
+        if os.getenv("CONTINUATION_STREAM", "1") != "0":
+            return self.call_continuation_stream_with_deadline(payload, deadline)
+
         start = time.time()
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         headers = {
@@ -2308,6 +2381,44 @@ class ProxyApp:
         except Exception as e:
             self.log("continuation_upstream_failed", error=str(e), deadline=deadline)
             raise
+
+    def call_continuation_stream_with_deadline(self, payload: JSON, deadline: float) -> JSON:
+        """Use the streaming transport for no-tool continuation synthesis."""
+        start = time.time()
+        content_parts: List[str] = []
+        usage: JSON = {}
+        try:
+            remaining = max(1.0, deadline - (time.time() - start))
+            for kind, value in self.iter_upstream_chat_stream(payload, timeout=remaining):
+                if time.time() - start > deadline:
+                    raise TimeoutError("streaming continuation deadline exceeded")
+                if kind == "complete":
+                    return value
+                if kind == "chunk":
+                    if isinstance(value, dict) and value.get("usage"):
+                        usage = value["usage"]
+                    for choice in (value.get("choices") if isinstance(value, dict) else []) or []:
+                        delta = choice.get("delta") or {}
+                        if isinstance(delta, dict) and delta.get("content") is not None:
+                            content_parts.append(as_text(delta.get("content")))
+                        message = choice.get("message") or {}
+                        if isinstance(message, dict) and message.get("content") is not None:
+                            content_parts.append(as_text(message.get("content")))
+                elif kind == "done":
+                    break
+        except Exception as e:
+            self.log("continuation_upstream_failed", error=str(e), deadline=deadline)
+            raise
+
+        content = "".join(content_parts)
+        if not content.strip():
+            self.log("continuation_upstream_failed",
+                     error="streaming continuation produced no content", deadline=deadline)
+            raise UpstreamError(502, "streaming continuation produced no content")
+        return {
+            "choices": [{"message": {"role": "assistant", "content": content}}],
+            "usage": usage,
+        }
 
     def build_degraded_completion(self, model: str, reason: str, tool_kind: ToolKind) -> JSON:
         """Build a degraded-but-terminal assistant message for stalled continuations."""
@@ -2416,7 +2527,7 @@ class ProxyApp:
                 self.model_semaphores.get(model, threading.Semaphore(1)).release()
             self.global_semaphore.release()
 
-    def iter_upstream_chat_stream(self, payload: JSON):
+    def iter_upstream_chat_stream(self, payload: JSON, timeout: Optional[float] = None):
         """
         Yield parsed upstream Chat Completions streaming chunks.
 
@@ -2440,7 +2551,7 @@ class ProxyApp:
 
         req = urllib.request.Request(self.upstream_chat_url, data=data, headers=headers, method="POST")
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            with urllib.request.urlopen(req, timeout=timeout or self.timeout) as resp:
                 ctype = (resp.headers.get("Content-Type") or "").lower()
                 if "application/json" in ctype and "event-stream" not in ctype:
                     body = resp.read().decode("utf-8", errors="replace")
@@ -2926,7 +3037,8 @@ class Handler(BaseHTTPRequestHandler):
 
         # Count turn and determine budget
         if prev_state:
-            turn = prev_state.tool_exchange_count + 1
+            history_turns = _count_tool_result_messages(prev_state.messages)
+            turn = max(prev_state.tool_exchange_count, history_turns) + 1
             max_exchanges = prev_state.task_max_exchanges or 1
         else:
             turn = 1
@@ -3043,11 +3155,6 @@ class Handler(BaseHTTPRequestHandler):
                 emitter.complete()
                 return
 
-            if mode in ("context_pack", "context_pack_report") and not _has_evidence_ledger(body):
-                context_pack_attempted = True
-                APP.log("mode_context_pack", envelope=envelope.get("read_only_paths", []))
-                # ... (existing context-pack code continues below) ...
-
             # Bounded exact write mode: runtime handles it
             if mode == "bounded_write_exact" and not context_pack_attempted:
                 context_pack_attempted = True
@@ -3065,7 +3172,17 @@ class Handler(BaseHTTPRequestHandler):
                         APP.log(exact_decision.log_event, **exact_decision.log_fields)
                     return
 
-            if mode in ("context_pack", "context_pack_report") and not _has_evidence_ledger(body):
+            evidence_ledger_present = _has_evidence_ledger(body)
+            use_direct_agent_loop = should_use_direct_agent_loop(
+                mode, evidence_ledger_present, APP.direct_agent_loop_v2)
+            if use_direct_agent_loop:
+                APP.log("direct_agent_loop_continue", mode=mode, turn=turn, max_exchanges=max_exchanges)
+
+            if (
+                mode in ("context_pack", "context_pack_report")
+                and not evidence_ledger_present
+                and not use_direct_agent_loop
+            ):
                 context_pack_attempted = True
                 from codex_oss.legacy_modes import handle_context_pack_report
                 context_decision = handle_context_pack_report(
@@ -3106,7 +3223,7 @@ class Handler(BaseHTTPRequestHandler):
             # Skip managed autonomy if context-pack was attempted
             if not context_pack_attempted:
                 # Managed autonomy: suppress duplicate reads
-                if mode == "managed_autonomy":
+                if mode == "managed_autonomy" or use_direct_agent_loop:
                     # Check if current tool call is for an already-read path
                     dup_msg = suppress_duplicate_read(
                         {"name": tool_name_raw, "arguments": json.dumps(
@@ -3123,6 +3240,20 @@ class Handler(BaseHTTPRequestHandler):
 
                 # Inject evidence ledger for managed autonomy
                 required_paths = extract_allowed_paths(handoff_text)
+                direct_sources_satisfied = (
+                    use_direct_agent_loop
+                    and direct_loop_required_sources_satisfied(required_paths, read_paths, target_path)
+                )
+                if direct_sources_satisfied:
+                    APP.log("direct_agent_loop_sources_satisfied",
+                            mode=mode, path=target_path, required_paths=required_paths)
+                else:
+                    if use_direct_agent_loop and turn >= max_exchanges:
+                        APP.log("direct_agent_loop_budget_exhausted", turn=turn, max_exchanges=max_exchanges)
+                    elif use_direct_agent_loop:
+                        APP.log("direct_agent_loop_continue_with_tools",
+                                turn=turn, max_exchanges=max_exchanges)
+                
                 remaining = [p for p in required_paths if p not in read_paths]
                 if remaining and not _has_evidence_ledger(body):
                     ledger_text = "EVIDENCE LEDGER\n"
@@ -3135,15 +3266,18 @@ class Handler(BaseHTTPRequestHandler):
                     input_items.insert(0, {"role": "system", "content": ledger_text})
                     body["input"] = input_items
 
-                self._handle_fresh_turn(body)
-                # Update state with incremented turn count
-                if prev_id:
-                    refreshed = APP.state.get(str(prev_id))
-                    if refreshed:
-                        refreshed.tool_exchange_count = turn
-                        refreshed.task_max_exchanges = max_exchanges
-                        APP.state.put(refreshed)
-                return
+                if not direct_sources_satisfied and turn < max_exchanges:
+                    body["_codex_oss_tool_exchange_count"] = turn
+                    body["_codex_oss_task_max_exchanges"] = max_exchanges
+                    self._handle_fresh_turn(body)
+                    # Update state with incremented turn count
+                    if prev_id:
+                        refreshed = APP.state.get(str(prev_id))
+                        if refreshed:
+                            refreshed.tool_exchange_count = turn
+                            refreshed.task_max_exchanges = max_exchanges
+                            APP.state.put(refreshed)
+                    return
 
         # Finalizer call for reads — no tools, short deadline, compacted output
         stream = bool(body.get("stream"))
@@ -3157,7 +3291,7 @@ class Handler(BaseHTTPRequestHandler):
             compacted_output=compacted.compacted,
             model_alias=model_alias,
             reverse_name_map=reverse_name_map,
-            continuation_model=APP.continuation_model,
+            continuation_model=model_alias if use_direct_agent_loop else APP.continuation_model,
             model_map=APP.model_map,
             continuation_tools=APP.continuation_tools,
             continuation_deadline=APP.continuation_deadline,

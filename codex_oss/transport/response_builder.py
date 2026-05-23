@@ -80,7 +80,11 @@ def build_response_object_from_chat(
             messages=all_messages,
             pending_call_ids=pending_ids,
             created_at=created_at,
-            task_max_exchanges=extract_budget(base_messages),
+            tool_exchange_count=int(body.get("_codex_oss_tool_exchange_count", 0) or 0),
+            task_max_exchanges=int(
+                body.get("_codex_oss_task_max_exchanges")
+                or extract_budget(base_messages)
+            ),
         )
     )
 
