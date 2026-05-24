@@ -17,10 +17,112 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from typing import Any
 
 JSON = dict[str, Any]
+
+
+def parse_closer_draft(text: str) -> JSON | None:
+    """Parse a model-authored CloserDraftV1 narrative response."""
+    raw = str(text or "").strip()
+    if not raw:
+        return None
+    if raw.startswith("```"):
+        match = re.match(r"^```(?:json)?\s*\n(.*?)\n```\s*$", raw, re.DOTALL)
+        if not match:
+            return None
+        raw = match.group(1).strip()
+    try:
+        draft = json.loads(raw)
+    except (json.JSONDecodeError, ValueError, TypeError):
+        return None
+    if not isinstance(draft, dict):
+        return None
+    if draft.get("action_type"):
+        return None
+    has_draft_field = any(
+        key in draft
+        for key in (
+            "narrative_summary",
+            "finding_narratives",
+            "caveat_narratives",
+            "verification_summary",
+            "confidence_rationale",
+        )
+    )
+    schema = str(draft.get("schema_version", "") or "").lower()
+    if not has_draft_field and "closer_draft" not in schema:
+        return None
+    return draft
+
+
+def _ledger_files(ledger: Any) -> list[JSON]:
+    files = getattr(ledger, "files_inspected", {}) or {}
+    items = []
+    for path, entry in files.items():
+        items.append({
+            "path": str(path),
+            "complete": bool(getattr(entry, "complete", False)),
+        })
+    return items
+
+
+def _ledger_commands(ledger: Any) -> list[JSON]:
+    commands = []
+    for cmd in getattr(ledger, "commands_run", []) or []:
+        commands.append({
+            "tool": str(getattr(cmd, "tool", "") or ""),
+            "args": dict(getattr(cmd, "args", {}) or {}),
+            "exit_code": getattr(cmd, "exit_code", None),
+        })
+    return commands
+
+
+def build_completion_seed_report(
+    mission: Any,
+    answer_graph: JSON,
+    ledger: Any,
+    *,
+    closure_source: str = "runtime_answer_graph",
+) -> JSON:
+    """Build the minimal evidence-bearing report used for envelope decisions."""
+    sufficiency = answer_graph.get("sufficiency", {}) or {}
+    obligations = (
+        list(answer_graph.get("required_obligations", []) or [])
+        + list(answer_graph.get("optional_obligations", []) or [])
+    )
+    findings = []
+    for o in obligations:
+        if o.get("status") != "answered":
+            continue
+        refs = list(o.get("evidence_refs", []) or [])[:4]
+        if not refs:
+            continue
+        findings.append({
+            "claim": str(o.get("question", "") or o.get("id", "") or "Evidence gathered")[:200],
+            "evidence_refs": refs,
+        })
+    recommended_status = sufficiency.get("recommended_status", "PARTIAL")
+    entitlement = sufficiency.get("closure_entitlement", {}) or {}
+    if isinstance(entitlement, dict) and entitlement.get("can_return_complete"):
+        recommended_status = "COMPLETE"
+    return {
+        "oss_report_version": "1.0",
+        "mission_id": str(getattr(mission, "mission_id", "") or ""),
+        "status": recommended_status,
+        "confidence": sufficiency.get("confidence_cap", "MEDIUM"),
+        "closure_source": closure_source,
+        "files_inspected": _ledger_files(ledger),
+        "commands_run": _ledger_commands(ledger),
+        "findings": findings,
+        "uncertainties": [],
+        "caveats": [],
+        "missing_fields": [],
+        "optional_exploration_actions": getattr(ledger, "optional_exploration_actions", 0),
+        "contradiction_search_done": bool(getattr(ledger, "contradiction_search_done", False)),
+    }
 
 
 def build_canonical_answer(
@@ -85,6 +187,8 @@ def build_canonical_answer(
             "reason_codes": sufficiency.get("reason_code", ""),
         },
         "required_findings": required_findings,
+        "files_inspected": _ledger_files(ledger),
+        "commands_run": _ledger_commands(ledger),
         "required_caveats": required_caveats,
         "missing_fields": list(missing_sources + contradicted + blocked),
         "unanswered_obligations": [
@@ -128,6 +232,7 @@ def build_closer_draft_prompt(skeleton: JSON, *, max_chars: int = 5000) -> str:
         "You are writing the narrative layer for a runtime-built report.",
         "",
         "The runtime has already decided status, confidence, findings, evidence refs, and caveats.",
+        "The required source floor is covered; this is a bounded no-tool closer turn.",
         "You must not change them.",
         "",
         "Return only CloserDraftV1 JSON.",
@@ -168,17 +273,30 @@ def build_closer_draft_prompt(skeleton: JSON, *, max_chars: int = 5000) -> str:
 
 def merge_draft_into_report(canonical_answer: JSON, draft: JSON) -> JSON:
     """Merge a CloserDraftV1 into the canonical answer to produce the final report."""
+    finding_narratives = draft.get("finding_narratives", []) or []
+
+    def _finding_text(index: int, fallback: str) -> str:
+        if index >= len(finding_narratives):
+            return fallback
+        item = finding_narratives[index]
+        if isinstance(item, dict):
+            return str(item.get("text", "") or fallback)
+        if isinstance(item, str) and item.strip():
+            return item[:500]
+        return fallback
+
     report = {
         "oss_report_version": "1.0",
         "mission_id": canonical_answer.get("mission_id", ""),
         "status": canonical_answer.get("recommended_status", "PARTIAL"),
         "confidence": canonical_answer.get("confidence_cap", "MEDIUM"),
         "report_source": "model_narrated_runtime_closed",
+        "closure_source": "model_narrated_runtime_closed",
+        "files_inspected": list(canonical_answer.get("files_inspected", []) or []),
+        "commands_run": list(canonical_answer.get("commands_run", []) or []),
         "findings": [
             {
-                "claim": draft.get("finding_narratives", [{}])[i].get("text", f["claim"])
-                if i < len(draft.get("finding_narratives", []) or [])
-                else f["claim"],
+                "claim": _finding_text(i, f["claim"]),
                 "evidence_refs": f["evidence_refs"],
             }
             for i, f in enumerate(canonical_answer.get("required_findings", []) or [])
@@ -320,6 +438,9 @@ def build_runtime_report_from_canonical(canonical_answer: JSON) -> JSON:
         "status": canonical_answer.get("recommended_status", "PARTIAL"),
         "confidence": canonical_answer.get("confidence_cap", "MEDIUM"),
         "report_source": "runtime_closed",
+        "closure_source": "runtime_answer_graph",
+        "files_inspected": list(canonical_answer.get("files_inspected", []) or []),
+        "commands_run": list(canonical_answer.get("commands_run", []) or []),
         "findings": [
             {"claim": f["claim"], "evidence_refs": f["evidence_refs"]}
             for f in findings

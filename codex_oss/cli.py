@@ -639,6 +639,7 @@ def _mission_template(args) -> int:
         "write_allowed": False,
         "allowed_roots": allowed_roots,
         "allowed_paths": allowed_paths,
+        "must_inspect": list(dict.fromkeys(allowed_paths)),
         "forbidden_roots": [],
         "forbidden_topics": [],
         "tool_budget": args.tool_budget,
@@ -768,6 +769,24 @@ def _mission_json_from_text(text: str) -> str:
     return json.dumps(parsed)
 
 
+def _mission_handoff_from_text(text: str) -> tuple[str, dict]:
+    """Return the full handoff text and parsed MissionV1 JSON.
+
+    Mission files can include sibling runtime blocks such as OSS_PATCH_INTENT_JSON.
+    Those blocks are part of the implementation authority handoff and must survive
+    the CLI -> bridge boundary. We still parse the MissionV1 block here so bad
+    mission files fail before the HTTP request.
+    """
+    import json
+
+    stripped = text.strip()
+    mission_json = _mission_json_from_text(stripped)
+    mission = json.loads(mission_json)
+    if "<OSS_HANDOFF_JSON>" in stripped:
+        return stripped, mission
+    return "<OSS_HANDOFF_JSON>\n" + json.dumps(mission) + "\n</OSS_HANDOFF_JSON>", mission
+
+
 def _mission_run(args) -> int:
     import json
     import os
@@ -775,8 +794,7 @@ def _mission_run(args) -> int:
     import urllib.request
 
     try:
-        mission_json = _mission_json_from_text(_read_mission_text(args.file))
-        mission = json.loads(mission_json)
+        handoff_text, mission = _mission_handoff_from_text(_read_mission_text(args.file))
     except Exception as exc:
         print(f"Invalid mission: {exc}", file=sys.stderr)
         return 1
@@ -789,7 +807,7 @@ def _mission_run(args) -> int:
         "input": [
             {
                 "role": "user",
-                "content": "<OSS_HANDOFF_JSON>\n" + json.dumps(mission) + "\n</OSS_HANDOFF_JSON>",
+                "content": handoff_text,
             }
         ],
     }

@@ -302,10 +302,13 @@ class StoredResponse:
     messages: List[JSON]
     pending_call_ids: List[str]
     created_at: int
+    output_items_json: str = "[]"
     tool_exchange_count: int = 0  # v10: tracks turn count for budget enforcement
     task_max_exchanges: int = 1  # v10: per-task-class budget
     read_ledger_json: str = ""  # v10: comma-sep read paths
     command_ledger_json: str = ""  # v10: pipe-sep commands
+    previous_response_id: str = ""
+    pending_replay_count: int = 0
 
 
 # ── v10: Task-class budgets ──
@@ -346,6 +349,67 @@ TASK_FIELD_LABELS = (
     "RELEVANT CONVENTIONS", "VERIFICATION STEPS", "VERIFICATION",
     "DELIVERABLE", "COMPLETION RULE", "ESCALATION RULE",
 )
+
+PLACEHOLDER_PATH_MARKERS = (
+    "<file", "<path", "<files", "files or dirs", "path/to/", "path_to_",
+    "replace_me", "your_file", "example/path",
+)
+
+
+def _is_placeholder_path(path: str) -> bool:
+    p = str(path or "").strip()
+    if not p:
+        return True
+    lower = p.lower()
+    if p.startswith("<") and p.endswith(">"):
+        return True
+    return any(marker in lower for marker in PLACEHOLDER_PATH_MARKERS)
+
+
+def _clean_required_paths(paths: list) -> list:
+    cleaned = []
+    seen = set()
+    for raw in paths or []:
+        path = str(raw or "").strip()
+        if not path or _is_placeholder_path(path):
+            continue
+        key = path.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(path)
+    return cleaned
+
+
+def _extract_inline_file_paths(text: str) -> list:
+    """Conservative fallback for unstructured direct-agent prompts."""
+    candidates = []
+    pattern = r"(?<![<\w/])(?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+\.(?:md|py|txt|json|toml|ya?ml|js|jsx|ts|tsx|css|html)(?![>\w])"
+    candidates.extend(re.findall(pattern, str(text or "")))
+    bare_pattern = r"(?<![<\w/])(?:README|AGENTS|CHANGELOG|LICENSE)\.(?:md|txt)(?![>\w])"
+    candidates.extend(re.findall(bare_pattern, str(text or ""), flags=re.IGNORECASE))
+    clean = _clean_required_paths(candidates)
+    positive: list[str] = []
+    source = str(text or "")
+    for path in clean:
+        idx = source.find(path)
+        if idx < 0:
+            positive.append(path)
+            continue
+        window = source[max(0, idx - 80):idx].lower()
+        neg = (
+            "do not inspect" in window
+            or "do not read" in window
+            or "don't inspect" in window
+            or "don't read" in window
+            or "never inspect" in window
+            or "never read" in window
+            or "forbidden" in window
+            or "not as task evidence" in source[idx:idx + len(path) + 120].lower()
+        )
+        if not neg:
+            positive.append(path)
+    return _clean_required_paths(positive)
 
 
 def _extract_budget(messages: List[JSON]) -> int:
@@ -414,14 +478,25 @@ def extract_allowed_paths(handoff_text: str) -> list:
         if section:
             parts = _parse_path_list(section)
             paths.extend([p for p in parts if p and not p.lower().startswith(("no ", "none", "do not", "git ")) and len(p) > 1])
-            return paths
+            return _clean_required_paths(paths)
     for sep in ("READ-ONLY PATHS:", "OWNED PATHS:", "ALLOWED PATHS:"):
         if sep in handoff_text:
             after = _extract_segment(handoff_text, sep)
             parts = _parse_path_list(after)
             paths.extend([p for p in parts if p and not p.lower().startswith(("no ", "none", "do not", "git ")) and len(p) > 1])
             break
-    return paths
+    return _clean_required_paths(paths)
+
+
+def required_paths_from_envelope(envelope: dict, handoff_text: str) -> list:
+    """Return required source paths from the parsed handoff, falling back to legacy labels."""
+    for key in ("read_only_paths", "owned_paths", "allowed_paths"):
+        paths = envelope.get(key)
+        if isinstance(paths, list) and paths:
+            cleaned = _clean_required_paths([str(p) for p in paths if str(p).strip()])
+            if cleaned:
+                return cleaned
+    return extract_allowed_paths(handoff_text) or _extract_inline_file_paths(handoff_text)
 
 
 def extract_required_deliverables(handoff_text: str) -> list:
@@ -489,15 +564,23 @@ def normalize_tool_args(args, tool_name: str) -> tuple:
     return (None, json.dumps(args))
 
 
-def _read_path_from_shell_command(command: str) -> Optional[str]:
+def _shell_parts(command: str) -> list[str]:
     try:
-        parts = shlex.split(command)
+        return shlex.split(command)
     except ValueError:
-        return None
+        return []
+
+
+def _read_path_from_shell_command(command: str) -> Optional[str]:
+    parts = _shell_parts(command)
     if len(parts) >= 3 and parts[0] == "rtk" and parts[1] == "read":
-        path = parts[2]
+        path = " ".join(parts[2:])
     elif len(parts) >= 2 and parts[0] == "cat":
-        path = parts[1]
+        path = " ".join(parts[1:])
+    elif len(parts) >= 4 and parts[0] == "rtk" and parts[1] == "grep":
+        path = " ".join(parts[3:])
+    elif len(parts) >= 3 and parts[0] == "grep":
+        path = " ".join(parts[2:])
     elif len(parts) >= 3 and parts[0] == "sed" and parts[-1] != "-n":
         path = parts[-1]
     else:
@@ -506,6 +589,25 @@ def _read_path_from_shell_command(command: str) -> Optional[str]:
     if os.path.isabs(path) and path.startswith(cwd + os.sep):
         return os.path.relpath(path, cwd)
     return path
+
+
+def _shell_command_is_read_like(command: str) -> bool:
+    parts = _shell_parts(command)
+    if not parts:
+        return False
+    if parts[0] == "rtk" and len(parts) >= 2 and parts[1] in ("read", "grep", "find", "ls"):
+        return True
+    return parts[0] in ("cat", "grep", "sed", "find", "ls")
+
+
+def effective_tool_kind(tool_name: str, tool_args: str, current_kind: ToolKind) -> ToolKind:
+    """Classify shell wrappers around read/search commands as read-like for closure."""
+    if current_kind != "shell":
+        return current_kind
+    _, command = normalize_tool_args(tool_args, tool_name)
+    if command and _shell_command_is_read_like(command):
+        return "read"
+    return current_kind
 
 
 def inject_evidence_ledger(messages: list, ledger: ReadLedger, required_paths: list,
@@ -562,6 +664,39 @@ def _extract_read_paths_from_history(messages: list) -> set:
     return paths
 
 
+def _extract_completed_read_paths_from_history(messages: list) -> set:
+    """Extract read-like paths whose assistant tool calls have matching tool results."""
+    pending: Dict[str, str] = {}
+    completed = set()
+    for msg in messages:
+        for tc in msg.get("tool_calls") or []:
+            func = tc.get("function", {})
+            name = func.get("name", "")
+            args = func.get("arguments", "{}")
+            path, _ = normalize_tool_args(args, name)
+            kind = effective_tool_kind(name, args, classify_tool_call_name(name))
+            if path and kind == "read":
+                call_id = tc.get("id") or tc.get("codex", {}).get("call_id")
+                if call_id:
+                    pending[str(call_id)] = path
+        codex_tc = msg.get("codex")
+        if codex_tc and isinstance(codex_tc, dict):
+            name = codex_tc.get("name", "")
+            args = codex_tc.get("arguments", "{}")
+            path, _ = normalize_tool_args(args, name)
+            kind = effective_tool_kind(name, args, classify_tool_call_name(name))
+            call_id = codex_tc.get("call_id") or codex_tc.get("id")
+            if path and kind == "read" and call_id:
+                pending[str(call_id)] = path
+
+        tool_call_id = msg.get("tool_call_id") or msg.get("call_id")
+        if msg.get("role") in ("tool", "function") or msg.get("type") in ("function_call_output", "tool_result"):
+            path = pending.get(str(tool_call_id or ""))
+            if path:
+                completed.add(path)
+    return completed
+
+
 def _count_tool_result_messages(messages: list) -> int:
     count = 0
     for msg in messages:
@@ -576,10 +711,35 @@ def _count_tool_result_messages(messages: list) -> int:
 
 def _extract_handoff_text(messages: list) -> str:
     """Extract the most likely current OSS handoff, not the whole history."""
+    def _is_instruction_dump(text: str) -> bool:
+        t = str(text or "")
+        return (
+            t.lstrip().startswith("# AGENTS.md instructions")
+            or "<INSTRUCTIONS>" in t
+            or "--- project-doc ---" in t
+        )
+
+    user_texts = [
+        str(msg["content"])
+        for msg in messages
+        if msg.get("role") == "user" and msg.get("content")
+    ]
+    task_user_texts = [text for text in user_texts if not _is_instruction_dump(text)]
+    search_texts = task_user_texts or user_texts
+    for text in reversed(search_texts):
+        if "OSS_HANDOFF_JSON" in text:
+            return text
+    for text in reversed(search_texts):
+        if _extract_inline_file_paths(text):
+            return text
+    for text in reversed(search_texts):
+        if _handoff_score(text) >= 1:
+            return text
+
     best_text = ""
     best_score = 0
     for msg in messages:
-        if msg.get("role") in ("system", "developer", "user") and msg.get("content"):
+        if msg.get("role") in ("system", "developer") and msg.get("content"):
             text = str(msg["content"])
             score = _handoff_score(text)
             if score >= best_score and score >= 2:
@@ -587,6 +747,8 @@ def _extract_handoff_text(messages: list) -> str:
                 best_score = score
     if best_text:
         return best_text
+    if user_texts:
+        return user_texts[-1]
     return " ".join(
         str(msg["content"])
         for msg in messages
@@ -630,7 +792,7 @@ class TaskSession:
 def select_execution_mode(handoff_text: str) -> str:
     """Choose execution mode based on handoff content."""
     task_class = extract_task_class(handoff_text)
-    paths = extract_allowed_paths(handoff_text)
+    paths = extract_allowed_paths(handoff_text) or _extract_inline_file_paths(handoff_text)
     # Paths are explicit known sources → context pack is best
     if task_class in ("prep_report", "scout") and len(paths) >= 2:
         return "context_pack"
@@ -650,7 +812,9 @@ def build_task_session(body: JSON, handoff_text: str, response_id: str) -> TaskS
     envelope = parse_task_envelope(handoff_text)
     task_class = envelope.get("task_type") or extract_task_class(handoff_text)
     mode = select_mode(envelope)
-    paths = envelope.get("read_only_paths") or extract_allowed_paths(handoff_text)
+    paths = required_paths_from_envelope(envelope, handoff_text)
+    if mode == "managed_autonomy" and paths:
+        mode = "context_pack_report"
     fields = envelope.get("deliverable_fields") or extract_required_deliverables(handoff_text)
     budget = get_task_budget(task_class)
 
@@ -905,6 +1069,8 @@ def validate_report(text: str, required_fields: list) -> tuple:
     """Check if the output is a valid report. Returns (is_valid, missing_fields)."""
     if len(text.strip()) < 50:
         return False, ["report_too_short"]
+    if is_intent_or_status(text):
+        return False, ["intent_or_status_detected"]
     if "Running the" in text and "startup" in text.lower():
         return False, ["startup_sentence_not_report"]
     missing = [f for f in required_fields if f.lower() not in text.lower()]
@@ -1314,12 +1480,16 @@ def _parse_path_list(line: str) -> list:
         if p.startswith("/"):
             cwd = os.getcwd()
             if p.startswith(cwd):
-                normalized.append(os.path.relpath(p, cwd))
+                rel = os.path.relpath(p, cwd)
+                if not _is_placeholder_path(rel):
+                    normalized.append(rel)
             else:
-                normalized.append(p)
+                if not _is_placeholder_path(p):
+                    normalized.append(p)
         else:
-            normalized.append(p)
-    return normalized
+            if not _is_placeholder_path(p):
+                normalized.append(p)
+    return _clean_required_paths(normalized)
 
 
 def select_mode(envelope: dict) -> str:
@@ -1340,6 +1510,10 @@ def select_mode(envelope: dict) -> str:
     if envelope.get("no_tools_required"):
         return "no_tool_exact"
     return "managed_autonomy"
+
+
+def legacy_direct_write_modes_enabled() -> bool:
+    return os.getenv("OSS_LEGACY_DIRECT_WRITES", "0").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def should_use_direct_agent_loop(mode: str, evidence_ledger_present: bool, enabled: bool = True) -> bool:
@@ -1372,6 +1546,497 @@ def direct_loop_required_sources_satisfied(required_paths: list, read_paths: set
             continue
         return False
     return True
+
+
+def _path_set_contains(paths: set, target_path: str) -> bool:
+    if not target_path:
+        return False
+    return any(_path_satisfies_required_path(path, target_path) for path in paths)
+
+
+def _remaining_required_paths(required_paths: list, read_paths: set) -> list:
+    remaining = []
+    for required in required_paths or []:
+        if not any(_path_satisfies_required_path(path, required) for path in read_paths):
+            remaining.append(required)
+    return remaining
+
+
+def direct_loop_terminal_decision(
+    required_paths: list,
+    completed_read_paths: set,
+    current_path: str,
+    turn: int,
+    max_exchanges: int,
+) -> tuple:
+    """Return (decision, remaining_paths) for direct read-loop continuation safety."""
+    evidence_paths = set(completed_read_paths or set())
+    current_repeats_completed = _path_set_contains(evidence_paths, current_path)
+    if current_path:
+        evidence_paths.add(current_path)
+    remaining = _remaining_required_paths(required_paths, evidence_paths)
+    if not remaining:
+        return ("sources_satisfied", [])
+    if current_repeats_completed:
+        return ("repeated_completed_read", remaining)
+    if turn >= max_exchanges:
+        return ("budget_exhausted", remaining)
+    return ("continue", remaining)
+
+
+def build_direct_loop_terminal_report(
+    *,
+    reason: str,
+    model_alias: str,
+    completed_paths: set,
+    current_path: str,
+    remaining_paths: list,
+    turn: int,
+    max_exchanges: int,
+) -> str:
+    evidence_paths = set(completed_paths or set())
+    if current_path:
+        evidence_paths.add(current_path)
+    inspected = ", ".join(sorted(evidence_paths)) or "none"
+    missing = ", ".join(remaining_paths or []) or "none"
+    return (
+        "PARTIAL\n"
+        "Synthesis status: DETERMINISTIC_DIRECT_LOOP_TERMINAL\n"
+        f"Reason: {reason}\n"
+        f"Model: {model_alias}\n"
+        f"Tool exchanges: {turn}/{max_exchanges}\n"
+        f"Files inspected: {inspected}\n"
+        f"Missing required sources: {missing}\n"
+        "Confidence: MEDIUM\n"
+        "Caveats: The bridge stopped the direct OSS tool loop deterministically because "
+        "the model did not make forward progress across required sources."
+    )
+
+
+def _pending_tool_call_outputs_from_state(state: StoredResponse) -> list:
+    pending = set(str(x) for x in state.pending_call_ids or [])
+    try:
+        stored_output = json.loads(state.output_items_json or "[]")
+    except Exception:
+        stored_output = []
+    if isinstance(stored_output, list):
+        stable_items = []
+        for item in stored_output:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") != "function_call":
+                continue
+            if str(item.get("call_id") or "") not in pending:
+                continue
+            stable = dict(item)
+            stable["status"] = "completed"
+            stable_items.append(stable)
+        if stable_items:
+            return stable_items
+
+    output = []
+    for msg in state.messages:
+        for tc in msg.get("tool_calls") or []:
+            call_id = str(tc.get("id") or tc.get("codex", {}).get("call_id") or "")
+            if call_id not in pending:
+                continue
+            func = tc.get("function", {})
+            output.append({
+                "type": "function_call",
+                "id": new_id("fc"),
+                "call_id": call_id,
+                "name": func.get("name", "tool"),
+                "arguments": func.get("arguments", "{}"),
+                "status": "completed",
+            })
+    return output
+
+
+def build_response_from_pending_child(body: JSON, state: StoredResponse) -> JSON:
+    """Rebuild a stored pending tool-call response for idempotent continuation replay."""
+    return APP.build_response_shell(
+        body,
+        state.model_alias,
+        response_id=state.response_id,
+        created_at=state.created_at,
+        status="completed",
+        output=_pending_tool_call_outputs_from_state(state),
+    )
+
+
+def _pending_command_summaries_from_state(state: StoredResponse) -> list:
+    out = []
+    for item in _pending_tool_call_outputs_from_state(state):
+        path, command = normalize_tool_args(item.get("arguments", "{}"), item.get("name", ""))
+        out.append(command or path or item.get("name", "tool"))
+    return out
+
+
+def _pending_command_signature_from_output_json(output_items_json: str) -> str:
+    try:
+        items = json.loads(output_items_json or "[]")
+    except Exception:
+        items = []
+    summaries = []
+    for item in items if isinstance(items, list) else []:
+        if not isinstance(item, dict) or item.get("type") != "function_call":
+            continue
+        path, command = normalize_tool_args(item.get("arguments", "{}"), item.get("name", ""))
+        summaries.append(command or path or str(item.get("name", "tool")))
+    return "\n".join(summaries)
+
+
+def _tool_args_dict(tool_args: Any) -> dict:
+    if isinstance(tool_args, dict):
+        return tool_args
+    if isinstance(tool_args, str):
+        try:
+            parsed = json.loads(tool_args)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            return {}
+    return {}
+
+
+def _command_workdir(tool_args: Any, default: str) -> str:
+    args = _tool_args_dict(tool_args)
+    workdir = str(args.get("workdir") or "").strip()
+    if workdir and os.path.isdir(workdir):
+        return workdir
+    return default
+
+
+def _workdir_from_history(messages: list, default: str) -> str:
+    for msg in reversed(messages or []):
+        for tc in reversed(msg.get("tool_calls") or []):
+            args = tc.get("function", {}).get("arguments", "{}")
+            workdir = _command_workdir(args, "")
+            if workdir:
+                return workdir
+    return default
+
+
+def _matching_required_path(path: str, required_paths: list) -> str:
+    for required in required_paths or []:
+        if _path_satisfies_required_path(path, required):
+            return required
+    return ""
+
+
+def _hash_text(text: str) -> str:
+    import hashlib
+    return hashlib.sha256(str(text or "").encode("utf-8", errors="replace")).hexdigest()
+
+
+def _safe_evidence_excerpt(text: str, *, max_chars: int = 1200) -> tuple:
+    """Return a short redacted excerpt for model-authored synthesis."""
+    try:
+        from codex_oss.runtime.policy import scan_secrets
+        redacted, found_secret = scan_secrets(str(text or ""))
+    except Exception:
+        redacted, found_secret = str(text or ""), False
+    lines = []
+    for line in redacted.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        lines.append(stripped[:240])
+        if len("\n".join(lines)) >= max_chars:
+            break
+    excerpt = "\n".join(lines)
+    if len(excerpt) > max_chars:
+        excerpt = excerpt[:max_chars].rsplit("\n", 1)[0].rstrip() + "\n[truncated]"
+    return excerpt, found_secret or len(str(text or "")) > len(excerpt)
+
+
+def _completed_read_evidence_from_history(messages: list) -> dict:
+    pending: Dict[str, str] = {}
+    evidence = {}
+    for msg in messages:
+        for tc in msg.get("tool_calls") or []:
+            func = tc.get("function", {})
+            name = func.get("name", "")
+            args = func.get("arguments", "{}")
+            path, _ = normalize_tool_args(args, name)
+            kind = effective_tool_kind(name, args, classify_tool_call_name(name))
+            call_id = tc.get("id") or tc.get("codex", {}).get("call_id")
+            if path and _is_placeholder_path(path):
+                continue
+            if path and kind == "read" and call_id:
+                pending[str(call_id)] = path
+        tool_call_id = msg.get("tool_call_id") or msg.get("call_id")
+        if msg.get("role") in ("tool", "function") or msg.get("type") in ("function_call_output", "tool_result"):
+            path = pending.get(str(tool_call_id or ""))
+            if path:
+                content = as_text(msg.get("content", msg.get("output", "")))
+                excerpt, redacted = _safe_evidence_excerpt(content)
+                evidence[path] = {
+                    "path": path,
+                    "source": "consumer_tool_output",
+                    "exit_code": 0,
+                    "output_chars": len(content),
+                    "output_sha256": _hash_text(content),
+                    "output_excerpt": excerpt,
+                    "redactions_applied": redacted,
+                }
+    return evidence
+
+
+def _default_rtk_read_executor(path: str, workdir: str) -> tuple:
+    try:
+        proc = subprocess.run(
+            ["rtk", "read", path],
+            cwd=workdir,
+            capture_output=True,
+            text=True,
+            timeout=float(os.getenv("OSS_SERVER_SIDE_READ_TIMEOUT_SECONDS", "20")),
+        )
+        return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
+    except Exception as exc:
+        return 1, str(exc)
+
+
+def build_server_side_read_completion_report(
+    *,
+    parent_response_id: str,
+    child_state: StoredResponse,
+    required_paths: list,
+    evidence: dict,
+    failures: list,
+) -> str:
+    completed_paths = set(evidence.keys())
+    missing = _remaining_required_paths(required_paths, completed_paths)
+    status = "COMPLETE" if not missing and not failures else "PARTIAL"
+    lines = [
+        status,
+        "Synthesis status: DETERMINISTIC_SERVER_SIDE_READ_COMPLETION",
+        "Reason: pending_tool_call_not_adopted_recovered_by_bridge",
+        f"Parent response: {parent_response_id}",
+        f"Pending response: {child_state.response_id}",
+        f"Replay count: {child_state.pending_replay_count}",
+        f"Files inspected: {', '.join(sorted(completed_paths)) if completed_paths else 'none'}",
+        f"Missing required sources: {', '.join(missing) if missing else 'none'}",
+        "No writes performed: true",
+        "Evidence:",
+    ]
+    for path in sorted(evidence):
+        item = evidence[path]
+        lines.append(
+            f"- {path}: source={item.get('source')}, chars={item.get('output_chars')}, "
+            f"sha256={item.get('output_sha256')}"
+        )
+    if failures:
+        lines.append("Failures:")
+        lines.extend(f"- {failure}" for failure in failures)
+    lines.extend([
+        "Confidence: HIGH" if status == "COMPLETE" else "Confidence: MEDIUM",
+        "Caveats: The consumer did not adopt a pending read tool call, so the bridge completed "
+        "the declared read-only evidence floor deterministically from the task ledger.",
+    ])
+    return "\n".join(lines)
+
+
+def build_server_side_read_finalizer_prompt(
+    *,
+    handoff_text: str,
+    required_paths: list,
+    evidence: dict,
+    failures: list,
+) -> str:
+    """Build a no-tools prompt for natural prose over canonical read evidence."""
+    requested = ", ".join(required_paths or []) or "none"
+    evidence_lines = []
+    for path in sorted(evidence):
+        item = evidence[path]
+        evidence_lines.append(
+            f"PATH: {path}\n"
+            f"SOURCE: {item.get('source')}\n"
+            f"EXIT_CODE: {item.get('exit_code')}\n"
+            f"CHARS: {item.get('output_chars')}\n"
+            f"SHA256: {item.get('output_sha256')}\n"
+            f"EXCERPT:\n{item.get('output_excerpt', '')}"
+        )
+    failure_text = "\n".join(f"- {f}" for f in failures) if failures else "none"
+    return (
+        "You are writing the final report for a read-only OSS subagent task.\n"
+        "The bridge/runtime already gathered the evidence below. Do not call tools. "
+        "Do not claim files were modified. Do not mention hidden reasoning or private scratchpads.\n\n"
+        "Write a natural, user-facing final report. Include:\n"
+        "- status: COMPLETE if all required paths were inspected and there are no failures; otherwise PARTIAL\n"
+        "- files inspected\n"
+        "- concise findings based only on the evidence excerpts\n"
+        "- confidence\n"
+        "- caveats\n\n"
+        f"Original handoff:\n{handoff_text[:2000]}\n\n"
+        f"Required paths: {requested}\n"
+        f"Failures: {failure_text}\n\n"
+        "Canonical evidence:\n"
+        f"{chr(10).join(evidence_lines)[:6000]}"
+    )
+
+
+def try_model_authored_server_side_read_report(
+    *,
+    handoff_text: str,
+    required_paths: list,
+    evidence: dict,
+    failures: list,
+    finalizer_call,
+    timeout_seconds: float,
+    log_fn=None,
+) -> str:
+    """Return natural model-authored read report when a bounded finalizer succeeds."""
+    if failures or not callable(finalizer_call):
+        return ""
+    required_fields = extract_required_deliverables(handoff_text)
+    if not required_fields:
+        required_fields = ["files inspected", "confidence", "caveats"]
+    prompt = build_server_side_read_finalizer_prompt(
+        handoff_text=handoff_text,
+        required_paths=required_paths,
+        evidence=evidence,
+        failures=failures,
+    )
+    try:
+        text = str(finalizer_call(prompt, timeout_seconds) or "").strip()
+    except Exception as exc:
+        if log_fn:
+            log_fn("server_side_read_model_finalizer_failed", error=str(exc))
+        return ""
+    valid, missing = validate_report(text, required_fields)
+    if not valid:
+        if log_fn:
+            log_fn("server_side_read_model_finalizer_invalid", missing=missing, text_len=len(text))
+        return ""
+    completed = set(evidence.keys())
+    missing_paths = _remaining_required_paths(required_paths, completed)
+    audit = (
+        "\n\nBridge evidence audit:\n"
+        "Synthesis status: MODEL_AUTHORED_SERVER_SIDE_READ_COMPLETION\n"
+        "Evidence-gathering status: PASS\n"
+        f"Files inspected: {', '.join(sorted(completed)) if completed else 'none'}\n"
+        f"Missing required sources: {', '.join(missing_paths) if missing_paths else 'none'}\n"
+        "No writes performed: true"
+    )
+    if log_fn:
+        log_fn("server_side_read_model_finalizer_ok", text_len=len(text))
+    return text + audit
+
+
+def complete_pending_reads_from_bridge(
+    *,
+    parent_response_id: str,
+    child_state: StoredResponse,
+    handoff_text: str,
+    project_root: str,
+    executor=None,
+    finalizer_call=None,
+    finalizer_timeout_seconds: float = 8,
+    log_fn=None,
+) -> str:
+    envelope = parse_task_envelope(handoff_text)
+    required_paths = required_paths_from_envelope(envelope, handoff_text)
+    if not required_paths:
+        return ""
+    read_executor = executor or _default_rtk_read_executor
+    evidence = _completed_read_evidence_from_history(child_state.messages)
+    failures = []
+    workdir = _workdir_from_history(child_state.messages, project_root)
+
+    for item in _pending_tool_call_outputs_from_state(child_state):
+        name = item.get("name", "")
+        args = item.get("arguments", "{}")
+        path, _ = normalize_tool_args(args, name)
+        kind = effective_tool_kind(name, args, classify_tool_call_name(name))
+        if path and _is_placeholder_path(path):
+            continue
+        if kind != "read" or not path:
+            continue
+        required = _matching_required_path(path, required_paths)
+        if not required:
+            failures.append(f"pending read path is outside required sources: {path}")
+            continue
+        workdir = _command_workdir(args, workdir)
+        if any(_path_satisfies_required_path(done, required) for done in evidence):
+            continue
+        exit_code, output = read_executor(path, workdir)
+        if exit_code == 0:
+            excerpt, redacted = _safe_evidence_excerpt(output)
+            evidence[required] = {
+                "path": required,
+                "source": "bridge_server_side_read",
+                "exit_code": exit_code,
+                "output_chars": len(output),
+                "output_sha256": _hash_text(output),
+                "output_excerpt": excerpt,
+                "redactions_applied": redacted,
+            }
+        else:
+            failures.append(f"{required}: exit_code={exit_code} output={str(output)[:200]}")
+
+    for required in _remaining_required_paths(required_paths, set(evidence.keys())):
+        exit_code, output = read_executor(required, workdir)
+        if exit_code == 0:
+            excerpt, redacted = _safe_evidence_excerpt(output)
+            evidence[required] = {
+                "path": required,
+                "source": "bridge_server_side_read",
+                "exit_code": exit_code,
+                "output_chars": len(output),
+                "output_sha256": _hash_text(output),
+                "output_excerpt": excerpt,
+                "redactions_applied": redacted,
+            }
+        else:
+            failures.append(f"{required}: exit_code={exit_code} output={str(output)[:200]}")
+
+    model_report = try_model_authored_server_side_read_report(
+        handoff_text=handoff_text,
+        required_paths=required_paths,
+        evidence=evidence,
+        failures=failures,
+        finalizer_call=finalizer_call,
+        timeout_seconds=finalizer_timeout_seconds,
+        log_fn=log_fn,
+    )
+    if model_report:
+        return model_report
+
+    return build_server_side_read_completion_report(
+        parent_response_id=parent_response_id,
+        child_state=child_state,
+        required_paths=required_paths,
+        evidence=evidence,
+        failures=failures,
+    )
+
+
+def build_pending_child_not_fulfilled_report(
+    *,
+    parent_response_id: str,
+    child_state: StoredResponse,
+    handoff_text: str,
+) -> str:
+    envelope = parse_task_envelope(handoff_text)
+    required_paths = required_paths_from_envelope(envelope, handoff_text)
+    completed_paths = _extract_completed_read_paths_from_history(child_state.messages)
+    missing = _remaining_required_paths(required_paths, completed_paths)
+    pending = _pending_command_summaries_from_state(child_state)
+    return (
+        "PARTIAL\n"
+        "Synthesis status: DETERMINISTIC_PENDING_TOOL_ADOPTION_FAILURE\n"
+        "Reason: pending_tool_call_not_fulfilled\n"
+        f"Parent response: {parent_response_id}\n"
+        f"Pending response: {child_state.response_id}\n"
+        f"Replay count: {child_state.pending_replay_count}\n"
+        f"Pending command: {', '.join(pending) if pending else 'unknown'}\n"
+        f"Files inspected: {', '.join(sorted(completed_paths)) if completed_paths else 'none'}\n"
+        f"Missing required sources: {', '.join(missing) if missing else 'none'}\n"
+        "Confidence: MEDIUM\n"
+        "Caveats: The bridge had already produced the next tool call, but the consumer "
+        "kept replaying the parent tool result instead of fulfilling the pending call."
+    )
 
 
 def is_intent_or_status(text: str) -> bool:
@@ -1425,9 +2090,47 @@ def tool_output_indicates_failure(output_text: str) -> bool:
     lowered = str(output_text or "").lower()
     if re.search(r"(process exited with code|exit code|exit_code:)\s*[1-9]\d*", lowered):
         return True
-    if any(token in lowered for token in ("traceback (most recent call last)", "assertionerror", "syntaxerror")):
+    if any(token in lowered for token in (
+        "traceback (most recent call last)",
+        "assertionerror",
+        "syntaxerror",
+        "command blocked by pretooluse hook",
+        "blocked by pretooluse",
+        "pre-tool block",
+        "pretooluse",
+    )):
         return True
     return False
+
+
+def pretool_block_repair_instruction(output_text: str) -> str:
+    text = str(output_text or "")
+    lowered = text.lower()
+    if "pretooluse" not in lowered and "pre-tool" not in lowered:
+        return ""
+    if "use `rtk read" in lowered or "instead of raw `cat`" in lowered:
+        return (
+            "[RUNTIME TOOL REPAIR]\n"
+            "Your previous file-read command was blocked by repo policy. Retry with `rtk read <path>`. "
+            "Do not use `cat`, and do not treat the blocked command as the final answer."
+        )
+    if "use `rtk ls" in lowered or "instead of raw `ls`" in lowered:
+        return (
+            "[RUNTIME TOOL REPAIR]\n"
+            "Your previous list command was blocked by repo policy. Retry with `rtk ls <path>`. "
+            "Do not use raw `ls`, and do not treat the blocked command as the final answer."
+        )
+    if "use `rtk grep" in lowered or "instead of raw `rg`" in lowered or "instead of raw `grep`" in lowered:
+        return (
+            "[RUNTIME TOOL REPAIR]\n"
+            "Your previous search command was blocked by repo policy. Retry with `rtk grep <pattern> <path>`. "
+            "Do not treat the blocked command as the final answer."
+        )
+    return (
+        "[RUNTIME TOOL REPAIR]\n"
+        "Your previous command was blocked by repo policy. Retry once using the suggested RTK replacement from the tool output. "
+        "Do not treat the blocked command as the final answer."
+    )
 
 
 def validate_report_output(text: str, mode: str, envelope: dict,
@@ -1546,6 +2249,18 @@ class StateStore:
             self.db.execute("ALTER TABLE responses ADD COLUMN task_max_exchanges INTEGER DEFAULT 1")
         except sqlite3.OperationalError:
             pass
+        try:
+            self.db.execute("ALTER TABLE responses ADD COLUMN previous_response_id TEXT DEFAULT ''")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            self.db.execute("ALTER TABLE responses ADD COLUMN pending_replay_count INTEGER DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            self.db.execute("ALTER TABLE responses ADD COLUMN output_items_json TEXT DEFAULT '[]'")
+        except sqlite3.OperationalError:
+            pass
         self.db.commit()
 
     def cleanup(self) -> None:
@@ -1566,11 +2281,29 @@ class StateStore:
 
     def put(self, state: StoredResponse) -> None:
         with self.lock:
+            if state.previous_response_id and state.pending_call_ids:
+                signature = _pending_command_signature_from_output_json(state.output_items_json or "[]")
+                if signature:
+                    rows = self.db.execute(
+                        """
+                        SELECT output_items_json FROM responses
+                        WHERE previous_response_id = ?
+                          AND response_id != ?
+                          AND pending_call_ids_json NOT IN ('[]', '')
+                        """,
+                        (state.previous_response_id, state.response_id),
+                    ).fetchall()
+                    semantic_replays = sum(
+                        1
+                        for row in rows
+                        if _pending_command_signature_from_output_json(row[0] or "[]") == signature
+                    )
+                    state.pending_replay_count = max(int(state.pending_replay_count or 0), semantic_replays)
             self.db.execute(
                 """
                 INSERT OR REPLACE INTO responses
-                (response_id, model_alias, model_upstream, messages_json, pending_call_ids_json, created_at, tool_exchange_count, task_max_exchanges)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                (response_id, model_alias, model_upstream, messages_json, pending_call_ids_json, created_at, tool_exchange_count, task_max_exchanges, previous_response_id, pending_replay_count, output_items_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     state.response_id,
@@ -1581,6 +2314,9 @@ class StateStore:
                     state.created_at,
                     state.tool_exchange_count,
                     state.task_max_exchanges,
+                    state.previous_response_id,
+                    state.pending_replay_count,
+                    state.output_items_json or "[]",
                 ),
             )
             for call_id in state.pending_call_ids:
@@ -1594,7 +2330,10 @@ class StateStore:
         with self.lock:
             row = self.db.execute(
                 "SELECT response_id, model_alias, model_upstream, messages_json, pending_call_ids_json, created_at, "
-                "COALESCE(tool_exchange_count, 0), COALESCE(task_max_exchanges, 1) FROM responses WHERE response_id = ?",
+                "COALESCE(tool_exchange_count, 0), COALESCE(task_max_exchanges, 1), "
+                "COALESCE(previous_response_id, ''), COALESCE(pending_replay_count, 0), "
+                "COALESCE(output_items_json, '[]') "
+                "FROM responses WHERE response_id = ?",
                 (response_id,),
             ).fetchone()
         if not row:
@@ -1608,6 +2347,9 @@ class StateStore:
             created_at=int(row[5]),
             tool_exchange_count=row[6] if len(row) > 6 else 0,
             task_max_exchanges=row[7] if len(row) > 7 else 1,
+            previous_response_id=row[8] if len(row) > 8 else "",
+            pending_replay_count=row[9] if len(row) > 9 else 0,
+            output_items_json=row[10] if len(row) > 10 else "[]",
         )
 
     def find_by_call_ids(self, call_ids: Iterable[str]) -> Optional[StoredResponse]:
@@ -1622,6 +2364,56 @@ class StateStore:
         if not rows:
             return None
         return self.get(rows[0][0])
+
+    def find_pending_child(self, previous_response_id: str) -> Optional[StoredResponse]:
+        if not previous_response_id:
+            return None
+        with self.lock:
+            row = self.db.execute(
+                """
+                SELECT response_id FROM responses
+                WHERE previous_response_id = ?
+                  AND pending_call_ids_json NOT IN ('[]', '')
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (str(previous_response_id),),
+            ).fetchone()
+        if not row:
+            return None
+        return self.get(row[0])
+
+    def find_terminal_pending_child(self, previous_response_id: str, replay_limit: int) -> Optional[StoredResponse]:
+        if not previous_response_id:
+            return None
+        with self.lock:
+            row = self.db.execute(
+                """
+                SELECT response_id FROM responses
+                WHERE previous_response_id = ?
+                  AND pending_call_ids_json NOT IN ('[]', '')
+                  AND COALESCE(pending_replay_count, 0) > ?
+                ORDER BY COALESCE(pending_replay_count, 0) DESC, created_at DESC
+                LIMIT 1
+                """,
+                (str(previous_response_id), int(replay_limit)),
+            ).fetchone()
+        if not row:
+            return None
+        return self.get(row[0])
+
+    def increment_pending_replay_count(self, response_id: str) -> int:
+        with self.lock:
+            self.db.execute(
+                "UPDATE responses SET pending_replay_count = COALESCE(pending_replay_count, 0) + 1 WHERE response_id = ?",
+                (response_id,),
+            )
+            row = self.db.execute(
+                "SELECT COALESCE(pending_replay_count, 0) FROM responses WHERE response_id = ?",
+                (response_id,),
+            ).fetchone()
+            self.db.commit()
+        return int(row[0]) if row else 0
 
 
 class HistoryRepairError(Exception):
@@ -2110,6 +2902,39 @@ def build_deterministic_error_report(error_kind: str, details: str) -> JSON:
     }
 
 
+def build_read_evidence_metadata(
+    *,
+    model_alias: str,
+    tool_name: str,
+    tool_kind: str,
+    tool_call_id: str,
+    tool_args: str,
+    target_path: str,
+    output_text: str,
+    exit_code: int,
+    required_fields: list,
+) -> JSON:
+    """Canonical evidence object for runtime-owned read closure."""
+    import hashlib
+
+    output_bytes = output_text.encode("utf-8", errors="replace")
+    _, command = normalize_tool_args(tool_args, tool_name)
+    return {
+        "schema_version": "raw_read_evidence.v1",
+        "model_alias": model_alias,
+        "tool_name": tool_name,
+        "tool_kind": tool_kind,
+        "tool_call_id": tool_call_id,
+        "command": command,
+        "normalized_path": target_path,
+        "exit_code": exit_code,
+        "output_chars": len(output_text),
+        "output_lines": len(output_text.splitlines()),
+        "output_sha256": hashlib.sha256(output_bytes).hexdigest(),
+        "required_deliverables": list(required_fields or []),
+    }
+
+
 # ── End v8 preamble ──
 
 
@@ -2359,10 +3184,13 @@ class ProxyApp:
 
     def call_continuation_with_deadline(self, payload: JSON, deadline: float) -> JSON:
         """Call upstream with a hard deadline. Returns response or raises."""
-        if os.getenv("CONTINUATION_STREAM", "1") != "0":
+        payload = dict(payload)
+        force_non_stream = bool(payload.pop("_codex_force_non_stream", False))
+        if os.getenv("CONTINUATION_STREAM", "1") != "0" and not force_non_stream:
             return self.call_continuation_stream_with_deadline(payload, deadline)
 
         start = time.time()
+        payload["stream"] = False
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         headers = {
             "Authorization": f"Bearer {self.upstream_key}",
@@ -2668,6 +3496,20 @@ class ProxyApp:
 
         # Tool definitions.
         converted_tools, reverse_name_map = convert_responses_tools(body.get("tools", []))
+        handoff_text = _extract_handoff_text(base_messages)
+        handoff_mode = select_mode(parse_task_envelope(handoff_text)) if handoff_text else ""
+        if handoff_mode in {"bounded_write_exact", "bounded_write_patch"} and not legacy_direct_write_modes_enabled():
+            converted_tools = []
+            reverse_name_map = {}
+            guard = {
+                "role": "system",
+                "content": (
+                    "This raw OSS write handoff is deprecated. Do not call tools or write files. "
+                    "Return a concise FAILED/PARTIAL report explaining that implementation work must use a MissionV1 A4/A5/A6 runtime-controlled patch lane."
+                ),
+            }
+            base_messages = [guard] + base_messages
+            self.log("legacy_direct_write_tools_stripped", mode=handoff_mode)
         if self.strip_tools:
             converted_tools = []
             reverse_name_map = {}
@@ -3018,6 +3860,15 @@ class Handler(BaseHTTPRequestHandler):
             prev_state = APP.state.get(str(prev_id))
         if not prev_state and tool_call_id:
             prev_state = APP.state.find_by_call_ids([tool_call_id])
+            if prev_state and not prev_id:
+                prev_id = prev_state.response_id
+                body["previous_response_id"] = prev_id
+        if prev_state and tool_call_id and tool_call_id not in set(prev_state.pending_call_ids or []):
+            call_state = APP.state.find_by_call_ids([tool_call_id])
+            if call_state:
+                prev_state = call_state
+                prev_id = call_state.response_id
+                body["previous_response_id"] = prev_id
 
         reverse_name_map = {}
         if prev_state:
@@ -3035,10 +3886,13 @@ class Handler(BaseHTTPRequestHandler):
         tool_output_raw = first_tool.get("output", "")
         tool_output_text = str(tool_output_raw)
 
-        # Count turn and determine budget
+        completed_read_paths_before = _extract_completed_read_paths_from_history(prev_state.messages) if prev_state else set()
+
+        # Count turn and determine budget. Use completed read evidence as a backstop so
+        # response-id churn cannot reset a direct-agent loop to exchange 1 forever.
         if prev_state:
             history_turns = _count_tool_result_messages(prev_state.messages)
-            turn = max(prev_state.tool_exchange_count, history_turns) + 1
+            turn = max(prev_state.tool_exchange_count, history_turns, len(completed_read_paths_before)) + 1
             max_exchanges = prev_state.task_max_exchanges or 1
         else:
             turn = 1
@@ -3063,13 +3917,85 @@ class Handler(BaseHTTPRequestHandler):
         exit_code = 0
         if isinstance(tool_output_raw, dict) and tool_output_raw.get("error"):
             exit_code = 1
+        elif tool_output_indicates_failure(tool_output_text):
+            exit_code = 1
 
         handoff_text = _extract_handoff_text(prev_state.messages) if prev_state else ""
         envelope = parse_task_envelope(handoff_text)
         mode = select_mode(envelope)
-        _, _, target_path = _find_tool_call_details(prev_state, tool_call_id)
+        matched_tool_name, tool_args, target_path = _find_tool_call_details(prev_state, tool_call_id)
+        if matched_tool_name:
+            tool_name_raw = matched_tool_name
+        tool_kind = effective_tool_kind(tool_name_raw, tool_args, tool_kind)
+        required_fields_for_evidence = extract_required_deliverables(handoff_text)
+        read_evidence = build_read_evidence_metadata(
+            model_alias=model_alias,
+            tool_name=tool_name_raw,
+            tool_kind=tool_kind,
+            tool_call_id=tool_call_id,
+            tool_args=tool_args,
+            target_path=target_path,
+            output_text=tool_output_text,
+            exit_code=exit_code,
+            required_fields=required_fields_for_evidence,
+        )
+
+        if prev_id and prev_state and mode in ("context_pack", "context_pack_report"):
+            pending_child = APP.state.find_pending_child(str(prev_id))
+            if pending_child:
+                replay_count = APP.state.increment_pending_replay_count(pending_child.response_id)
+                pending_child.pending_replay_count = replay_count
+                replay_limit = int(os.getenv("OSS_PENDING_REPLAY_TERMINAL_REPLAYS", "2"))
+                APP.log(
+                    "continuation_pending_child_replay",
+                    parent_response_id=str(prev_id),
+                    pending_response_id=pending_child.response_id,
+                    replay_count=replay_count,
+                    replay_limit=replay_limit,
+                )
+                if replay_count > replay_limit:
+                    report_text = ""
+                    if os.getenv("OSS_SERVER_SIDE_READ_FALLBACK", "1") != "0":
+                        report_text = complete_pending_reads_from_bridge(
+                            parent_response_id=str(prev_id),
+                            child_state=pending_child,
+                            handoff_text=handoff_text,
+                            project_root=os.getcwd(),
+                            finalizer_call=self._server_side_read_finalizer_call(model_alias),
+                            finalizer_timeout_seconds=float(os.getenv("OSS_SERVER_SIDE_READ_FINALIZER_TIMEOUT_SECONDS", "8")),
+                            log_fn=APP.log,
+                        )
+                    if not report_text:
+                        report_text = build_pending_child_not_fulfilled_report(
+                            parent_response_id=str(prev_id),
+                            child_state=pending_child,
+                            handoff_text=handoff_text,
+                        )
+                    emitter = ResponseEmitter(self, new_id("resp"), model_alias, bool(body.get("stream")))
+                    emitter.emit_text_message(report_text)
+                    emitter.complete()
+                    return
+                resp_obj = build_response_from_pending_child(body, pending_child)
+                if body.get("stream"):
+                    self._send_sse(resp_obj)
+                else:
+                    self._send_json(200, resp_obj)
+                return
 
         if mode == "bounded_write_patch":
+            if not legacy_direct_write_modes_enabled():
+                emitter = ResponseEmitter(self, new_id("resp"), model_alias, bool(body.get("stream")))
+                emitter.emit_text_message(
+                    "PARTIAL\n"
+                    "Synthesis status: DETERMINISTIC_LEGACY_WRITE_DEMOTED\n"
+                    "Reason: raw OSS write handoffs are disabled by default.\n"
+                    "Required path: use a MissionV1 A4/A5/A6 implementation mission so the runtime owns patch validation, apply, verification, rollback, and final status.\n"
+                    "Confidence: HIGH\n"
+                    "Caveats: No bridge-owned raw write closure was accepted."
+                )
+                emitter.complete()
+                APP.log("legacy_direct_write_demoted", mode=mode)
+                return
             from codex_oss.legacy_modes import handle_bounded_patch_continuation
             patch_decision = handle_bounded_patch_continuation(
                 envelope=envelope,
@@ -3110,16 +4036,33 @@ class Handler(BaseHTTPRequestHandler):
         # Deterministic close for writes and errors (even under budget)
         # Writers always close deterministically after first write
         if exit_code != 0 or tool_kind == "write":
-            report = build_deterministic_write_report(
-                model=model_alias, tool_name=tool_name_raw,
-                path=tool_call_id,
-                success=(exit_code == 0)) if exit_code != 0 or tool_kind == "write" else \
-                build_deterministic_error_report(tool_kind, compacted.compacted[:200])
+            repair_instruction = pretool_block_repair_instruction(tool_output_text)
+            if repair_instruction and prev_state and turn < max_exchanges:
+                input_items = list(body.get("input", []))
+                input_items.insert(0, {"role": "system", "content": repair_instruction})
+                body["input"] = input_items
+                APP.log("pretool_block_repair_continuation", tool_kind=tool_kind, turn=turn, max_exchanges=max_exchanges)
+                self._handle_fresh_turn(body)
+                return
+            if tool_kind == "write":
+                report = build_deterministic_write_report(
+                    model=model_alias,
+                    tool_name=tool_name_raw,
+                    path=target_path or tool_call_id,
+                    success=(exit_code == 0),
+                )
+            else:
+                report = build_deterministic_error_report(
+                    f"{tool_kind}_tool_failed",
+                    compacted.compacted[:500],
+                )
             APP.log("continuation_deterministic_close", tool_kind=tool_kind)
             emitter = ResponseEmitter(self, new_id("resp"), model_alias, bool(body.get("stream")))
             emitter.emit_text_message(report["content"][0]["text"])
             emitter.complete()
             return
+
+        use_direct_agent_loop = False
 
         # Continue with tools if budget remains (v10: managed autonomy)
         if turn < max_exchanges and prev_state:
@@ -3131,7 +4074,12 @@ class Handler(BaseHTTPRequestHandler):
                 envelope = parse_task_envelope(handoff_text)
                 mode = select_mode(envelope)
             APP.log("execution_mode", mode=mode, paths=envelope.get("read_only_paths", []))
-            read_paths = _extract_read_paths_from_history(prev_state.messages)
+            read_paths = set(completed_read_paths_before)
+            if target_path:
+                read_paths_after_current = set(read_paths)
+                read_paths_after_current.add(target_path)
+            else:
+                read_paths_after_current = set(read_paths)
 
             # Context-pack: gather sources, one no-tools model call
             context_pack_attempted = False
@@ -3157,6 +4105,20 @@ class Handler(BaseHTTPRequestHandler):
 
             # Bounded exact write mode: runtime handles it
             if mode == "bounded_write_exact" and not context_pack_attempted:
+                if not legacy_direct_write_modes_enabled():
+                    context_pack_attempted = True
+                    emitter = ResponseEmitter(self, new_id("resp"), model_alias, bool(body.get("stream")))
+                    emitter.emit_text_message(
+                        "PARTIAL\n"
+                        "Synthesis status: DETERMINISTIC_LEGACY_WRITE_DEMOTED\n"
+                        "Reason: raw OSS exact-write handoffs are disabled by default.\n"
+                        "Required path: use a MissionV1 A4/A5/A6 implementation mission so the runtime owns writes and verification.\n"
+                        "Confidence: HIGH\n"
+                        "Caveats: No exact-content write was performed by the bridge."
+                    )
+                    emitter.complete()
+                    APP.log("legacy_direct_write_demoted", mode=mode)
+                    return
                 context_pack_attempted = True
                 APP.log("mode_bounded_write_exact")
                 from codex_oss.legacy_modes import handle_bounded_write_exact
@@ -3226,12 +4188,11 @@ class Handler(BaseHTTPRequestHandler):
                 if mode == "managed_autonomy" or use_direct_agent_loop:
                     # Check if current tool call is for an already-read path
                     dup_msg = suppress_duplicate_read(
-                        {"name": tool_name_raw, "arguments": json.dumps(
-                            body.get("input", [{}])[0] if body.get("input") else {})},
+                        {"name": tool_name_raw, "arguments": tool_args},
                         TaskSession(task_session_id="", root_response_id="", task_class="",
                                     execution_mode="", max_tool_exchanges=max_exchanges,
                                     read_paths={p: {"complete": True} for p in read_paths},
-                                    required_paths=extract_allowed_paths(handoff_text)))
+                                    required_paths=required_paths_from_envelope(envelope, handoff_text)))
                     if dup_msg:
                         APP.log("duplicate_suppressed", tool=tool_name_raw)
                         input_items = list(body.get("input", []))
@@ -3239,14 +4200,40 @@ class Handler(BaseHTTPRequestHandler):
                         body["input"] = input_items
 
                 # Inject evidence ledger for managed autonomy
-                required_paths = extract_allowed_paths(handoff_text)
-                direct_sources_satisfied = (
-                    use_direct_agent_loop
-                    and direct_loop_required_sources_satisfied(required_paths, read_paths, target_path)
+                required_paths = required_paths_from_envelope(envelope, handoff_text)
+                direct_decision, remaining = direct_loop_terminal_decision(
+                    required_paths,
+                    read_paths,
+                    target_path,
+                    turn,
+                    max_exchanges,
                 )
+                direct_sources_satisfied = use_direct_agent_loop and direct_decision == "sources_satisfied"
                 if direct_sources_satisfied:
                     APP.log("direct_agent_loop_sources_satisfied",
                             mode=mode, path=target_path, required_paths=required_paths)
+                elif use_direct_agent_loop and direct_decision in ("repeated_completed_read", "budget_exhausted"):
+                    APP.log(
+                        "direct_agent_loop_terminal_guard",
+                        reason=direct_decision,
+                        turn=turn,
+                        max_exchanges=max_exchanges,
+                        path=target_path,
+                        remaining=remaining,
+                    )
+                    text = build_direct_loop_terminal_report(
+                        reason=direct_decision,
+                        model_alias=model_alias,
+                        completed_paths=read_paths,
+                        current_path=target_path,
+                        remaining_paths=remaining,
+                        turn=turn,
+                        max_exchanges=max_exchanges,
+                    )
+                    emitter = ResponseEmitter(self, new_id("resp"), model_alias, bool(body.get("stream")))
+                    emitter.emit_text_message(text)
+                    emitter.complete()
+                    return
                 else:
                     if use_direct_agent_loop and turn >= max_exchanges:
                         APP.log("direct_agent_loop_budget_exhausted", turn=turn, max_exchanges=max_exchanges)
@@ -3254,11 +4241,10 @@ class Handler(BaseHTTPRequestHandler):
                         APP.log("direct_agent_loop_continue_with_tools",
                                 turn=turn, max_exchanges=max_exchanges)
                 
-                remaining = [p for p in required_paths if p not in read_paths]
                 if remaining and not _has_evidence_ledger(body):
                     ledger_text = "EVIDENCE LEDGER\n"
-                    if read_paths:
-                        ledger_text += f"Already read: {', '.join(sorted(read_paths))}\n"
+                    if read_paths_after_current:
+                        ledger_text += f"Already read: {', '.join(sorted(read_paths_after_current))}\n"
                     ledger_text += f"Still required: {', '.join(remaining)}\n"
                     ledger_text += f"Tool budget remaining: {max_exchanges - turn}\n"
                     ledger_text += "Do not reread completed files."
@@ -3283,48 +4269,174 @@ class Handler(BaseHTTPRequestHandler):
         stream = bool(body.get("stream"))
         emitter = ResponseEmitter(self, new_id("resp"), model_alias, stream)
         from codex_oss.legacy_modes import handle_read_finalizer
-        finalizer_decision = handle_read_finalizer(
-            body=body,
-            prev_state_messages=prev_state.messages if prev_state else [],
-            tool_outputs=tool_outputs,
-            tool_kind=tool_kind,
-            compacted_output=compacted.compacted,
-            model_alias=model_alias,
-            reverse_name_map=reverse_name_map,
-            continuation_model=model_alias if use_direct_agent_loop else APP.continuation_model,
-            model_map=APP.model_map,
-            continuation_tools=APP.continuation_tools,
-            continuation_deadline=APP.continuation_deadline,
-            continuation_fallbacks=APP.continuation_fallbacks,
-            max_tool_output_chars=APP.max_tool_output_chars,
-            degraded_completion_on_timeout=APP.degraded_completion_on_timeout,
-            log_fn=APP.log,
-            map_model=map_model,
-            repair_chat_history=repair_chat_history,
-            merge_new_user_messages=merge_new_user_messages,
-            extract_handoff_text=_extract_handoff_text,
-            extract_required_deliverables=extract_required_deliverables,
-            validate_report=validate_report,
-            call_continuation_with_deadline=APP.call_continuation_with_deadline,
-            build_response_object=APP.build_response_object,
-            build_degraded_completion=APP.build_degraded_completion,
-        )
+        def run_finalizer():
+            return handle_read_finalizer(
+                body=body,
+                prev_state_messages=prev_state.messages if prev_state else [],
+                tool_outputs=tool_outputs,
+                tool_kind=tool_kind,
+                compacted_output=compacted.compacted,
+                model_alias=model_alias,
+                reverse_name_map=reverse_name_map,
+                continuation_model=model_alias if use_direct_agent_loop else APP.continuation_model,
+                model_map=APP.model_map,
+                continuation_tools=APP.continuation_tools,
+                continuation_deadline=APP.continuation_deadline,
+                continuation_fallbacks=APP.continuation_fallbacks,
+                max_tool_output_chars=APP.max_tool_output_chars,
+                degraded_completion_on_timeout=APP.degraded_completion_on_timeout,
+                log_fn=APP.log,
+                map_model=map_model,
+                repair_chat_history=repair_chat_history,
+                merge_new_user_messages=merge_new_user_messages,
+                extract_handoff_text=_extract_handoff_text,
+                extract_required_deliverables=extract_required_deliverables,
+                validate_report=validate_report,
+                call_continuation_with_deadline=APP.call_continuation_with_deadline,
+                build_response_object=APP.build_response_object,
+                build_degraded_completion=APP.build_degraded_completion,
+                evidence_metadata=read_evidence,
+            )
+
+        if stream:
+            finalizer_decision = self._await_streamed_read_finalizer(
+                emitter,
+                body,
+                model_alias,
+                run_finalizer,
+            )
+            if finalizer_decision is None:
+                return
+        else:
+            finalizer_decision = run_finalizer()
         if finalizer_decision.handled:
             if stream:
-                if not emitter._sse_headers_sent:
-                    emitter.start()
                 emitter.emit_text_message(finalizer_decision.text)
-            else:
+            elif finalizer_decision.response_obj:
                 emitter._json_response = finalizer_decision.response_obj
+            else:
+                emitter.emit_text_message(finalizer_decision.text)
             emitter.complete()
             if finalizer_decision.log_event:
                 APP.log(finalizer_decision.log_event, **finalizer_decision.log_fields)
         else:
             self._send_error_obj(502, f"All continuation finalizers failed for {tool_kind}")
 
+    def _await_streamed_read_finalizer(
+        self,
+        emitter: ResponseEmitter,
+        body: JSON,
+        model_alias: str,
+        run_finalizer,
+        heartbeat_s: Optional[float] = None,
+    ):
+        """Run a blocking read finalizer while keeping the Responses stream alive."""
+        if not emitter._sse_headers_sent:
+            emitter.start()
+
+        result_q: "queue.Queue[Tuple[str, Any]]" = queue.Queue(maxsize=1)
+
+        def worker() -> None:
+            try:
+                result_q.put(("ok", run_finalizer()))
+            except Exception as exc:
+                result_q.put(("error", exc))
+
+        threading.Thread(target=worker, daemon=True).start()
+        interval = heartbeat_s if heartbeat_s is not None else float(os.getenv("SSE_UPSTREAM_HEARTBEAT_SECONDS", "5"))
+        while True:
+            try:
+                kind, value = result_q.get(timeout=interval)
+            except queue.Empty:
+                try:
+                    self._write_in_progress(
+                        emitter.response_id,
+                        model_alias,
+                        emitter.created_at,
+                        body,
+                        "read_finalizer_wait",
+                    )
+                except ClientDisconnected:
+                    APP.log(
+                        "client_disconnected",
+                        response_id=emitter.response_id,
+                        phase="read_finalizer_wait",
+                    )
+                    self.close_connection = True
+                    return None
+                continue
+            if kind == "ok":
+                return value
+            raise value
+
+    def _server_side_read_finalizer_call(self, model_alias: str):
+        """Return a bounded no-tool finalizer callable for recovered read evidence."""
+        def call(prompt: str, timeout_seconds: float) -> str:
+            preferred = os.getenv("OSS_SERVER_SIDE_READ_FINALIZER_MODEL", "").strip()
+            candidates = [preferred or model_alias]
+            for fallback in APP.continuation_fallbacks:
+                if fallback not in candidates:
+                    candidates.append(fallback)
+            deadline = time.monotonic() + max(1.0, float(timeout_seconds or 1.0))
+            last_error: Exception | None = None
+            for candidate in candidates:
+                remaining = deadline - time.monotonic()
+                if remaining <= 1.0:
+                    break
+                payload = {
+                    "model": map_model(candidate, APP.model_map),
+                    "messages": [{"role": "user", "content": prompt}],
+                    "stream": False,
+                    "tools": [],
+                    "_codex_force_non_stream": True,
+                }
+                try:
+                    response = APP.call_continuation_with_deadline(payload, min(APP.continuation_deadline, remaining))
+                    return response.get("choices", [{}])[0].get("message", {}).get("content", "")
+                except Exception as exc:
+                    last_error = exc
+                    APP.log("server_side_read_finalizer_candidate_failed", model=candidate, error=str(exc))
+            if last_error:
+                raise last_error
+            raise TimeoutError("server-side read finalizer deadline exhausted")
+        return call
+
     def _handle_fresh_turn(self, body: JSON) -> None:
         """Fallback for when continuation path can't handle the request."""
         payload, base_messages, model_alias, model_upstream, reverse_name_map = APP.prepare_chat_payload(body)
+        prev_id = str(body.get("previous_response_id") or "")
+        if prev_id:
+            replay_limit = int(os.getenv("OSS_PENDING_REPLAY_TERMINAL_REPLAYS", "2"))
+            terminal_child = APP.state.find_terminal_pending_child(prev_id, replay_limit)
+            if terminal_child:
+                handoff_text = _extract_handoff_text(base_messages)
+                report_text = ""
+                if os.getenv("OSS_SERVER_SIDE_READ_FALLBACK", "1") != "0":
+                    report_text = complete_pending_reads_from_bridge(
+                        parent_response_id=prev_id,
+                        child_state=terminal_child,
+                        handoff_text=handoff_text,
+                        project_root=os.getcwd(),
+                        finalizer_call=self._server_side_read_finalizer_call(model_alias),
+                        finalizer_timeout_seconds=float(os.getenv("OSS_SERVER_SIDE_READ_FINALIZER_TIMEOUT_SECONDS", "8")),
+                        log_fn=APP.log,
+                    )
+                if not report_text:
+                    report_text = build_pending_child_not_fulfilled_report(
+                        parent_response_id=prev_id,
+                        child_state=terminal_child,
+                        handoff_text=handoff_text,
+                    )
+                APP.log(
+                    "fresh_turn_semantic_pending_terminal",
+                    parent_response_id=prev_id,
+                    pending_response_id=terminal_child.response_id,
+                    replay_count=terminal_child.pending_replay_count,
+                )
+                emitter = ResponseEmitter(self, new_id("resp"), model_alias, bool(body.get("stream")))
+                emitter.emit_text_message(report_text)
+                emitter.complete()
+                return
         if body.get("stream"):
             self._send_sse_with_upstream(body, payload, base_messages, model_alias, model_upstream, reverse_name_map)
         else:
@@ -3699,6 +4811,17 @@ class Handler(BaseHTTPRequestHandler):
         self._emit_sse_items_and_completed(resp_obj)
 
     def _emit_sse_items_and_completed(self, resp_obj: JSON) -> None:
+        sequence_number = 0
+        response_id = str(resp_obj.get("id") or "")
+
+        def emit(event: str, payload: JSON) -> None:
+            nonlocal sequence_number
+            sequence_number += 1
+            enriched = dict(payload)
+            enriched.setdefault("response_id", response_id)
+            enriched.setdefault("sequence_number", sequence_number)
+            self._write_sse(event, enriched)
+
         for idx, item in enumerate(resp_obj.get("output", [])):
             item_type = item.get("type")
             item_for_added = item
@@ -3714,7 +4837,7 @@ class Handler(BaseHTTPRequestHandler):
                 item_for_added["arguments"] = ""
                 item_for_added["status"] = "in_progress"
 
-            self._write_sse(
+            emit(
                 "response.output_item.added",
                 {"type": "response.output_item.added", "output_index": idx, "item": item_for_added},
             )
@@ -3723,7 +4846,7 @@ class Handler(BaseHTTPRequestHandler):
                 content = item.get("content") or []
                 if content:
                     part = content[0]
-                    self._write_sse(
+                    emit(
                         "response.content_part.added",
                         {
                             "type": "response.content_part.added",
@@ -3737,7 +4860,7 @@ class Handler(BaseHTTPRequestHandler):
                     chunk_size = int(os.getenv("SSE_CHUNK_SIZE", "256"))
                     for start in range(0, len(text), chunk_size):
                         delta = text[start : start + chunk_size]
-                        self._write_sse(
+                        emit(
                             "response.output_text.delta",
                             {
                                 "type": "response.output_text.delta",
@@ -3747,7 +4870,7 @@ class Handler(BaseHTTPRequestHandler):
                                 "item_id": item.get("id"),
                             },
                         )
-                    self._write_sse(
+                    emit(
                         "response.output_text.done",
                         {
                             "type": "response.output_text.done",
@@ -3757,7 +4880,7 @@ class Handler(BaseHTTPRequestHandler):
                             "item_id": item.get("id"),
                         },
                     )
-                    self._write_sse(
+                    emit(
                         "response.content_part.done",
                         {
                             "type": "response.content_part.done",
@@ -3785,7 +4908,7 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 for start in range(0, len(args), arg_chunk_size):
                     delta = args[start : start + arg_chunk_size]
-                    self._write_sse(
+                    emit(
                         "response.function_call_arguments.delta",
                         {
                             "type": "response.function_call_arguments.delta",
@@ -3794,7 +4917,7 @@ class Handler(BaseHTTPRequestHandler):
                             "delta": delta,
                         },
                     )
-                self._write_sse(
+                emit(
                     "response.function_call_arguments.done",
                     {
                         "type": "response.function_call_arguments.done",
@@ -3804,7 +4927,7 @@ class Handler(BaseHTTPRequestHandler):
                     },
                 )
 
-            self._write_sse(
+            emit(
                 "response.output_item.done",
                 {"type": "response.output_item.done", "output_index": idx, "item": item},
             )
@@ -3813,7 +4936,7 @@ class Handler(BaseHTTPRequestHandler):
         if os.getenv("SSE_COMPACT_COMPLETED_FOR_TOOL_CALLS", "0") == "1":
             completed_response = self._compact_completed_response(resp_obj)
 
-        self._write_sse("response.completed", {"type": "response.completed", "response": completed_response})
+        emit("response.completed", {"type": "response.completed", "response": completed_response})
         self._safe_write(b"data: [DONE]\n\n")
         self.close_connection = True
 

@@ -343,6 +343,122 @@ def assert_read_finalizer_repairs_invalid_report_before_accepting():
     assert any(event == "report_invalid" for event, _ in events), events
 
 
+def assert_read_finalizer_degrades_to_deterministic_recovery():
+    events = []
+
+    def failing_call(payload, timeout):
+        raise TimeoutError("finalizer timeout")
+
+    decision = handle_read_finalizer(
+        body={"input": []},
+        prev_state_messages=[
+            {"role": "user", "content": "Read docs/CONTINUITY.md and report execution cursor"},
+            {"role": "assistant", "content": "ok"},
+        ],
+        tool_outputs=[{"role": "tool", "tool_call_id": "x", "content": "## Execution Cursor\nactive intent_artifact_payload_missing"}],
+        tool_kind="read",
+        compacted_output="## Execution Cursor\nactive intent_artifact_payload_missing\nNo writes observed.",
+        model_alias="ocg-kimi-k2.6",
+        reverse_name_map={},
+        continuation_model="kimi",
+        model_map={},
+        continuation_tools="none",
+        continuation_deadline=1,
+        continuation_fallbacks=[],
+        max_tool_output_chars=1000,
+        degraded_completion_on_timeout=True,
+        log_fn=lambda event, **kwargs: events.append((event, kwargs)),
+        map_model=lambda model, model_map: model,
+        repair_chat_history=lambda messages, outputs: list(messages) + list(outputs),
+        merge_new_user_messages=lambda messages, new: messages,
+        extract_handoff_text=lambda messages: "DELIVERABLE: execution cursor, confidence, caveats",
+        extract_required_deliverables=lambda text: ["execution cursor", "confidence", "caveats"],
+        validate_report=lambda text, required: (False, required),
+        call_continuation_with_deadline=failing_call,
+        build_response_object=lambda *args, **kwargs: {},
+        build_degraded_completion=lambda model, reason, kind: {"content": [{"text": "all finalizers failed"}]},
+        evidence_metadata={
+            "schema_version": "raw_read_evidence.v1",
+            "model_alias": "ocg-kimi-k2.6",
+            "tool_name": "rtk_read",
+            "tool_kind": "read",
+            "command": "docs/CONTINUITY.md",
+            "normalized_path": "docs/CONTINUITY.md",
+            "exit_code": 0,
+            "output_chars": 77,
+            "output_lines": 3,
+            "output_sha256": "sha-test",
+        },
+    )
+    assert decision.handled, decision
+    assert decision.log_event == "continuation_deterministic_read_recovery", decision
+    assert "Synthesis status: DETERMINISTIC_READ_RECOVERY" in decision.text, decision.text
+    assert "Canonical evidence:" in decision.text, decision.text
+    assert "raw_read_evidence.v1" in decision.text, decision.text
+    assert "output_sha256: sha-test" in decision.text, decision.text
+    assert "all finalizers failed" not in decision.text, decision.text
+    assert "intent_artifact_payload_missing" in decision.text, decision.text
+
+
+def assert_read_finalizer_rejects_progress_text_as_terminal():
+    def build_response_object(body, chat_resp, messages, model_alias, model_used, reverse_name_map):
+        text = chat_resp["choices"][0]["message"]["content"]
+        return {"output": [{"type": "message", "content": [{"type": "output_text", "text": text}]}]}
+
+    calls = []
+    events = []
+
+    def call(payload, timeout):
+        calls.append(payload)
+        return {"choices": [{"message": {"content": "Running the first verification step against the requested files now."}}]}
+
+    decision = handle_read_finalizer(
+        body={"input": []},
+        prev_state_messages=[
+            {"role": "user", "content": "Read docs/CONTINUITY.md and report execution cursor"},
+            {"role": "assistant", "content": "ok"},
+        ],
+        tool_outputs=[{"role": "tool", "tool_call_id": "x", "content": "Command blocked by PreToolUse hook"}],
+        tool_kind="read",
+        compacted_output="Command blocked by PreToolUse hook: use rtk read instead of raw cat.",
+        model_alias="ocg-kimi-k2.6",
+        reverse_name_map={},
+        continuation_model="kimi",
+        model_map={},
+        continuation_tools="none",
+        continuation_deadline=1,
+        continuation_fallbacks=[],
+        max_tool_output_chars=1000,
+        degraded_completion_on_timeout=True,
+        log_fn=lambda event, **kwargs: events.append((event, kwargs)),
+        map_model=lambda model, model_map: model,
+        repair_chat_history=lambda messages, outputs: list(messages) + list(outputs),
+        merge_new_user_messages=lambda messages, new: messages,
+        extract_handoff_text=lambda messages: "DELIVERABLE: execution cursor, confidence, caveats",
+        extract_required_deliverables=lambda text: ["execution cursor", "confidence", "caveats"],
+        validate_report=lambda text, required: (
+            False if text.lower().startswith("running ") else all(field in text.lower() for field in required),
+            ["intent_or_status_detected"] if text.lower().startswith("running ") else [field for field in required if field not in text.lower()],
+        ),
+        call_continuation_with_deadline=call,
+        build_response_object=build_response_object,
+        build_degraded_completion=lambda model, reason, kind: {"content": [{"text": "all finalizers failed"}]},
+        evidence_metadata={
+            "schema_version": "raw_read_evidence.v1",
+            "tool_name": "exec_command",
+            "tool_kind": "read",
+            "command": "cat /Users/goldtetsola/.codex/skills/napkin/SKILL.md",
+            "exit_code": 1,
+            "output_sha256": "blocked-sha",
+        },
+    )
+    assert decision.handled, decision
+    assert "Running the first verification step" not in decision.text, decision.text
+    assert "Synthesis status: DETERMINISTIC_READ_RECOVERY" in decision.text, decision.text
+    assert "blocked-sha" in decision.text, decision.text
+    assert any(event == "report_invalid" for event, _ in events), events
+
+
 def main():
     assert_legacy_mode_decision_defaults_are_initialized()
     assert_exact_write_creates_and_reads_back()
@@ -353,6 +469,8 @@ def main():
     assert_context_pack_synthesis_uses_compacted_pack()
     assert_read_finalizer_returns_response_object()
     assert_read_finalizer_repairs_invalid_report_before_accepting()
+    assert_read_finalizer_degrades_to_deterministic_recovery()
+    assert_read_finalizer_rejects_progress_text_as_terminal()
     print("PASS: legacy mode helper suite")
 
 

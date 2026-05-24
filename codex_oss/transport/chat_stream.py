@@ -85,8 +85,14 @@ class ChatStreamAssembler:
         self.tool_states: Dict[int, ToolStreamState] = {}
         self.usage: JSON = {}
         self.last_progress = time.time()
+        self.sequence_number = 0
 
     def _write_sse(self, event: str, data: Any) -> None:
+        if isinstance(data, dict):
+            self.sequence_number += 1
+            data = dict(data)
+            data.setdefault("response_id", self.response_id)
+            data.setdefault("sequence_number", self.sequence_number)
         self.write_sse(event, data)
         self.last_progress = time.time()
 
@@ -376,11 +382,13 @@ class ChatStreamAssembler:
                 messages=all_messages,
                 pending_call_ids=[tc["id"] for tc in replay_tool_calls],
                 created_at=self.created_at,
+                output_items_json=self.json_dumps(output),
                 tool_exchange_count=int(self.body.get("_codex_oss_tool_exchange_count", 0) or 0),
                 task_max_exchanges=int(
                     self.body.get("_codex_oss_task_max_exchanges")
                     or self.extract_budget(self.base_messages)
                 ),
+                previous_response_id=str(self.body.get("previous_response_id") or ""),
             )
         )
 

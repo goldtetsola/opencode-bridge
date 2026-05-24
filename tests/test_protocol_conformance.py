@@ -2,8 +2,10 @@
 """Protocol conformance gauntlet for OSS bridge task contracts."""
 
 import os
+import json
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 os.environ["ALLOW_MISSING_OPENCODE_KEY"] = "1"
@@ -13,17 +15,31 @@ sys.path.insert(0, ROOT)
 
 from bridge import _path_is_within_owned_paths
 from bridge import _extract_read_paths_from_history
+from bridge import _extract_completed_read_paths_from_history
 from bridge import _count_tool_result_messages
+from bridge import _extract_handoff_text
+from bridge import build_direct_loop_terminal_report
+from bridge import build_pending_child_not_fulfilled_report
+from bridge import build_response_from_pending_child
+from bridge import complete_pending_reads_from_bridge
 from bridge import build_context_pack
 from bridge import build_context_pack_deterministic_report
 from bridge import build_patch_contract_report
 from bridge import build_task_session
 from bridge import collect_owned_path_changes
 from bridge import evaluate_evidence_coverage
+from bridge import effective_tool_kind
+from bridge import normalize_tool_args
 from bridge import parse_task_envelope
+from bridge import pretool_block_repair_instruction
+from bridge import required_paths_from_envelope
+from bridge import Handler
 from bridge import ProxyApp
 from bridge import select_mode
+from bridge import StateStore
+from bridge import StoredResponse
 from bridge import should_use_direct_agent_loop
+from bridge import direct_loop_terminal_decision
 from bridge import direct_loop_required_sources_satisfied
 from bridge import tool_output_indicates_failure
 from bridge import validate_report_output
@@ -53,6 +69,47 @@ def assert_exact_write_requires_exact_content():
     exact_envelope = parse_task_envelope(exact_handoff)
     assert select_mode(patch_envelope) == "bounded_write_patch", patch_envelope
     assert select_mode(exact_envelope) == "bounded_write_exact", exact_envelope
+
+
+def assert_legacy_write_handoffs_do_not_receive_raw_tools_by_default():
+    old = os.environ.get("OSS_LEGACY_DIRECT_WRITES")
+    os.environ.pop("OSS_LEGACY_DIRECT_WRITES", None)
+    try:
+        app = ProxyApp()
+        body = {
+            "model": "ocg-deepseek-v4-flash",
+            "input": [
+                {
+                    "role": "user",
+                    "content": (
+                        "OSS_HANDOFF_JSON:\n"
+                        "{\"schema_version\":1,\"role\":\"Patch docs\",\"goal\":\"Patch one fixture\","
+                        "\"task_type\":\"docs_support\",\"owned_paths\":[\"tests/fixtures/protocol-doc.md\"],"
+                        "\"read_only_paths\":[],\"forbidden_actions\":[\"Do not edit source\"],"
+                        "\"verification_steps\":[\"Run rtk git diff --check\"],"
+                        "\"deliverable_fields\":[\"changed_sections\",\"verification\",\"caveats\"],"
+                        "\"completion_rule\":\"stop after verification\",\"escalation_rule\":\"stop on scope drift\"}"
+                    ),
+                }
+            ],
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "exec_command",
+                    "description": "Run a shell command",
+                    "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}},
+                }
+            ],
+        }
+        payload, base_messages, _, _, reverse = app.prepare_chat_payload(body)
+        assert "tools" not in payload, payload
+        assert reverse == {}, reverse
+        assert "raw OSS write handoff is deprecated" in base_messages[0]["content"], base_messages
+    finally:
+        if old is None:
+            os.environ.pop("OSS_LEGACY_DIRECT_WRITES", None)
+        else:
+            os.environ["OSS_LEGACY_DIRECT_WRITES"] = old
 
 
 def assert_no_match_search_is_still_covered():
@@ -148,7 +205,10 @@ def assert_verification_claims_need_observed_results():
         verification_observed=True)
     assert valid, missing
     assert tool_output_indicates_failure("Process exited with code 1\nAssertionError: failed")
+    assert tool_output_indicates_failure("Command blocked by PreToolUse hook: use rtk read instead of raw cat.")
     assert not tool_output_indicates_failure("Process exited with code 0\nAll protocol checks passed")
+    repair = pretool_block_repair_instruction("Command blocked by PreToolUse hook: use `rtk read ...` instead of raw `cat`.")
+    assert "rtk read" in repair and "final answer" in repair, repair
 
 
 def assert_scope_violation_is_detectable():
@@ -304,6 +364,575 @@ def assert_direct_loop_stops_after_required_source_is_read():
     assert not direct_loop_required_sources_satisfied(["README.md", "missing.md"], {"README.md"}, "")
 
 
+def assert_direct_loop_detects_repeated_completed_source():
+    messages = [
+        {
+            "role": "user",
+            "content": (
+                "OSS_HANDOFF_JSON:\n"
+                '{"schema_version":1,"role":"Scout","goal":"Read required files",'
+                '"task_type":"scout","read_only_paths":["/Users/goldtetsola/.codex/skills/napkin/SKILL.md",'
+                '".codex/napkin.md","docs/CONTINUITY.md"],"deliverable_fields":["confidence","caveats"]}'
+            ),
+        },
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": "call_a",
+                "type": "function",
+                "function": {
+                    "name": "rtk_read",
+                    "arguments": '{"path":"/Users/goldtetsola/.codex/skills/napkin/SKILL.md"}',
+                },
+            }],
+        },
+        {"role": "tool", "tool_call_id": "call_a", "content": "skill"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": "call_b",
+                "type": "function",
+                "function": {"name": "rtk_read", "arguments": '{"path":".codex/napkin.md"}'},
+            }],
+        },
+        {"role": "tool", "tool_call_id": "call_b", "content": "napkin"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": "call_c",
+                "type": "function",
+                "function": {"name": "rtk_read", "arguments": '{"path":".codex/napkin.md"}'},
+            }],
+        },
+    ]
+    completed = _extract_completed_read_paths_from_history(messages)
+    envelope = parse_task_envelope(messages[0]["content"])
+    required = required_paths_from_envelope(envelope, messages[0]["content"])
+    assert ".codex/napkin.md" in completed, completed
+    assert required == [
+        "/Users/goldtetsola/.codex/skills/napkin/SKILL.md",
+        ".codex/napkin.md",
+        "docs/CONTINUITY.md",
+    ], required
+    decision, remaining = direct_loop_terminal_decision(
+        required,
+        completed,
+        ".codex/napkin.md",
+        turn=3,
+        max_exchanges=6,
+    )
+    assert decision == "repeated_completed_read", (decision, remaining)
+    assert remaining == ["docs/CONTINUITY.md"], remaining
+    report = build_direct_loop_terminal_report(
+        reason=decision,
+        model_alias="ocg-deepseek-v4-pro",
+        completed_paths=completed,
+        current_path=".codex/napkin.md",
+        remaining_paths=remaining,
+        turn=3,
+        max_exchanges=6,
+    )
+    assert "DETERMINISTIC_DIRECT_LOOP_TERMINAL" in report, report
+    assert "docs/CONTINUITY.md" in report, report
+
+
+def assert_pending_child_replay_is_idempotent_and_terminalizable():
+    handoff_obj = {
+        "schema_version": 1,
+        "role": "Scout",
+        "goal": "Read required files",
+        "task_type": "scout",
+        "owned_paths": [],
+        "read_only_paths": [".codex/napkin.md", "docs/CONTINUITY.md"],
+        "forbidden_actions": ["do not write files"],
+        "verification_steps": ["read listed files"],
+        "deliverable_fields": ["files inspected", "confidence", "caveats"],
+        "completion_rule": "stop after deliverable",
+        "escalation_rule": "stop if blocked",
+    }
+    handoff = "OSS_HANDOFF_JSON:\n" + __import__("json").dumps(handoff_obj)
+    child_messages = [
+        {"role": "user", "content": handoff},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": "call_first",
+                "type": "function",
+                "function": {"name": "rtk_read", "arguments": '{"path":".codex/napkin.md"}'},
+            }],
+        },
+        {"role": "tool", "tool_call_id": "call_first", "content": "napkin"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": "call_second",
+                "type": "function",
+                "function": {"name": "rtk_read", "arguments": '{"path":"docs/CONTINUITY.md"}'},
+            }],
+        },
+    ]
+
+    with tempfile.TemporaryDirectory(dir=ROOT) as d:
+        stable_output = [{
+            "type": "function_call",
+            "id": "fc_stable_second",
+            "call_id": "call_second",
+            "name": "rtk_read",
+            "arguments": '{"path":"docs/CONTINUITY.md"}',
+            "status": "completed",
+        }]
+        store = StateStore(str(Path(d) / "state.sqlite3"))
+        store.put(StoredResponse(
+            response_id="resp_child",
+            model_alias="ocg-deepseek-v4-pro",
+            model_upstream="deepseek-v4-pro",
+            messages=child_messages,
+            pending_call_ids=["call_second"],
+            created_at=123,
+            tool_exchange_count=1,
+            task_max_exchanges=6,
+            previous_response_id="resp_parent",
+            output_items_json=json.dumps(stable_output),
+        ))
+        child = store.find_pending_child("resp_parent")
+        assert child and child.response_id == "resp_child", child
+        replay = build_response_from_pending_child({"previous_response_id": "resp_parent"}, child)
+        replay_again = build_response_from_pending_child({"previous_response_id": "resp_parent"}, child)
+        assert replay["id"] == "resp_child", replay
+        assert replay["output"][0] == stable_output[0], replay
+        assert replay_again["output"][0] == stable_output[0], replay_again
+        assert replay["output"][0]["call_id"] == "call_second", replay
+        assert replay["output"][0]["arguments"] == '{"path":"docs/CONTINUITY.md"}', replay
+        assert store.increment_pending_replay_count("resp_child") == 1
+        child = store.get("resp_child")
+        report = build_pending_child_not_fulfilled_report(
+            parent_response_id="resp_parent",
+            child_state=child,
+            handoff_text=handoff,
+        )
+        assert "DETERMINISTIC_PENDING_TOOL_ADOPTION_FAILURE" in report, report
+        assert "Pending command: docs/CONTINUITY.md" in report, report
+
+
+def assert_semantic_pending_replays_survive_fresh_call_ids():
+    output = lambda call_id: json.dumps([{
+        "type": "function_call",
+        "id": "fc_" + call_id,
+        "call_id": call_id,
+        "name": "exec_command",
+        "arguments": '{"cmd":"rtk read docs/visible-commentary.md"}',
+        "status": "completed",
+    }])
+    with tempfile.TemporaryDirectory(dir=ROOT) as d:
+        store = StateStore(str(Path(d) / "state.sqlite3"))
+        for idx in range(3):
+            call_id = f"call_{idx}"
+            store.put(StoredResponse(
+                response_id=f"resp_child_{idx}",
+                model_alias="ocg-deepseek-v4-flash",
+                model_upstream="deepseek-v4-flash",
+                messages=[{"role": "assistant", "content": "", "tool_calls": [{
+                    "id": call_id,
+                    "type": "function",
+                    "function": {"name": "exec_command", "arguments": '{"cmd":"rtk read docs/visible-commentary.md"}'},
+                }]}],
+                pending_call_ids=[call_id],
+                created_at=123 + idx,
+                tool_exchange_count=1,
+                task_max_exchanges=6,
+                previous_response_id="resp_parent",
+                output_items_json=output(call_id),
+            ))
+        latest = store.find_pending_child("resp_parent")
+        assert latest and latest.response_id == "resp_child_2", latest
+        assert latest.pending_replay_count == 2, latest
+        assert store.increment_pending_replay_count(latest.response_id) == 3
+
+
+def assert_terminal_pending_child_uses_semantic_replay_not_latest_child():
+    def output(call_id: str, cmd: str) -> str:
+        return json.dumps([{
+            "type": "function_call",
+            "id": "fc_" + call_id,
+            "call_id": call_id,
+            "name": "exec_command",
+            "arguments": json.dumps({"cmd": cmd}),
+            "status": "completed",
+        }])
+
+    with tempfile.TemporaryDirectory(dir=ROOT) as d:
+        store = StateStore(str(Path(d) / "state.sqlite3"))
+        store.put(StoredResponse(
+            response_id="resp_replayed_read",
+            model_alias="ocg-deepseek-v4-flash",
+            model_upstream="deepseek-v4-flash",
+            messages=[],
+            pending_call_ids=["call_read"],
+            created_at=100,
+            previous_response_id="resp_parent",
+            pending_replay_count=5,
+            output_items_json=output("call_read", "rtk read docs/visible-commentary.md"),
+        ))
+        store.put(StoredResponse(
+            response_id="resp_latest_probe",
+            model_alias="ocg-deepseek-v4-flash",
+            model_upstream="deepseek-v4-flash",
+            messages=[],
+            pending_call_ids=["call_probe"],
+            created_at=101,
+            previous_response_id="resp_parent",
+            pending_replay_count=0,
+            output_items_json=output("call_probe", "which rtk"),
+        ))
+        latest = store.find_pending_child("resp_parent")
+        assert latest and latest.response_id == "resp_latest_probe", latest
+        terminal = store.find_terminal_pending_child("resp_parent", 2)
+        assert terminal and terminal.response_id == "resp_replayed_read", terminal
+
+
+def assert_orphan_tool_output_can_bind_pending_child_lineage():
+    with tempfile.TemporaryDirectory(dir=ROOT) as d:
+        store = StateStore(str(Path(d) / "state.sqlite3"))
+        store.put(StoredResponse(
+            response_id="resp_parent",
+            model_alias="ocg-deepseek-v4-pro",
+            model_upstream="deepseek-v4-pro",
+            messages=[{"role": "assistant", "content": "", "tool_calls": [{
+                "id": "call_parent",
+                "type": "function",
+                "function": {"name": "rtk_read", "arguments": '{"path":"README.md"}'},
+            }]}],
+            pending_call_ids=["call_parent"],
+            created_at=1,
+            tool_exchange_count=0,
+            task_max_exchanges=6,
+        ))
+        recovered = store.find_by_call_ids(["call_parent"])
+        body = {"input": [{"type": "function_call_output", "call_id": "call_parent", "output": "README"}]}
+        if recovered and not body.get("previous_response_id"):
+            body["previous_response_id"] = recovered.response_id
+        store.put(StoredResponse(
+            response_id="resp_child",
+            model_alias="ocg-deepseek-v4-pro",
+            model_upstream="deepseek-v4-pro",
+            messages=[],
+            pending_call_ids=["call_child"],
+            created_at=2,
+            tool_exchange_count=1,
+            task_max_exchanges=6,
+            previous_response_id=str(body.get("previous_response_id") or ""),
+        ))
+        child = store.find_pending_child("resp_parent")
+        assert child and child.response_id == "resp_child", child
+
+
+def assert_pending_child_adoption_failure_can_complete_reads_server_side():
+    handoff_obj = {
+        "schema_version": 1,
+        "role": "Scout",
+        "goal": "Read required files",
+        "task_type": "scout",
+        "owned_paths": [],
+        "read_only_paths": ["README.md", "bridge.py", "tests/test_protocol_conformance.py"],
+        "forbidden_actions": ["do not write files"],
+        "verification_steps": ["read listed files"],
+        "deliverable_fields": ["files inspected", "confidence", "caveats"],
+        "completion_rule": "stop after deliverable",
+        "escalation_rule": "stop if blocked",
+    }
+    handoff = "OSS_HANDOFF_JSON:\n" + __import__("json").dumps(handoff_obj)
+    root_json = __import__("json").dumps(ROOT)
+    child = StoredResponse(
+        response_id="resp_child",
+        model_alias="ocg-deepseek-v4-pro",
+        model_upstream="deepseek-v4-pro",
+        messages=[
+            {"role": "user", "content": handoff},
+            {"role": "assistant", "content": "", "tool_calls": [{
+                "id": "call_readme",
+                "type": "function",
+                "function": {"name": "exec_command", "arguments": '{"cmd":"rtk read README.md","workdir":' + root_json + '}'},
+            }]},
+            {"role": "tool", "tool_call_id": "call_readme", "content": "README contents"},
+            {"role": "assistant", "content": "", "tool_calls": [{
+                "id": "call_bridge",
+                "type": "function",
+                "function": {"name": "exec_command", "arguments": '{"cmd":"rtk read bridge.py","workdir":' + root_json + '}'},
+            }]},
+        ],
+        pending_call_ids=["call_bridge"],
+        created_at=1,
+        tool_exchange_count=1,
+        task_max_exchanges=6,
+        previous_response_id="resp_parent",
+        pending_replay_count=3,
+    )
+    executed = []
+
+    def fake_executor(path, workdir):
+        executed.append((path, workdir))
+        return 0, f"contents for {path}"
+
+    report = complete_pending_reads_from_bridge(
+        parent_response_id="resp_parent",
+        child_state=child,
+        handoff_text=handoff,
+        project_root=ROOT,
+        executor=fake_executor,
+    )
+    assert report.startswith("COMPLETE"), report
+    assert "DETERMINISTIC_SERVER_SIDE_READ_COMPLETION" in report, report
+    assert "No writes performed: true" in report, report
+    assert "README.md" in report and "bridge.py" in report, report
+    assert "tests/test_protocol_conformance.py" in report, report
+    assert executed == [
+        ("bridge.py", ROOT),
+        ("tests/test_protocol_conformance.py", ROOT),
+    ], executed
+
+
+def assert_server_side_read_completion_prefers_model_authored_report():
+    handoff_obj = {
+        "schema_version": 1,
+        "role": "Scout",
+        "goal": "Read visible commentary docs",
+        "task_type": "scout",
+        "owned_paths": [],
+        "read_only_paths": ["docs/visible-commentary.md"],
+        "forbidden_actions": ["do not write files"],
+        "verification_steps": ["read listed files"],
+        "deliverable_fields": ["files inspected", "confidence", "caveats"],
+        "completion_rule": "stop after deliverable",
+        "escalation_rule": "stop if blocked",
+    }
+    handoff = "OSS_HANDOFF_JSON:\n" + json.dumps(handoff_obj)
+    child = StoredResponse(
+        response_id="resp_child_model_final",
+        model_alias="ocg-deepseek-v4-flash",
+        model_upstream="deepseek-v4-flash",
+        messages=[{"role": "user", "content": handoff}],
+        pending_call_ids=[],
+        created_at=1,
+        tool_exchange_count=1,
+        task_max_exchanges=6,
+        previous_response_id="resp_parent",
+        pending_replay_count=3,
+    )
+    prompts = []
+
+    def fake_executor(path, workdir):
+        return 0, "# Visible Commentary\nRuntime-backed agents show progress."
+
+    def fake_finalizer(prompt, timeout):
+        prompts.append(prompt)
+        return (
+            "COMPLETE\n"
+            "Files inspected: docs/visible-commentary.md\n"
+            "Findings: The doc describes visible runtime progress for OSS agents.\n"
+            "Confidence: HIGH\n"
+            "Caveats: Only the requested read-only file was inspected."
+        )
+
+    report = complete_pending_reads_from_bridge(
+        parent_response_id="resp_parent",
+        child_state=child,
+        handoff_text=handoff,
+        project_root=ROOT,
+        executor=fake_executor,
+        finalizer_call=fake_finalizer,
+        finalizer_timeout_seconds=3,
+    )
+    assert report.startswith("COMPLETE"), report
+    assert "MODEL_AUTHORED_SERVER_SIDE_READ_COMPLETION" in report, report
+    assert "DETERMINISTIC_SERVER_SIDE_READ_COMPLETION" not in report, report
+    assert prompts and "Do not call tools" in prompts[0], prompts
+    assert "# Visible Commentary" in prompts[0], prompts[0]
+
+
+def assert_server_side_read_completion_falls_back_when_model_report_invalid():
+    handoff = (
+        "READ-ONLY PATHS: docs/visible-commentary.md\n"
+        "DELIVERABLE: files inspected, confidence, caveats"
+    )
+    child = StoredResponse(
+        response_id="resp_child_invalid_final",
+        model_alias="ocg-kimi-k2.6",
+        model_upstream="kimi-k2.6",
+        messages=[{"role": "user", "content": handoff}],
+        pending_call_ids=[],
+        created_at=1,
+        tool_exchange_count=1,
+        task_max_exchanges=6,
+        previous_response_id="resp_parent",
+        pending_replay_count=3,
+    )
+
+    report = complete_pending_reads_from_bridge(
+        parent_response_id="resp_parent",
+        child_state=child,
+        handoff_text=handoff,
+        project_root=ROOT,
+        executor=lambda path, workdir: (0, "visible commentary docs"),
+        finalizer_call=lambda prompt, timeout: "Running the first verification step now.",
+        finalizer_timeout_seconds=3,
+    )
+    assert "DETERMINISTIC_SERVER_SIDE_READ_COMPLETION" in report, report
+    assert "Running the first verification step" not in report, report
+
+
+def assert_placeholder_read_paths_are_ignored_and_inline_target_recovers():
+    handoff = (
+        "READ-ONLY PATHS: <files or dirs>\n"
+        "Goal: inspect docs/visible-commentary.md and report status.\n"
+        "DELIVERABLE: files inspected, confidence, caveats"
+    )
+    assert required_paths_from_envelope(parse_task_envelope(handoff), handoff) == [
+        "docs/visible-commentary.md"
+    ]
+    child = StoredResponse(
+        response_id="resp_child_placeholder",
+        model_alias="ocg-deepseek-v4-flash",
+        model_upstream="deepseek-v4-flash",
+        messages=[
+            {"role": "user", "content": handoff},
+            {"role": "assistant", "content": "", "tool_calls": [{
+                "id": "call_placeholder",
+                "type": "function",
+                "function": {"name": "exec_command", "arguments": '{"cmd":"cat <files or dirs>"}'},
+            }]},
+        ],
+        pending_call_ids=["call_placeholder"],
+        created_at=1,
+        tool_exchange_count=1,
+        task_max_exchanges=6,
+        previous_response_id="resp_parent",
+        pending_replay_count=3,
+    )
+    executed = []
+
+    def fake_executor(path, workdir):
+        executed.append((path, workdir))
+        return 0, "visible commentary docs"
+
+    report = complete_pending_reads_from_bridge(
+        parent_response_id="resp_parent",
+        child_state=child,
+        handoff_text=handoff,
+        project_root=ROOT,
+        executor=fake_executor,
+    )
+    assert report.startswith("COMPLETE"), report
+    assert "docs/visible-commentary.md" in report, report
+    assert "<files or dirs>" not in report, report
+    assert executed == [("docs/visible-commentary.md", ROOT)], executed
+
+
+def assert_handoff_extraction_prefers_current_user_task_over_repo_memory():
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "# AGENTS.md instructions for /repo\n"
+                "<INSTRUCTIONS>\n"
+                "Memory hierarchy:\n"
+                "OSS_HANDOFF_JSON example follows, but it is only repo guidance.\n"
+                "1. Global memory: ~/.codex/memory.md\n"
+                "2. Project memory: <repo>/.codex/napkin.md\n"
+                "@/Users/goldtetsola/.codex/RTK.md\n"
+                "READ-ONLY PATHS: codex/memory.md, codex/napkin.md, codex/RTK.md\n"
+                "</INSTRUCTIONS>\n"
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                "# AGENTS.md instructions for /repo\n"
+                "<INSTRUCTIONS>\n"
+                "OSS_HANDOFF_JSON example follows, but it is only repo guidance.\n"
+                "READ-ONLY PATHS: codex/memory.md, codex/napkin.md, codex/RTK.md\n"
+                "</INSTRUCTIONS>\n"
+            ),
+        },
+        {
+            "role": "user",
+            "content": "Inspect docs/visible-commentary.md only. Final deliverable fields: files inspected, confidence, caveats.",
+        },
+    ]
+    handoff = _extract_handoff_text(messages)
+    assert "docs/visible-commentary.md" in handoff, handoff
+    assert "codex/memory.md" not in handoff, handoff
+    assert required_paths_from_envelope(parse_task_envelope(handoff), handoff) == [
+        "docs/visible-commentary.md"
+    ]
+
+
+def assert_inline_required_paths_ignore_negative_mentions():
+    handoff = (
+        "Inspect docs/visible-commentary.md only. "
+        "Do not inspect AGENTS.md, codex/memory.md, codex/napkin.md, or codex/RTK.md as task evidence."
+    )
+    assert required_paths_from_envelope(parse_task_envelope(handoff), handoff) == [
+        "docs/visible-commentary.md"
+    ]
+
+
+def assert_shell_read_path_with_spaces_is_preserved():
+    command = "rtk read /Users/goldtetsola/Desktop/Coding Projects/Rorschach/docs/CONTINUITY.md"
+    path, command = normalize_tool_args(
+        {"cmd": command},
+        "exec_command",
+    )
+    assert path.endswith("Coding Projects/Rorschach/docs/CONTINUITY.md"), (path, command)
+    assert "Coding Projects" in path, path
+    assert effective_tool_kind("exec_command", {"cmd": command}, "shell") == "read"
+
+
+def assert_streamed_read_finalizer_sends_heartbeats_while_blocked():
+    class Emitter:
+        response_id = "resp_wait"
+        created_at = 1
+        _sse_headers_sent = False
+
+        def start(self):
+            self._sse_headers_sent = True
+
+    class FakeHandler:
+        def __init__(self):
+            self.notes = []
+            self.close_connection = False
+
+        def _write_in_progress(self, response_id, model_alias, created_at, body, note):
+            self.notes.append((response_id, model_alias, created_at, note))
+
+    class Decision:
+        handled = True
+
+    fake = FakeHandler()
+    emitter = Emitter()
+
+    def slow_finalizer():
+        time.sleep(0.05)
+        return Decision()
+
+    decision = Handler._await_streamed_read_finalizer(
+        fake,
+        emitter,
+        {"input": []},
+        "ocg-kimi-k2.6",
+        slow_finalizer,
+        heartbeat_s=0.01,
+    )
+    assert decision.handled, decision
+    assert emitter._sse_headers_sent is True
+    assert fake.notes, "streaming read finalizer must emit progress while waiting"
+    assert fake.notes[0][3] == "read_finalizer_wait", fake.notes
+
+
 def assert_doctor_rejects_embedded_mission_examples_in_agreements():
     with tempfile.TemporaryDirectory(dir=ROOT) as d:
         root = Path(d)
@@ -335,6 +964,7 @@ def assert_doctor_rejects_embedded_mission_examples_in_agreements():
 def main():
     assert_malformed_handoff_fails_closed()
     assert_exact_write_requires_exact_content()
+    assert_legacy_write_handoffs_do_not_receive_raw_tools_by_default()
     assert_no_match_search_is_still_covered()
     assert_incomplete_evidence_blocks_confident_pass()
     assert_patch_acceptance_requires_scope_change_and_verification()
@@ -344,8 +974,21 @@ def main():
     assert_direct_read_only_utility_prefers_live_agent_loop()
     assert_direct_loop_turn_count_survives_response_projection()
     assert_shell_rtk_read_counts_as_read_evidence()
+    assert_shell_read_path_with_spaces_is_preserved()
     assert_turn_count_can_be_recovered_from_history()
     assert_direct_loop_stops_after_required_source_is_read()
+    assert_direct_loop_detects_repeated_completed_source()
+    assert_pending_child_replay_is_idempotent_and_terminalizable()
+    assert_semantic_pending_replays_survive_fresh_call_ids()
+    assert_terminal_pending_child_uses_semantic_replay_not_latest_child()
+    assert_orphan_tool_output_can_bind_pending_child_lineage()
+    assert_pending_child_adoption_failure_can_complete_reads_server_side()
+    assert_server_side_read_completion_prefers_model_authored_report()
+    assert_server_side_read_completion_falls_back_when_model_report_invalid()
+    assert_placeholder_read_paths_are_ignored_and_inline_target_recovers()
+    assert_handoff_extraction_prefers_current_user_task_over_repo_memory()
+    assert_inline_required_paths_ignore_negative_mentions()
+    assert_streamed_read_finalizer_sends_heartbeats_while_blocked()
     assert_doctor_rejects_embedded_mission_examples_in_agreements()
     print("PASS: OSS bridge protocol conformance suite")
 

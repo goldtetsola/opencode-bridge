@@ -26,6 +26,7 @@ from codex_oss.implementation import (
 )
 from codex_oss.audit import audit_mission
 from codex_oss.mission import InvalidHandoffError, _build_mission
+from codex_oss.visible_commentary import VisibleCommentarySink
 
 
 def sha256_text(text: str) -> str:
@@ -704,6 +705,57 @@ def assert_a4_writes_runtime_artifact_bundle():
         shutil.rmtree(root)
 
 
+def assert_a4_writes_visible_commentary_and_patch_intent_artifacts():
+    root, _ = make_project()
+    try:
+        mission = implementation_mission(mission_id="mission_a4_visible_implementation")
+        intent = {
+            "patch_intent_version": "1.0",
+            "summary": "Add visible implementation commentary fixture.",
+            "edits": [
+                {
+                    "operation": "insert_after",
+                    "path": "tests/test_config.py",
+                    "anchor": "def test_existing():\n    assert True",
+                    "content": "\n\ndef test_visible_implementation_commentary():\n    assert True\n",
+                }
+            ],
+            "verification_plan": [
+                {"command": ["python3", "-m", "pytest", "tests/test_config.py"]}
+            ],
+        }
+        handoff = (
+            "<OSS_PATCH_INTENT_JSON>\n"
+            + json.dumps(intent, indent=2)
+            + "\n</OSS_PATCH_INTENT_JSON>\n"
+        )
+        artifact_dir = os.path.join(root, ".codex-oss", "missions", mission.mission_id)
+        commentary = VisibleCommentarySink(mission.mission_id, artifact_dir)
+        result = run_implementation_mission(
+            mission=mission,
+            raw_model_alias="mission-a4-kimi",
+            handoff=handoff,
+            call_model=lambda messages, tools, timeout: fake_chat_response("{}"),
+            timeout=30,
+            project_root=root,
+            commentary=commentary,
+        )
+        assert result["status"] == "VALID", result
+        for name in ("visible_commentary.jsonl", "patch_proposal.json", "patch_intent.json"):
+            assert os.path.exists(os.path.join(artifact_dir, name)), name
+        with open(os.path.join(artifact_dir, "visible_commentary.jsonl"), encoding="utf-8") as handle:
+            event_types = [json.loads(line)["event_type"] for line in handle if line.strip()]
+        assert "mission_started" in event_types, event_types
+        assert "patch_intent_received" in event_types, event_types
+        assert "patch_validation_passed" in event_types, event_types
+        assert "mission_completed" in event_types, event_types
+        with open(os.path.join(artifact_dir, "patch_intent.json"), encoding="utf-8") as handle:
+            saved_intent = json.load(handle)
+        assert saved_intent["patch_intent_version"] == "1.0", saved_intent
+    finally:
+        shutil.rmtree(root)
+
+
 def json_dumps(value: dict) -> str:
     import json
 
@@ -929,6 +981,71 @@ def assert_a5_isolated_apply_verifies_without_mutating_main_workspace():
         assert os.path.exists(os.path.join(root, report["patch_artifact"])), report
         artifact_dir = os.path.join(root, ".codex-oss", "missions", mission.mission_id)
         assert os.path.exists(os.path.join(artifact_dir, "implementation_readiness_graph.json")), artifact_dir
+    finally:
+        shutil.rmtree(root)
+
+
+def assert_a5_isolated_apply_inside_repo_does_not_escape_to_parent_git():
+    root = tempfile.mkdtemp(prefix="oss_nested_project_", dir=ROOT)
+    try:
+        write(os.path.join(root, "tests/test_config.py"), "def test_existing():\n    assert True\n")
+        write(os.path.join(root, "src/config.py"), "def parse_config(value):\n    return value\n")
+        mission = implementation_mission(
+            mission_id="mission_a5_nested_worktree",
+            tier="A5",
+            mode="bounded_implementation",
+            write_allowed=True,
+            apply_mode="isolated_worktree",
+            allowed_paths=["tests/fixtures/nested_apply_smoke.py"],
+            owned_paths=["tests/fixtures/nested_apply_smoke.py"],
+            read_only_paths=[],
+            objective_spec={
+                "schema_version": "objective_spec.v1",
+                "objective_type": "implementation_patch",
+                "target": {
+                    "required_changed_files": ["tests/fixtures/nested_apply_smoke.py"],
+                    "required_test_files": ["tests/fixtures/nested_apply_smoke.py"],
+                    "required_test_names": ["test_nested_apply_smoke"],
+                },
+                "required_outputs": ["changed_test_file"],
+                "required_evidence_shapes": ["test_definition"],
+                "completion_criteria": ["required_tests_present", "verification_required"],
+            },
+            verification_policy={
+                "allowed_commands": [["python3", "tests/fixtures/nested_apply_smoke.py"]],
+                "max_commands": 1,
+                "timeout_seconds": 20,
+            },
+        )
+        intent = {
+            "patch_intent_version": "1.0",
+            "status": "PROPOSED",
+            "summary": "Create an isolated nested-repo verification smoke.",
+            "edits": [
+                {
+                    "operation": "create_file",
+                    "path": "tests/fixtures/nested_apply_smoke.py",
+                    "content": (
+                        "def test_nested_apply_smoke():\n"
+                        "    assert True\n\n\n"
+                        "if __name__ == '__main__':\n"
+                        "    test_nested_apply_smoke()\n"
+                    ),
+                    "reason": "Prove isolated git apply stays inside the copied sandbox.",
+                }
+            ],
+            "verification_plan": [
+                {"command": ["python3", "tests/fixtures/nested_apply_smoke.py"], "reason": "Run smoke."}
+            ],
+        }
+        patch = build_patch_proposal_from_intent(intent, mission, root)
+        report = apply_patch_in_isolated_worktree(patch, mission, root)
+        assert report["status"] == "VERIFIED", report
+        assert report["main_workspace_mutated"] is False, report
+        assert not os.path.exists(os.path.join(root, "tests/fixtures/nested_apply_smoke.py")), report
+        assert os.path.exists(
+            os.path.join(root, ".codex-oss", "worktrees", mission.mission_id, "tests/fixtures/nested_apply_smoke.py")
+        ), report
     finally:
         shutil.rmtree(root)
 
@@ -1518,6 +1635,7 @@ def main():
     assert_patch_intent_noop_gets_targeted_repair()
     assert_malformed_desired_state_gets_targeted_repair()
     assert_a4_writes_runtime_artifact_bundle()
+    assert_a4_writes_visible_commentary_and_patch_intent_artifacts()
     assert_patch_validator_rejects_path_escape_and_forbidden_paths()
     assert_patch_validator_escalates_critical_paths_and_blocks_secrets()
     assert_patch_validator_rejects_stale_base_and_oversized_patch()
@@ -1525,6 +1643,7 @@ def main():
     assert_patch_validator_enforces_broad_implementation_objective_spec()
     assert_patch_validator_requires_evidence_shapes_for_broad_implementation()
     assert_a5_isolated_apply_verifies_without_mutating_main_workspace()
+    assert_a5_isolated_apply_inside_repo_does_not_escape_to_parent_git()
     assert_a5_temp_project_apply_verifies_without_mutating_main_workspace()
     assert_a5_workspace_apply_is_policy_gated_and_reversible()
     assert_a5_workspace_apply_can_be_enabled_by_mission_policy_without_env()

@@ -14,6 +14,24 @@ JSON = Dict[str, Any]
 ACTION_RE = re.compile(r'\{[^{}]*"action_type"[^{}]*\}', re.DOTALL)
 
 
+def _call_model_with_optional_override(
+    call_model_fn,
+    context: list,
+    tools: list,
+    timeout: float,
+    model_alias_override: str | None = None,
+):
+    """Call model function, using runtime finalizer alias only when supported."""
+    if model_alias_override:
+        try:
+            return call_model_fn(context, tools, timeout, model_alias_override=model_alias_override)
+        except TypeError as exc:
+            message = str(exc)
+            if "model_alias_override" not in message and "unexpected keyword" not in message:
+                raise
+    return call_model_fn(context, tools, timeout)
+
+
 class ModelAction:
     """Parsed model action from ManagedInvestigationActionV1 JSON."""
 
@@ -187,6 +205,7 @@ def run_loop(mission: Any, ledger: Any, call_model_fn, tools, emitter,
     deadline.max_total_model_calls = int(getattr(mission, "max_model_calls", deadline.max_total_model_calls))
     repair_count = 0
     forced_final_requested = False
+    closer_turn_active = False
 
     # Concurrency
     acquired, slot_reason = acquire_mission_slot(mission)
@@ -276,7 +295,7 @@ def run_loop(mission: Any, ledger: Any, call_model_fn, tools, emitter,
                 phase="PLAN", source="runtime", model=str(getattr(mission, "runtime_model_alias", "") or ""),
                 metadata={"mode": mode, "objective_style": style, "required_sources": required_count},
             )
-        if str(getattr(mission, "objective_style", "") or "") == "open_investigation" and str(getattr(mission, "evidence_collection_mode", "prefetch_floor") or "prefetch_floor") == "prefetch_floor":
+        if _should_prefetch_pending_sources(mission, ledger, deadline):
             initial_answer_graph = _runtime_prefetch_required_sources(
                 mission,
                 ledger,
@@ -292,6 +311,37 @@ def run_loop(mission: Any, ledger: Any, call_model_fn, tools, emitter,
             "phase recomputed after runtime prefetch",
         )
         context = _build_context(mission, ledger, allowed_tool_names)
+        if (
+            str(getattr(mission, "evidence_collection_mode", "prefetch_floor") or "prefetch_floor") == "prefetch_floor"
+            and not list(getattr(mission, "answer_obligations", []) or [])
+            and not pending_required_agenda_items(initial_answer_graph)
+            and bool(getattr(ledger, "files_inspected", {}) or getattr(ledger, "commands_run", []))
+        ):
+            if os.getenv("RUNTIME_SOURCE_FLOOR_MODEL_CLOSER", "0").strip().lower() not in {"1", "true", "yes", "on"}:
+                if commentary is not None:
+                    commentary.emit(
+                        "runtime_closure_started",
+                        "Required source floor covered",
+                        "The runtime covered the required source floor, so I'm closing from the evidence graph without a final model turn.",
+                        phase=str(initial_answer_graph.get("investigation_state", {}).get("phase", "") or "REPORT"),
+                        source="runtime",
+                        metadata={"evidence_refs": _evidence_ref_summary(ledger), "model_closer_skipped": True},
+                    )
+                return _partial(mission, ledger, "source_floor_runtime_closed", deadline)
+            forced_final_requested = True
+            context.append({"role": "user", "content": (
+                "The runtime has satisfied the required source floor. Return exactly one final_report JSON object now "
+                f"using only the available evidence refs: {_evidence_ref_summary(ledger)}. Do not call another tool."
+            )})
+            if commentary is not None:
+                commentary.emit(
+                    "runtime_closure_started",
+                    "Required source floor covered",
+                    "The runtime covered the required source floor, so I'm asking only for final synthesis now.",
+                    phase=str(initial_answer_graph.get("investigation_state", {}).get("phase", "") or "REPORT"),
+                    source="runtime",
+                    metadata={"evidence_refs": _evidence_ref_summary(ledger)},
+                )
 
         while True:
             elapsed = _time.time() - start
@@ -329,22 +379,32 @@ def run_loop(mission: Any, ledger: Any, call_model_fn, tools, emitter,
 
             # Call model
             model_timeout = max(1, deadline.remaining() - 2)
+            model_alias_override = None
             if forced_final_requested:
                 final_timeout = float(os.getenv("RUNTIME_FINAL_REPORT_MODEL_TIMEOUT_SECONDS", "20"))
                 model_timeout = max(1, min(model_timeout, final_timeout))
+                model_alias_override = os.getenv("RUNTIME_FINAL_REPORT_MODEL_ALIAS", "mission-a2-flash").strip() or None
                 # CloserDraftV1 flow: runtime builds skeleton, model narrates
                 answer_graph = getattr(ledger, "answer_graph", {}) or {}
                 sufficiency = answer_graph.get("sufficiency", {}) if isinstance(answer_graph, dict) else {}
                 if sufficiency.get("required_answered", 0) > 0:
                     from codex_oss.runtime.closure import (
                         build_canonical_answer, build_report_skeleton, build_closer_draft_prompt,
+                        build_completion_seed_report,
                     )
                     from codex_oss.completion import build_completion_envelope, default_completion_contract
                     contract = getattr(mission, "completion_contract", {}) or default_completion_contract(mission)
-                    envelope = build_completion_envelope(mission, {"status": sufficiency.get("recommended_status", "PARTIAL"), "closure_source": "runtime_answer_graph"}, answer_graph, sufficiency, None)
+                    seed_report = build_completion_seed_report(
+                        mission,
+                        answer_graph,
+                        ledger,
+                        closure_source="model_narrated_runtime_closed",
+                    )
+                    envelope = build_completion_envelope(mission, seed_report, answer_graph, sufficiency, None)
                     canonical = build_canonical_answer(mission, answer_graph, envelope, ledger)
                     skeleton = build_report_skeleton(canonical)
                     context = [{"role": "user", "content": build_closer_draft_prompt(skeleton)}]
+                    closer_turn_active = True
                     _record_closer_attempt(
                         mission,
                         "closer",
@@ -360,14 +420,26 @@ def run_loop(mission: Any, ledger: Any, call_model_fn, tools, emitter,
                 if commentary is not None:
                     commentary.emit(
                         "model_action_requested",
-                        "Requesting next action",
+                        "Requesting final narration" if forced_final_requested else "Requesting next action",
+                        "I'm asking the OSS model for a bounded no-tool final narration."
+                        if forced_final_requested else
                         "I'm asking the OSS model for the next safe investigation action.",
                         phase=_mission_phase(ledger),
                         source="runtime",
                         model=str(getattr(mission, "last_reasoning_model", "") or getattr(mission, "runtime_model_alias", "") or ""),
-                        metadata={"forced_final_requested": forced_final_requested, "timeout_seconds": model_timeout},
+                        metadata={
+                            "forced_final_requested": forced_final_requested,
+                            "timeout_seconds": model_timeout,
+                            "model_alias_override": model_alias_override or "",
+                        },
                     )
-                response = call_model_fn(context, tools, model_timeout)
+                response = _call_model_with_optional_override(
+                    call_model_fn,
+                    context,
+                    [] if forced_final_requested else tools,
+                    model_timeout,
+                    model_alias_override=model_alias_override if forced_final_requested else None,
+                )
                 deadline.record_call()
             except Exception as e:
                 if commentary is not None:
@@ -390,6 +462,34 @@ def run_loop(mission: Any, ledger: Any, call_model_fn, tools, emitter,
 
             action = parse_action(text)
             if not action:
+                if closer_turn_active:
+                    from codex_oss.runtime.closure import parse_closer_draft
+                    draft = parse_closer_draft(text)
+                    if draft is not None:
+                        return _finalize_closer_draft(
+                            mission,
+                            ledger,
+                            draft,
+                            deadline,
+                            payload_chars=len(str(context[-1].get("content", "") or "")) if context else 0,
+                            timeout_seconds=model_timeout,
+                            commentary=commentary,
+                        )
+                    _record_closer_attempt(
+                        mission,
+                        "closer",
+                        "invalid",
+                        attempt_type="closer_draft",
+                        payload_chars=len(str(context[-1].get("content", "") or "")) if context else 0,
+                        report_valid=False,
+                        error_type="parse_failed",
+                        error_message="closer returned neither CloserDraftV1 nor final_report action",
+                        closure_status="RUNTIME_CLOSED",
+                        skip_reason="closer_draft_invalid",
+                        timeout_seconds=model_timeout,
+                        deadline_remaining_seconds=deadline.remaining(),
+                    )
+                    return _partial(mission, ledger, "closer_draft_invalid", deadline)
                 if commentary is not None:
                     commentary.emit(
                         "model_action_invalid",
@@ -406,6 +506,8 @@ def run_loop(mission: Any, ledger: Any, call_model_fn, tools, emitter,
                 return _partial(mission, ledger, "action_parse_failed", deadline)
 
             if not action.is_valid:
+                if closer_turn_active:
+                    return _partial(mission, ledger, "closer_action_invalid", deadline)
                 if commentary is not None:
                     commentary.emit(
                         "model_action_invalid",
@@ -439,7 +541,7 @@ def run_loop(mission: Any, ledger: Any, call_model_fn, tools, emitter,
                         ledger.answer_graph = current_answer_graph
                         pending_required = pending_required_agenda_items(current_answer_graph)
                         if pending_required and str(report.get("status", "") or "").upper() == "COMPLETE":
-                            if repair_count < max_repair:
+                            if not closer_turn_active and repair_count < max_repair:
                                 repair_count += 1
                                 context.append({"role": "user", "content": (
                                     "You cannot return COMPLETE yet. Required evidence sources are still pending: "
@@ -457,7 +559,7 @@ def run_loop(mission: Any, ledger: Any, call_model_fn, tools, emitter,
                                 require_contradiction = bool(exploration_policy.get("require_contradiction_search", True))
                                 contradiction_done = bool(getattr(ledger, "contradiction_search_done", False))
                                 if optional_count < min_optional:
-                                    if repair_count < max_repair:
+                                    if not closer_turn_active and repair_count < max_repair:
                                         repair_count += 1
                                         context.append({"role": "user", "content": (
                                             f"Required evidence floor is covered, but exploration policy expects "
@@ -470,7 +572,7 @@ def run_loop(mission: Any, ledger: Any, call_model_fn, tools, emitter,
                                         f"Skipped optional exploration: floor covered but only {optional_count}/{min_optional} optional actions performed."
                                     )
                                 elif require_contradiction and not contradiction_done:
-                                    if repair_count < max_repair:
+                                    if not closer_turn_active and repair_count < max_repair:
                                         repair_count += 1
                                         context.append({"role": "user", "content": (
                                             "Exploration policy requires a contradiction search before closure. "
@@ -552,7 +654,7 @@ def run_loop(mission: Any, ledger: Any, call_model_fn, tools, emitter,
                         elif not bool(sufficiency.get("enough_evidence_to_report", False)):
                             coverage_errors = list(coverage_errors) + list(sufficiency.get("missing_requirements", []) or [])
                         if coverage_errors:
-                            if repair_count < max_repair:
+                            if not closer_turn_active and repair_count < max_repair:
                                 repair_count += 1
                                 context.append({"role": "user", "content":
                                     REPAIR_PROMPT.format(
@@ -569,7 +671,7 @@ def run_loop(mission: Any, ledger: Any, call_model_fn, tools, emitter,
                             published = build_published_answer(mission, refreshed_answer_graph, refreshed_graph)
                             semantic = evaluate_report_semantic_completeness(mission, report, published, refreshed_answer_graph, answer_sufficiency)
                             if not semantic.get("ok"):
-                                if repair_count < max_repair:
+                                if not closer_turn_active and repair_count < max_repair:
                                     repair_count += 1
                                     from codex_oss.runtime.closer import build_report_skeleton, build_targeted_repair_prompt
                                     skeleton = build_report_skeleton(mission, refreshed_answer_graph)
@@ -629,7 +731,7 @@ def run_loop(mission: Any, ledger: Any, call_model_fn, tools, emitter,
                             repair_attempted=repair_count > 0,
                         )
                         return {"status": report["status"], "report": report}
-                    if repair_count < max_repair:
+                    if not closer_turn_active and repair_count < max_repair:
                         repair_count += 1
                         # Build targeted repair prompt with exact ledger command IDs
                         cmd_list = _ledger_command_ids(ledger)
@@ -668,6 +770,16 @@ def run_loop(mission: Any, ledger: Any, call_model_fn, tools, emitter,
                         getattr(action, "arguments", {}) if isinstance(action.arguments, dict) else {},
                         [],
                     )
+                    if closer_turn_active:
+                        return _partial(mission, ledger, "deadline_final_report_ignored", deadline)
+                    if repair_count < max_repair:
+                        repair_count += 1
+                        context.append({"role": "user", "content": (
+                            "The deadline final-report request is mandatory. Do not call another tool. "
+                            "Return exactly one final_report JSON object now using only the available evidence refs: "
+                            f"{_evidence_ref_summary(ledger)}."
+                        )})
+                        continue
                     return _partial(mission, ledger, "deadline_final_report_ignored", deadline)
                 tool_name = action.tool_name
                 raw_arguments = dict(action.arguments) if isinstance(action.arguments, dict) else {}
@@ -1350,6 +1462,22 @@ def _runtime_prefetch_required_sources(
                     "exit_code": exit_code,
                 },
             )
+            sufficiency = answer_graph.get("sufficiency", {}) if isinstance(answer_graph, dict) else {}
+            commentary.emit(
+                "coverage_update",
+                "Coverage updated",
+                (
+                    f"Required source coverage updated. "
+                    f"Missing required sources: {len(list(sufficiency.get('missing_required_sources', []) or []))}."
+                ),
+                phase=str((answer_graph.get("investigation_state", {}) or {}).get("phase", "") or _mission_phase(ledger)),
+                source="coverage",
+                metadata={
+                    "missing_required_sources": list(sufficiency.get("missing_required_sources", []) or []),
+                    "recommended_status": sufficiency.get("recommended_status"),
+                    "can_close": sufficiency.get("can_close"),
+                },
+            )
     return answer_graph
 
 
@@ -1370,6 +1498,15 @@ def _should_prefetch_pending_sources(mission: Any, ledger: Any, deadline: Any | 
     mode = str(getattr(mission, "evidence_collection_mode", "prefetch_floor") or "prefetch_floor")
     if mode == "model_led":
         return False
+    if deadline is not None and not final_attempt:
+        try:
+            remaining = float(deadline.remaining())
+            first_byte = float(getattr(deadline, "first_byte_timeout", 20) or 20)
+            fallback = float(getattr(deadline, "fallback_budget", 20) or 20)
+            if remaining <= first_byte + fallback:
+                return False
+        except Exception:
+            pass
     if mode == "prefetch_floor":
         return True
     redirect_count = sum(
@@ -1531,6 +1668,7 @@ def _partial_dict(mission, ledger, reason: str) -> dict:
         envelope = build_completion_envelope(mission, report, answer_graph, sufficiency=answer_graph.get("sufficiency", {}) if isinstance(answer_graph, dict) else {}, closure_attempts=None)
         report["completion_envelope"] = envelope
         report["status"] = envelope["final_status"]
+        report["closure_status"] = "RUNTIME_CLOSED"
         acc = getattr(ledger, "narration_accumulator", None)
         if acc is not None:
             report["narration_accumulator"] = acc.to_dict()
@@ -1605,7 +1743,12 @@ def _record_closer_attempt(
         project_root = os.getcwd()
         mission_dir = os.path.join(project_root, ".codex-oss", "missions", getattr(mission, "mission_id", "unknown"))
         os.makedirs(mission_dir, exist_ok=True)
-        final_source = "model_report" if closer_type == "model" else "runtime_answer_graph"
+        if closer_type == "runtime":
+            final_source = "runtime_answer_graph"
+        elif closer_type == "closer":
+            final_source = "model_narrated_runtime_closed"
+        else:
+            final_source = "model_report"
         record_closure_telemetry(
             mission_dir,
             f"close_{int(time.time())}",
@@ -1630,6 +1773,103 @@ def _record_closer_attempt(
         )
     except Exception:
         pass
+
+
+def _finalize_closer_draft(
+    mission: Any,
+    ledger: Any,
+    draft: dict,
+    deadline: Any,
+    *,
+    payload_chars: int = 0,
+    timeout_seconds: float = 0,
+    commentary: Any | None = None,
+) -> dict:
+    """Merge a bounded no-tool CloserDraftV1 into the runtime-owned report."""
+    from codex_oss.completion import build_completion_envelope
+    from codex_oss.runtime.closure import (
+        build_canonical_answer,
+        build_completion_seed_report,
+        merge_draft_into_report,
+    )
+    from codex_oss.validation import validate_report
+    from codex_oss.claim_graph import refresh_claim_graph
+    from codex_oss.answer_graph import refresh_answer_graph
+
+    claim_graph = refresh_claim_graph(mission, ledger, reason="closer_draft", persist=True)
+    answer_graph = refresh_answer_graph(
+        mission,
+        ledger,
+        claim_graph=claim_graph,
+        reason="closer_draft",
+        persist=True,
+    )
+    sufficiency = answer_graph.get("sufficiency", {}) if isinstance(answer_graph, dict) else {}
+    seed_report = build_completion_seed_report(
+        mission,
+        answer_graph,
+        ledger,
+        closure_source="model_narrated_runtime_closed",
+    )
+    envelope = build_completion_envelope(mission, seed_report, answer_graph, sufficiency, None)
+    canonical = build_canonical_answer(mission, answer_graph, envelope, ledger)
+    report = merge_draft_into_report(canonical, draft)
+    report["optional_exploration_actions"] = getattr(ledger, "optional_exploration_actions", 0)
+    report["contradiction_search_done"] = bool(getattr(ledger, "contradiction_search_done", False))
+    report["semantic_gate_evaluated"] = True
+    report["semantic_gate_decision"] = "ACCEPT"
+    report["closure_status"] = "MODEL_NARRATED_RUNTIME_CLOSED"
+    _annotate_report_provenance(mission, report, "model_narrated_runtime_closed")
+    report["completion_envelope"] = build_completion_envelope(mission, report, answer_graph, sufficiency, None)
+    report["status"] = report["completion_envelope"]["final_status"]
+    report["closure_status"] = report["completion_envelope"].get("closure_status", "MODEL_NARRATED_RUNTIME_CLOSED")
+    acc = getattr(ledger, "narration_accumulator", None)
+    if acc is not None:
+        acc.add_closer_draft(draft)
+        report["narration_accumulator"] = acc.to_dict()
+
+    result = validate_report(report, ledger)
+    if not result.is_valid:
+        _record_closer_attempt(
+            mission,
+            "closer",
+            "invalid",
+            attempt_type="closer_draft",
+            payload_chars=payload_chars,
+            report_valid=False,
+            error_type="schema_failed",
+            error_message=";".join(result.errors[:3]),
+            draft_valid=True,
+            merged_report_valid=False,
+            closure_status="RUNTIME_CLOSED",
+            timeout_seconds=timeout_seconds,
+            deadline_remaining_seconds=deadline.remaining(),
+        )
+        return _partial(mission, ledger, f"closer_draft_merge_failed:{','.join(result.errors[:3])}", deadline)
+
+    _record_closer_attempt(
+        mission,
+        "closer",
+        report["status"],
+        attempt_type="closer_draft",
+        payload_chars=payload_chars,
+        report_valid=True,
+        draft_valid=True,
+        merged_report_valid=True,
+        closure_status=report.get("closure_status", "MODEL_NARRATED_RUNTIME_CLOSED"),
+        timeout_seconds=timeout_seconds,
+        deadline_remaining_seconds=deadline.remaining(),
+    )
+    if commentary is not None:
+        commentary.emit(
+            "model_narrated_runtime_closed",
+            "Report narrated",
+            "The closer returned a narrative draft, and the runtime merged it into the evidence-backed final report.",
+            phase="REPORT",
+            source="runtime_closer",
+            metadata={"status": report["status"], "closure_status": report.get("closure_status", "")},
+        )
+    return {"status": report["status"], "report": report}
 
 
 def _partial(mission, ledger, reason: str, deadline) -> dict:

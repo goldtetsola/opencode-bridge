@@ -72,22 +72,6 @@ def build_response_object_from_chat(
     all_messages = repair_chat_history(base_messages, None) + [assistant_msg]
     pending_ids = [x["codex"]["call_id"] for x in tool_calls_out]
 
-    state_put(
-        stored_response_factory(
-            response_id=response_id,
-            model_alias=model_alias,
-            model_upstream=model_upstream,
-            messages=all_messages,
-            pending_call_ids=pending_ids,
-            created_at=created_at,
-            tool_exchange_count=int(body.get("_codex_oss_tool_exchange_count", 0) or 0),
-            task_max_exchanges=int(
-                body.get("_codex_oss_task_max_exchanges")
-                or extract_budget(base_messages)
-            ),
-        )
-    )
-
     output: List[JSON] = []
     if reasoning_content and os.getenv("EXPOSE_EMPTY_REASONING_ITEM", "1") != "0":
         output.append({"type": "reasoning", "id": new_id("rs"), "summary": []})
@@ -115,6 +99,24 @@ def build_response_object_from_chat(
                 "content": [{"type": "output_text", "text": content, "annotations": []}],
             }
         )
+
+    state_put(
+        stored_response_factory(
+            response_id=response_id,
+            model_alias=model_alias,
+            model_upstream=model_upstream,
+            messages=all_messages,
+            pending_call_ids=pending_ids,
+            created_at=created_at,
+            output_items_json=json_dumps(output),
+            tool_exchange_count=int(body.get("_codex_oss_tool_exchange_count", 0) or 0),
+            task_max_exchanges=int(
+                body.get("_codex_oss_task_max_exchanges")
+                or extract_budget(base_messages)
+            ),
+            previous_response_id=str(body.get("previous_response_id") or ""),
+        )
+    )
 
     usage = chat_resp.get("usage") or {}
     return {

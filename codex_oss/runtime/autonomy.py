@@ -233,6 +233,7 @@ def grade_trace(ledger: Any, report: dict | None = None) -> dict[str, Any]:
         "duplicate": 0,
         "repaired": 0,
         "cache_hit": 0,
+        "runtime_prefetch": 0,
         "medium_gain": 0,
         "low_gain": 0,
         "unsupported_arg_events": 0,
@@ -250,10 +251,16 @@ def grade_trace(ledger: Any, report: dict | None = None) -> dict[str, Any]:
 
     if (
         counts["medium_gain"] > 0
-        or (counts["allowed"] > 0 and bool(getattr(ledger, "files_inspected", {}) or getattr(ledger, "commands_run", [])))
-    ) and counts["allowed"] + counts["cache_hit"] > counts["redirected"] + counts["blocked"]:
+        or (
+            (counts["allowed"] > 0 or counts["runtime_prefetch"] > 0)
+            and bool(getattr(ledger, "files_inspected", {}) or getattr(ledger, "commands_run", []))
+        )
+    ) and (
+        counts["runtime_prefetch"] > 0
+        or counts["allowed"] + counts["cache_hit"] > counts["redirected"] + counts["blocked"]
+    ):
         labels.append("productive_exploration")
-        reasons.append("Trace contains allowed or cached evidence-gathering actions with non-trivial information gain.")
+        reasons.append("Trace contains allowed, cached, or runtime-prefetched evidence-gathering actions with non-trivial information gain.")
 
     if counts["duplicate"] > 0 or any(
         getattr(trace, "tool_name", "") == "rtk_grep" and getattr(trace, "novelty", "") == "repeated"

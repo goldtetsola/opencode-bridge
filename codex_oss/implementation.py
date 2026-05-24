@@ -48,10 +48,26 @@ def run_implementation_mission(
     call_model: Callable[[Any, Any, float], JSON],
     timeout: float,
     project_root: str,
+    commentary: Any | None = None,
 ) -> JSON:
     """Run A4/A5 patch-mediated implementation without raw write tools."""
     mission.runtime_model_alias = raw_model_alias
     mission.model_repair_count = 0
+    artifact_dir = os.path.join(
+        project_root,
+        ".codex-oss",
+        "missions",
+        str(getattr(mission, "mission_id", "mission_unknown")),
+    )
+    os.makedirs(artifact_dir, exist_ok=True)
+    _emit_commentary(
+        commentary,
+        "mission_started",
+        "Implementation mission accepted",
+        "I'm compiling this as a runtime-controlled implementation mission. The model may propose intent, but the runtime owns patch validation, apply, verification, and final status.",
+        phase="PLAN",
+        source="runtime",
+    )
     append_decision(
         mission,
         decision_type="implementation_entry",
@@ -72,6 +88,15 @@ def run_implementation_mission(
         if recipe is not None:
             proposal, parse_error = _proposal_from_recipe(recipe, mission, project_root)
     if proposal is None:
+        intent, _ = _patch_intent_from_handoff(handoff)
+        if intent is not None:
+            try:
+                proposal = build_patch_proposal_from_intent(intent, mission, project_root)
+                parse_error = None
+            except ValueError as exc:
+                proposal = None
+                parse_error = f"PatchIntentV1 build failed: {exc}"
+    if proposal is None:
         proposal, parse_error = _proposal_from_model(mission, call_model, timeout, project_root)
     if proposal is None:
         report = {
@@ -80,25 +105,61 @@ def run_implementation_mission(
             "changed_files": [],
             "checks": {},
             "reasons": [parse_error or "PatchProposalV1 was not returned"],
+            "visible_commentary_path": os.path.join(artifact_dir, "visible_commentary.jsonl"),
+            "summary_path": os.path.join(artifact_dir, "summary.md"),
         }
+        _emit_commentary(
+            commentary,
+            "mission_failed",
+            "Patch proposal missing",
+            "The implementation mission could not continue because no valid patch proposal, recipe, desired state, or patch intent was available.",
+            phase="PROPOSE",
+            source="runtime",
+            severity="warning",
+        )
         return {
             "status": "FAILED",
             "text": render_patch_validation_report(mission, report),
         }
 
+    _emit_commentary(
+        commentary,
+        "patch_intent_received",
+        "Patch intent captured",
+        _proposal_commentary_message(proposal),
+        phase="PROPOSE",
+        source="runtime",
+        artifact_refs=["patch_proposal.json"],
+    )
+
     if mission.tier == "A4":
+        _emit_commentary(
+            commentary,
+            "patch_validation_started",
+            "Validating patch proposal",
+            "I'm validating the runtime-built diff against path policy, base hashes, semantic review, secret scanning, and verification plan requirements.",
+            phase="VALIDATE_PATCH",
+            source="runtime",
+        )
         validation = validate_patch_proposal(proposal, mission, project_root)
         if validation.get("status") == "INVALID":
             mission.model_repair_count = int(getattr(mission, "model_repair_count", 0) or 0) + 1
+            _emit_commentary(
+                commentary,
+                "runtime_redirect",
+                "Requesting patch repair",
+                "The first patch proposal failed validation, so the runtime is asking for a constrained repair instead of applying it.",
+                phase="VALIDATE_PATCH",
+                source="runtime",
+                severity="warning",
+                runtime_decision="patch_repair_requested",
+            )
             repaired, _ = _repair_patch_proposal(mission, proposal, validation, call_model, timeout, project_root)
             if repaired is not None:
                 repaired_validation = validate_patch_proposal(repaired, mission, project_root)
                 if repaired_validation.get("status") != "INVALID":
                     proposal = repaired
                     validation = repaired_validation
-        mission_id = str(getattr(mission, "mission_id", "mission_unknown"))
-        artifact_dir = os.path.join(project_root, ".codex-oss", "missions", mission_id)
-        os.makedirs(artifact_dir, exist_ok=True)
         patch_path, rollback_path = _write_patch_artifacts(artifact_dir, proposal)
         _write_json(os.path.join(artifact_dir, "validation.json"), validation)
         _write_json(os.path.join(artifact_dir, "verification.json"), [])
@@ -115,6 +176,7 @@ def run_implementation_mission(
             caveats=["Patch proposal was validated but not applied because A4 is non-mutating."],
             execution_mode="proposal_only",
         )
+        _emit_validation_commentary(commentary, validation, "VALIDATE_PATCH")
         _persist_implementation_runtime_artifacts(
             artifact_dir=artifact_dir,
             mission=mission,
@@ -124,19 +186,40 @@ def run_implementation_mission(
             report=report,
             certification=None,
         )
+        _emit_terminal_implementation_commentary(commentary, report)
         return {
             "status": validation.get("status", "INVALID"),
             "text": render_patch_validation_report(mission, validation),
         }
 
+    _emit_commentary(
+        commentary,
+        "patch_validation_started",
+        "Validating patch proposal",
+        "I'm validating the proposed change before any apply step. Writes are still mediated by the runtime.",
+        phase="VALIDATE_PATCH",
+        source="runtime",
+    )
     validation = validate_patch_proposal(proposal, mission, project_root)
     if validation.get("status") == "INVALID":
         mission.model_repair_count = int(getattr(mission, "model_repair_count", 0) or 0) + 1
+        _emit_commentary(
+            commentary,
+            "runtime_redirect",
+            "Requesting patch repair",
+            "The first patch proposal failed validation, so the runtime is asking for a constrained repair before apply.",
+            phase="VALIDATE_PATCH",
+            source="runtime",
+            severity="warning",
+            runtime_decision="patch_repair_requested",
+        )
         repaired, _ = _repair_patch_proposal(mission, proposal, validation, call_model, timeout, project_root)
         if repaired is not None:
             repaired_validation = validate_patch_proposal(repaired, mission, project_root)
             if repaired_validation.get("status") != "INVALID":
                 proposal = repaired
+                validation = repaired_validation
+    _emit_validation_commentary(commentary, validation, "VALIDATE_PATCH")
     apply_mode = getattr(mission, "apply_mode", "isolated_worktree")
     certification = None
     workspace_policy = getattr(mission, "workspace_apply_policy", {}) or {}
@@ -155,11 +238,37 @@ def run_implementation_mission(
         "workspace_explicit",
         "critical_workspace_certified",
     ):
+        _emit_commentary(
+            commentary,
+            "workspace_apply_started",
+            "Applying in workspace",
+            "The runtime is applying the validated patch under the configured workspace apply policy.",
+            phase="APPLY",
+            source="runtime",
+        )
         implementation = apply_patch_in_workspace(proposal, mission, project_root, certification=certification)
     elif apply_mode == "temp_project":
+        _emit_commentary(
+            commentary,
+            "isolated_apply_started",
+            "Applying in temporary project",
+            "The runtime is applying the validated patch in a disposable project copy.",
+            phase="APPLY",
+            source="runtime",
+        )
         implementation = apply_patch_in_temp_project(proposal, mission, project_root)
     else:
+        _emit_commentary(
+            commentary,
+            "isolated_apply_started",
+            "Applying in isolated worktree",
+            "The runtime is applying the validated patch in an isolated worktree; the main workspace will not be mutated.",
+            phase="APPLY",
+            source="runtime",
+        )
         implementation = apply_patch_in_isolated_worktree(proposal, mission, project_root)
+    _emit_verification_commentary(commentary, implementation)
+    _emit_terminal_implementation_commentary(commentary, implementation)
     return {
         "status": implementation.get("status", "FAILED"),
         "text": render_implementation_report(mission, implementation),
@@ -225,6 +334,98 @@ def render_implementation_report(mission: Any, report: JSON) -> str:
     return "\n".join(lines)
 
 
+def _emit_commentary(commentary: Any | None, *args: Any, **kwargs: Any) -> None:
+    if commentary is None:
+        return
+    try:
+        commentary.emit(*args, **kwargs)
+    except Exception:
+        pass
+
+
+def _proposal_commentary_message(proposal: JSON) -> str:
+    source = str(proposal.get("proposal_source", "raw_patch_proposal_v1") or "raw_patch_proposal_v1")
+    changed = [
+        str(item.get("path", "") or "")
+        for item in proposal.get("changed_files", []) or []
+        if isinstance(item, dict) and item.get("path")
+    ]
+    if source in {"patch_intent_v1", "patch_recipe_v1", "desired_state_v1"}:
+        prefix = "The runtime built a patch proposal from a constrained model-authored intent."
+    else:
+        prefix = "The runtime captured a model-authored patch proposal for validation."
+    return f"{prefix} Target files: {', '.join(changed) if changed else 'none'}."
+
+
+def _emit_validation_commentary(commentary: Any | None, validation: JSON, phase: str) -> None:
+    status = str(validation.get("status", "") or "UNKNOWN")
+    checks = validation.get("checks", {}) if isinstance(validation.get("checks"), dict) else {}
+    if status == "VALID":
+        _emit_commentary(
+            commentary,
+            "patch_validation_passed",
+            "Patch validation passed",
+            "Path policy, base hashes, secret scan, semantic review, apply-check, and verification-plan checks are clean enough for the configured mission tier.",
+            phase=phase,
+            source="runtime",
+            artifact_refs=["validation.json"],
+        )
+        return
+    failed = [key for key, ok in sorted(checks.items()) if ok is False]
+    _emit_commentary(
+        commentary,
+        "patch_validation_failed",
+        "Patch validation blocked apply",
+        f"Patch validation returned {status}. Blocking checks: {', '.join(failed[:6]) if failed else 'see validation.json'}.",
+        phase=phase,
+        source="runtime",
+        severity="warning",
+        artifact_refs=["validation.json"],
+    )
+
+
+def _emit_verification_commentary(commentary: Any | None, report: JSON) -> None:
+    verification = report.get("verification", []) or []
+    if not verification:
+        return
+    all_green = all(isinstance(item, dict) and item.get("exit_code") == 0 for item in verification)
+    _emit_commentary(
+        commentary,
+        "verification_passed" if all_green else "verification_failed",
+        "Verification passed" if all_green else "Verification failed",
+        f"The runtime ran {len(verification)} verification command(s); {'all exited 0' if all_green else 'at least one did not exit 0'}.",
+        phase="VERIFY",
+        source="verification",
+        severity="info" if all_green else "warning",
+        artifact_refs=["verification.json"],
+    )
+
+
+def _emit_terminal_implementation_commentary(commentary: Any | None, report: JSON) -> None:
+    status = str(report.get("status", "") or "UNKNOWN").upper()
+    if status in {"VERIFIED", "VALIDATED"}:
+        event_type = "mission_completed"
+        title = "Implementation mission completed"
+    elif status == "ESCALATE":
+        event_type = "mission_escalated"
+        title = "Implementation mission escalated"
+    elif status == "FAILED":
+        event_type = "mission_failed"
+        title = "Implementation mission failed"
+    else:
+        event_type = "mission_partial"
+        title = "Implementation mission partially completed"
+    _emit_commentary(
+        commentary,
+        event_type,
+        title,
+        f"Final status: {status}. Patch, validation, verification, rollback, and report artifacts have been persisted.",
+        phase="REPORT",
+        source="runtime",
+        artifact_refs=["report.json", "patch.diff", "rollback.diff"],
+    )
+
+
 def _persist_implementation_runtime_artifacts(
     artifact_dir: str,
     mission: Any,
@@ -234,6 +435,15 @@ def _persist_implementation_runtime_artifacts(
     report: JSON,
     certification: JSON | None = None,
 ) -> None:
+    _write_json(os.path.join(artifact_dir, "patch_proposal.json"), proposal)
+    source_payloads = [
+        ("patch_intent.json", proposal.get("patch_intent")),
+        ("patch_recipe.json", proposal.get("patch_recipe")),
+        ("desired_state.json", proposal.get("desired_state")),
+    ]
+    for filename, payload in source_payloads:
+        if isinstance(payload, dict):
+            _write_json(os.path.join(artifact_dir, filename), payload)
     _write_json(os.path.join(artifact_dir, "report.json"), report)
     readiness_graph = validation.get("implementation_readiness_graph")
     if isinstance(readiness_graph, dict):
@@ -468,6 +678,19 @@ def _patch_recipe_from_handoff(handoff: str) -> tuple[JSON | None, str | None]:
         return None, f"invalid OSS_PATCH_RECIPE_JSON: {exc}"
     if not isinstance(parsed, dict):
         return None, "OSS_PATCH_RECIPE_JSON must contain a JSON object"
+    return parsed, None
+
+
+def _patch_intent_from_handoff(handoff: str) -> tuple[JSON | None, str | None]:
+    block = _extract_optional_block(handoff, "OSS_PATCH_INTENT_JSON")
+    if block is None:
+        return None, None
+    try:
+        parsed = json.loads(block)
+    except json.JSONDecodeError as exc:
+        return None, f"invalid OSS_PATCH_INTENT_JSON: {exc}"
+    if not isinstance(parsed, dict):
+        return None, "OSS_PATCH_INTENT_JSON must contain a JSON object"
     return parsed, None
 
 
@@ -726,6 +949,8 @@ def build_patch_proposal_from_desired_state(desired_state: JSON, mission: Any, p
     }
     proposal = build_patch_proposal_from_intent(intent, mission, project_root)
     proposal["proposal_source"] = "desired_state_v1"
+    proposal["desired_state"] = copy.deepcopy(desired_state)
+    proposal["patch_intent"] = copy.deepcopy(intent)
     return proposal
 
 
@@ -757,6 +982,8 @@ def build_patch_proposal_from_recipe(recipe: JSON, mission: Any, project_root: s
     }
     proposal = build_patch_proposal_from_intent(intent, mission, project_root)
     proposal["proposal_source"] = "patch_recipe_v1"
+    proposal["patch_recipe"] = copy.deepcopy(recipe)
+    proposal["patch_intent"] = copy.deepcopy(intent)
     return proposal
 
 
@@ -1133,6 +1360,7 @@ def build_patch_proposal_from_intent(intent: JSON, mission: Any, project_root: s
         "evidence_refs": _as_list(intent.get("evidence_refs")),
         "caveats": _as_list(intent.get("caveats")),
         "proposal_source": "patch_intent_v1",
+        "patch_intent": copy.deepcopy(intent),
     }
 
 
@@ -1758,7 +1986,7 @@ def apply_patch_in_isolated_worktree(proposal: JSON, mission: Any, project_root:
         apply_result = subprocess.run(
             ["git", "apply", patch_path],
             cwd=worktree_root,
-            env=_minimal_env(),
+            env=_sandbox_git_env(worktree_root),
             capture_output=True,
             text=True,
             timeout=30,
@@ -1847,7 +2075,7 @@ def apply_patch_in_temp_project(proposal: JSON, mission: Any, project_root: str)
         apply_result = subprocess.run(
             ["git", "apply", patch_path],
             cwd=execution_root,
-            env=_minimal_env(),
+            env=_sandbox_git_env(execution_root),
             capture_output=True,
             text=True,
             timeout=30,
@@ -2624,6 +2852,8 @@ def _implementation_report(
             "artifact": rollback_path,
             "method": "git apply -R rollback.diff",
         },
+        "visible_commentary_path": os.path.join(os.path.dirname(patch_path), "visible_commentary.jsonl"),
+        "summary_path": os.path.join(os.path.dirname(patch_path), "summary.md"),
         "confidence": "MEDIUM" if status == "VERIFIED" else "LOW",
         "caveats": caveats,
         "gpt_review_required": True,
@@ -2645,6 +2875,10 @@ def _relativize_report_paths(report: JSON, project_root: str) -> JSON:
             rollback_copy = dict(rollback)
             rollback_copy["artifact"] = os.path.relpath(rollback_artifact, project_root)
             result["rollback"] = rollback_copy
+    for key in ("visible_commentary_path", "summary_path"):
+        path = str(result.get(key, "") or "")
+        if path and os.path.isabs(path):
+            result[key] = os.path.relpath(path, project_root)
     return result
 
 
@@ -2680,6 +2914,13 @@ def _write_mission_artifact(mission: Any, project_root: str) -> None:
 def _minimal_env() -> dict:
     allowed = ("PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TERM")
     return {key: value for key, value in os.environ.items() if key in allowed}
+
+
+def _sandbox_git_env(sandbox_root: str) -> dict:
+    """Prevent git commands in copied sandboxes from discovering the parent repo."""
+    env = _minimal_env()
+    env["GIT_CEILING_DIRECTORIES"] = os.path.abspath(os.path.dirname(sandbox_root))
+    return env
 
 
 class PathLockError(RuntimeError):
@@ -2971,7 +3212,7 @@ def _prove_patch_reversible(proposal: JSON, validation: JSON, project_root: str)
         apply_proc = subprocess.run(
             ["git", "apply", patch_path],
             cwd=work_root,
-            env=_minimal_env(),
+            env=_sandbox_git_env(work_root),
             capture_output=True,
             text=True,
             timeout=30,
@@ -2981,7 +3222,7 @@ def _prove_patch_reversible(proposal: JSON, validation: JSON, project_root: str)
         reverse_proc = subprocess.run(
             ["git", "apply", "-R", patch_path],
             cwd=work_root,
-            env=_minimal_env(),
+            env=_sandbox_git_env(work_root),
             capture_output=True,
             text=True,
             timeout=30,

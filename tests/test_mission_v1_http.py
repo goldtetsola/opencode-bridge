@@ -19,6 +19,7 @@ FAKE_UPSTREAM_PORT = 9006
 AUTH = "sk-local-codex-bridge"
 UPSTREAM_REQUESTS = []
 ROOT = os.path.dirname(os.path.dirname(__file__))
+sys.path.insert(0, ROOT)
 HTTP_TARGET = "tests/fixtures/a4_http_target.py"
 HTTP_TARGET_ORIGINAL = 'VALUE = "original"\n\n\ndef describe():\n    return VALUE\n'
 
@@ -306,6 +307,27 @@ def test_cli_mission_run_uses_runtime_bridge():
     print("  PASS: CLI mission run uses runtime bridge alias end-to-end")
 
 
+def test_cli_mission_handoff_preserves_sibling_runtime_blocks():
+    from codex_oss.cli import _mission_handoff_from_text
+
+    mission = implementation_mission("A4", "patch_proposal", False)
+    text = (
+        "<OSS_HANDOFF_JSON>\n"
+        + json.dumps(mission)
+        + "\n</OSS_HANDOFF_JSON>\n"
+        + "<OSS_PATCH_INTENT_JSON>\n"
+        + http_target_patch_intent()
+        + "\n</OSS_PATCH_INTENT_JSON>\n"
+    )
+
+    handoff_text, parsed = _mission_handoff_from_text(text)
+    assert parsed["mission_id"] == "mission_http_a4", parsed
+    assert handoff_text.count("<OSS_HANDOFF_JSON>") == 1, handoff_text
+    assert "<OSS_PATCH_INTENT_JSON>" in handoff_text, handoff_text
+    assert "added_by_runtime_patch" in handoff_text, handoff_text
+    print("  PASS: CLI mission handoff preserves sibling runtime blocks")
+
+
 def implementation_mission(tier: str, mode: str, write_allowed: bool) -> dict:
     mission = {
         "schema_version": "oss_agent_mission.v1",
@@ -423,6 +445,7 @@ def main():
         test_runtime_alias_maps_model_and_disables_provider_tools()
         test_runtime_alias_without_mission_fails_closed()
         test_cli_mission_run_uses_runtime_bridge()
+        test_cli_mission_handoff_preserves_sibling_runtime_blocks()
         test_a4_runtime_alias_returns_patch_validation_report()
         test_a5_runtime_alias_applies_patch_in_isolation_only()
         print("PASS: MissionV1 HTTP boundary suite")

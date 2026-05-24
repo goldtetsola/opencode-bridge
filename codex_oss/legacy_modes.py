@@ -235,6 +235,7 @@ def handle_read_finalizer(
     call_continuation_with_deadline: Callable[[dict, float], dict],
     build_response_object: Callable[..., dict],
     build_degraded_completion: Callable[[str, str, str], dict],
+    evidence_metadata: dict = None,
 ) -> LegacyModeDecision:
     """Run the legacy read finalizer/fallback ladder."""
     finalizer_model = map_model(continuation_model, model_map)
@@ -256,6 +257,8 @@ def handle_read_finalizer(
     })
     handoff_text = extract_handoff_text(finalizer_messages)
     required = extract_required_deliverables(handoff_text)
+    if not required:
+        required = ["confidence", "caveat"]
 
     def _response_from_chat(chat_resp: dict, messages: list) -> dict:
         return build_response_object(
@@ -330,10 +333,17 @@ def handle_read_finalizer(
             log_fn("continuation_fallback_failed", model=fb_model)
 
     if degraded_completion_on_timeout:
-        degraded = build_degraded_completion(model_alias, "all finalizers failed", tool_kind)
-        return LegacyModeDecision(True, text=degraded["content"][0]["text"],
-                                  degraded_report=degraded,
-                                  log_event="continuation_degraded_complete")
+        evidence = dict(evidence_metadata or {})
+        evidence.setdefault("required_deliverables", required)
+        text = _build_deterministic_read_recovery_report(
+            model_alias=model_alias,
+            tool_kind=tool_kind,
+            compacted_output=compacted_output,
+            required_fields=required,
+            evidence_metadata=evidence,
+        )
+        return LegacyModeDecision(True, text=text,
+                                  log_event="continuation_deterministic_read_recovery")
     return LegacyModeDecision(False, log_event="continuation_finalizer_failed_all")
 
 
@@ -344,6 +354,72 @@ def _first_response_text(resp_obj: dict) -> str:
             if content:
                 return content[0].get("text", "")
     return ""
+
+
+def _build_deterministic_read_recovery_report(
+    *,
+    model_alias: str,
+    tool_kind: str,
+    compacted_output: str,
+    required_fields: list,
+    evidence_metadata: dict = None,
+) -> str:
+    """Terminal read report used when model finalization fails after evidence exists."""
+    evidence_metadata = evidence_metadata or {}
+    preview_lines = []
+    for line in str(compacted_output or "").splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        preview_lines.append(stripped[:220])
+        if len(preview_lines) >= 8:
+            break
+    evidence = "\n".join(f"- {line}" for line in preview_lines) or "- No readable tool output was available."
+    deliverables = []
+    for field in required_fields or []:
+        label = str(field or "").strip().strip("- ").strip()
+        if label:
+            deliverables.append(f"- {label}: PARTIAL — model finalization failed; review the evidence preview.")
+    deliverable_text = "\n".join(deliverables) if deliverables else "- requested deliverables: PARTIAL — review the evidence preview."
+    metadata_lines = []
+    for key in (
+        "schema_version",
+        "model_alias",
+        "tool_name",
+        "tool_kind",
+        "command",
+        "normalized_path",
+        "exit_code",
+        "output_chars",
+        "output_lines",
+        "output_sha256",
+    ):
+        value = evidence_metadata.get(key)
+        if value not in (None, ""):
+            metadata_lines.append(f"- {key}: {value}")
+    if not metadata_lines:
+        metadata_lines = [
+            f"- model_alias: {model_alias}",
+            f"- tool_kind: {tool_kind}",
+        ]
+    metadata_text = "\n".join(metadata_lines)
+    return (
+        "PARTIAL\n"
+        "Transport status: PASS\n"
+        "Evidence-gathering status: PASS\n"
+        "Synthesis status: DETERMINISTIC_READ_RECOVERY\n"
+        f"Model: {model_alias}\n"
+        f"Tool kind: {tool_kind}\n"
+        "Canonical evidence:\n"
+        f"{metadata_text}\n"
+        "Summary: The requested read tool returned evidence, but the OSS model final report could not be finalized cleanly.\n"
+        "Evidence preview:\n"
+        f"{evidence}\n"
+        "Requested deliverables:\n"
+        f"{deliverable_text}\n"
+        "Confidence: LOW\n"
+        "Caveats: deterministic bridge recovery; GPT review must inspect the evidence before accepting the result."
+    )
 
 
 def handle_bounded_write_exact(

@@ -68,6 +68,10 @@ def mission(**overrides):
     return _build_mission(raw)
 
 
+def _clean_mission_artifacts(mission_id: str) -> None:
+    shutil.rmtree(os.path.join(ROOT, ".codex-oss", "missions", mission_id), ignore_errors=True)
+
+
 def assert_run_loop_accepts_valid_final_report():
     m = mission()
     ledger = EvidenceLedger(mission_id=m.mission_id, tool_budget_remaining=m.tool_budget)
@@ -653,6 +657,47 @@ def assert_visible_commentary_close_adds_terminal_lifecycle_event():
         assert os.path.exists(os.path.join(d, "summary.md"))
 
 
+def assert_a3_allowed_paths_become_required_inspection_floor():
+    from codex_oss.answer_graph import refresh_answer_graph
+    from codex_oss.ledger import EvidenceLedger
+    from codex_oss.mission import _build_mission
+
+    mission = _build_mission({
+        "schema_version": "oss_agent_mission.v1",
+        "mission_id": "mission_allowed_paths_floor",
+        "tier": "A3",
+        "mode": "managed_investigation",
+        "objective": "Inspect explicit source files.",
+        "risk_tier": "low",
+        "write_allowed": False,
+        "allowed_paths": ["bridge.py", "codex_oss/transport/response_builder.py"],
+        "must_inspect": ["bridge.py", "codex_oss/transport/response_builder.py"],
+        "allowed_tool_classes": ["read", "search"],
+        "required_outputs": [
+            "files_inspected",
+            "commands_run",
+            "findings",
+            "uncertainties",
+            "confidence",
+            "caveats",
+            "escalation_recommendation",
+        ],
+        "stop_conditions": ["valid_report", "deadline_reached"],
+        "report_schema": "managed_investigation_report.v1",
+        "tool_budget": 3,
+        "time_budget_seconds": 30,
+    })
+    assert mission.must_inspect == ["bridge.py", "codex_oss/transport/response_builder.py"], mission.must_inspect
+
+    graph = refresh_answer_graph(mission, EvidenceLedger(mission_id=mission.mission_id), persist=False)
+    agenda_items = graph["evidence_agenda"]["items"]
+    assert [item.get("path") for item in agenda_items] == [
+        "bridge.py",
+        "codex_oss/transport/response_builder.py",
+    ], agenda_items
+    assert all(item.get("kind") == "required_read" for item in agenda_items), agenda_items
+
+
 def assert_response_emitter_streams_commentary_and_final_phases():
     class FakeWFile:
         def __init__(self):
@@ -1012,7 +1057,7 @@ def assert_runtime_forces_final_report_after_file_evidence_when_budget_is_low():
                 ]
             }
 
-        result = run_loop(m, ledger, fake_model, [], None, m.allowed_roots, m.allowed_paths, request_deadline=90)
+        result = run_loop(m, ledger, fake_model, [], None, m.allowed_roots, m.allowed_paths, request_deadline=30)
         assert result["status"] == "COMPLETE", result
         assert len(ledger.commands_run) == 1, ledger.commands_run
         assert any("After file evidence exists" in item or "Adaptive autonomy budget requires closure" in item for item in calls), calls
@@ -1021,6 +1066,166 @@ def assert_runtime_forces_final_report_after_file_evidence_when_budget_is_low():
             os.unlink(fixture_path)
         except FileNotFoundError:
             pass
+
+
+def assert_runtime_closer_accepts_closer_draft_without_tools_or_repair():
+    mission_id = "mission_runtime_closer_draft_once"
+    _clean_mission_artifacts(mission_id)
+    previous_timeout = os.environ.get("RUNTIME_FINAL_REPORT_MODEL_TIMEOUT_SECONDS")
+    previous_source_floor_closer = os.environ.get("RUNTIME_SOURCE_FLOOR_MODEL_CLOSER")
+    os.environ["RUNTIME_FINAL_REPORT_MODEL_TIMEOUT_SECONDS"] = "3"
+    os.environ["RUNTIME_SOURCE_FLOOR_MODEL_CLOSER"] = "1"
+    try:
+        m = mission(
+            mission_id=mission_id,
+            objective="Inspect the runtime loop and summarize the evidence.",
+            objective_style="open_investigation",
+            evidence_collection_mode="prefetch_floor",
+            allowed_roots=[],
+            allowed_paths=["codex_oss/runtime/loop.py"],
+            must_inspect=["codex_oss/runtime/loop.py"],
+            allowed_tool_classes=["read"],
+            tool_budget=2,
+            time_budget_seconds=90,
+            exploration_policy={"after_required_floor": "close_immediately", "require_contradiction_search": False},
+        )
+        ledger = EvidenceLedger(mission_id=m.mission_id, tool_budget_remaining=m.tool_budget)
+        calls = []
+
+        def fake_model(messages, tools, timeout, model_alias_override=None):
+            calls.append({"messages": messages, "tools": tools, "timeout": timeout, "alias": model_alias_override})
+            assert tools == [], tools
+            assert timeout <= 3, timeout
+            assert "CloserDraftV1" in messages[-1]["content"], messages[-1]["content"]
+            return {"choices": [{"message": {"content": json.dumps({
+                "schema_version": "closer_draft.v1",
+                "narrative_summary": "The runtime loop source was inspected and the evidence floor is covered.",
+                "finding_narratives": [{"text": "The runtime loop source was inspected as required."}],
+                "caveat_narratives": [],
+                "verification_summary": "No extra verification was required by policy.",
+                "confidence_rationale": "The status comes from the runtime evidence envelope.",
+            })}}]}
+
+        result = run_loop(m, ledger, fake_model, [], None, m.allowed_roots, m.allowed_paths, request_deadline=90)
+        report = result["report"]
+        assert len(calls) == 1, calls
+        assert result["status"] == "COMPLETE", result
+        assert report["status"] == "COMPLETE", report
+        assert report["closure_status"] == "MODEL_NARRATED_RUNTIME_CLOSED", report
+        assert report["closure_source"] == "model_narrated_runtime_closed", report
+        assert report["completion_envelope"]["final_status"] == "COMPLETE", report
+        assert report["narrative_summary"], report
+    finally:
+        if previous_timeout is None:
+            os.environ.pop("RUNTIME_FINAL_REPORT_MODEL_TIMEOUT_SECONDS", None)
+        else:
+            os.environ["RUNTIME_FINAL_REPORT_MODEL_TIMEOUT_SECONDS"] = previous_timeout
+        if previous_source_floor_closer is None:
+            os.environ.pop("RUNTIME_SOURCE_FLOOR_MODEL_CLOSER", None)
+        else:
+            os.environ["RUNTIME_SOURCE_FLOOR_MODEL_CLOSER"] = previous_source_floor_closer
+        _clean_mission_artifacts(mission_id)
+
+
+def assert_runtime_closer_timeout_falls_back_once_preserving_complete_status():
+    mission_id = "mission_runtime_closer_timeout_fallback"
+    _clean_mission_artifacts(mission_id)
+    previous_timeout = os.environ.get("RUNTIME_FINAL_REPORT_MODEL_TIMEOUT_SECONDS")
+    previous_source_floor_closer = os.environ.get("RUNTIME_SOURCE_FLOOR_MODEL_CLOSER")
+    os.environ["RUNTIME_FINAL_REPORT_MODEL_TIMEOUT_SECONDS"] = "2"
+    os.environ["RUNTIME_SOURCE_FLOOR_MODEL_CLOSER"] = "1"
+    try:
+        m = mission(
+            mission_id=mission_id,
+            objective="Inspect the runtime loop and close from evidence if synthesis times out.",
+            objective_style="open_investigation",
+            evidence_collection_mode="prefetch_floor",
+            allowed_roots=[],
+            allowed_paths=["codex_oss/runtime/loop.py"],
+            must_inspect=["codex_oss/runtime/loop.py"],
+            allowed_tool_classes=["read"],
+            tool_budget=2,
+            time_budget_seconds=90,
+            exploration_policy={"after_required_floor": "close_immediately", "require_contradiction_search": False},
+        )
+        ledger = EvidenceLedger(mission_id=m.mission_id, tool_budget_remaining=m.tool_budget)
+        calls = []
+
+        def fake_model(messages, tools, timeout, model_alias_override=None):
+            calls.append({"tools": tools, "timeout": timeout, "content": messages[-1]["content"]})
+            raise TimeoutError("simulated final synthesis timed out")
+
+        result = run_loop(m, ledger, fake_model, [], None, m.allowed_roots, m.allowed_paths, request_deadline=90)
+        report = result["report"]
+        assert len(calls) == 1, calls
+        assert calls[0]["tools"] == [], calls
+        assert calls[0]["timeout"] <= 2, calls
+        assert result["status"] == "COMPLETE", result
+        assert report["closure_status"] == "RUNTIME_CLOSED", report
+        assert report["closure_source"] == "runtime_answer_graph", report
+        assert report["completion_envelope"]["final_status"] == "COMPLETE", report
+        attempts_path = os.path.join(ROOT, ".codex-oss", "missions", mission_id, "closure_attempts.jsonl")
+        with open(attempts_path, "r", encoding="utf-8") as handle:
+            attempts = [json.loads(line) for line in handle if line.strip()]
+        assert attempts[-1]["attempt_type"] == "runtime_fallback", attempts
+        assert attempts[-1]["error_type"] == "timeout", attempts
+        assert attempts[-1]["final_closure_source"] == "runtime_answer_graph", attempts
+    finally:
+        if previous_timeout is None:
+            os.environ.pop("RUNTIME_FINAL_REPORT_MODEL_TIMEOUT_SECONDS", None)
+        else:
+            os.environ["RUNTIME_FINAL_REPORT_MODEL_TIMEOUT_SECONDS"] = previous_timeout
+        if previous_source_floor_closer is None:
+            os.environ.pop("RUNTIME_SOURCE_FLOOR_MODEL_CLOSER", None)
+        else:
+            os.environ["RUNTIME_SOURCE_FLOOR_MODEL_CLOSER"] = previous_source_floor_closer
+        _clean_mission_artifacts(mission_id)
+
+
+def assert_runtime_closer_tool_call_falls_back_without_repair_loop():
+    mission_id = "mission_runtime_closer_tool_call_fallback"
+    _clean_mission_artifacts(mission_id)
+    previous_source_floor_closer = os.environ.get("RUNTIME_SOURCE_FLOOR_MODEL_CLOSER")
+    os.environ["RUNTIME_SOURCE_FLOOR_MODEL_CLOSER"] = "1"
+    try:
+        m = mission(
+            mission_id=mission_id,
+            objective="Inspect the runtime loop and refuse final-turn tools.",
+            objective_style="open_investigation",
+            evidence_collection_mode="prefetch_floor",
+            allowed_roots=[],
+            allowed_paths=["codex_oss/runtime/loop.py"],
+            must_inspect=["codex_oss/runtime/loop.py"],
+            allowed_tool_classes=["read", "search"],
+            tool_budget=3,
+            time_budget_seconds=90,
+            exploration_policy={"after_required_floor": "close_immediately", "require_contradiction_search": False},
+        )
+        ledger = EvidenceLedger(mission_id=m.mission_id, tool_budget_remaining=m.tool_budget)
+        calls = []
+
+        def fake_model(messages, tools, timeout, model_alias_override=None):
+            calls.append({"tools": tools, "content": messages[-1]["content"]})
+            return {"choices": [{"message": {"content": json.dumps({
+                "action_type": "tool_call",
+                "tool_name": "rtk_grep",
+                "arguments": {"path": "codex_oss/runtime/loop.py", "pattern": "final"},
+                "reason": "Try another search even though final synthesis was requested.",
+            })}}]}
+
+        result = run_loop(m, ledger, fake_model, [], None, m.allowed_roots, m.allowed_paths, request_deadline=90)
+        report = result["report"]
+        assert len(calls) == 1, calls
+        assert calls[0]["tools"] == [], calls
+        assert result["status"] == "COMPLETE", result
+        assert report["closure_status"] == "RUNTIME_CLOSED", report
+        assert report["closure_source"] == "runtime_answer_graph", report
+    finally:
+        if previous_source_floor_closer is None:
+            os.environ.pop("RUNTIME_SOURCE_FLOOR_MODEL_CLOSER", None)
+        else:
+            os.environ["RUNTIME_SOURCE_FLOOR_MODEL_CLOSER"] = previous_source_floor_closer
+        _clean_mission_artifacts(mission_id)
 
 
 def assert_runtime_traces_followup_search_after_file_evidence():
@@ -1033,6 +1238,9 @@ def assert_runtime_traces_followup_search_after_file_evidence():
             allowed_paths=[fixture_path],
             allowed_tool_classes=["read", "search"],
             tool_budget=6,
+            objective_style="open_investigation",
+            evidence_collection_mode="model_led",
+            exploration_policy={"require_contradiction_search": False, "after_required_floor": "allow_model_exploration"},
         )
         ledger = EvidenceLedger(mission_id=m.mission_id, tool_budget_remaining=m.tool_budget)
         calls = []
@@ -1094,7 +1302,7 @@ def assert_runtime_traces_followup_search_after_file_evidence():
                 ]
             }
 
-        result = run_loop(m, ledger, fake_model, [], None, m.allowed_roots, m.allowed_paths, request_deadline=90)
+        result = run_loop(m, ledger, fake_model, [], None, m.allowed_roots, m.allowed_paths, request_deadline=30)
         assert result["status"] == "COMPLETE", result
         assert len(ledger.commands_run) == 2, ledger.commands_run
         assert len(ledger.action_trace) >= 2, ledger.action_trace
@@ -2045,7 +2253,7 @@ def assert_complete_report_with_explicit_spec_requires_required_value():
                 },
             })}}]}
 
-        result = run_loop(m, ledger, fake_model, [], None, m.allowed_roots, m.allowed_paths, request_deadline=90)
+        result = run_loop(m, ledger, fake_model, [], None, m.allowed_roots, m.allowed_paths, request_deadline=30)
         assert result["status"] == "COMPLETE", result
         assert any("objective coverage" in item for item in calls), calls
         assert "ocg-kimi-k2.6" in result["report"]["findings"][0]["claim"], result
@@ -3085,6 +3293,108 @@ def assert_open_investigation_prefetch_reads_required_sources_before_model_loop(
     assert sorted(ledger.files_inspected.keys()) == ["codex_oss/audit.py", "codex_oss/managed_bridge.py"], ledger.files_inspected
     assert result["report"]["closure_source"] == "runtime_answer_graph", result
     assert result["report"]["answer_graph_summary"]["required_answered"] == 2, result
+
+
+def assert_source_floor_only_prefetch_closes_without_final_model_timeout():
+    with tempfile.TemporaryDirectory(dir=ROOT) as td:
+        from pathlib import Path
+
+        target = Path(td) / "source_floor_only.py"
+        target.write_text("VALUE = 'covered'\n", encoding="utf-8")
+        target_rel = os.path.relpath(target, ROOT)
+        m = mission(
+            mission_id="mission_source_floor_only_no_timeout",
+            objective="Inspect the required source floor.",
+            objective_style="open_investigation",
+            evidence_collection_mode="prefetch_floor",
+            allowed_roots=[],
+            allowed_paths=[target_rel],
+            allowed_tool_classes=["read"],
+            tool_budget=3,
+            must_inspect=[target_rel],
+            exploration_policy={"after_required_floor": "close_immediately", "min_optional_actions_after_floor": 0, "max_optional_actions_after_floor": 0, "require_contradiction_search": False},
+        )
+        ledger = EvidenceLedger(mission_id=m.mission_id, tool_budget_remaining=m.tool_budget)
+
+        def fake_model(messages, tools, timeout, model_alias_override=None):
+            raise AssertionError("source-floor-only prefetch should not call final model closer")
+
+        result = run_loop(m, ledger, fake_model, [], None, m.allowed_roots, m.allowed_paths, request_deadline=30)
+        assert result["status"] == "COMPLETE", result
+        assert result["report"]["closure_source"] == "runtime_answer_graph", result
+        assert target_rel in ledger.files_inspected, ledger.files_inspected
+
+
+def assert_runtime_final_synthesis_uses_fast_bounded_closer_alias():
+    with tempfile.TemporaryDirectory(dir=ROOT) as td:
+        from pathlib import Path
+
+        target = Path(td) / "source_floor.py"
+        target.write_text("def target():\n    return 'covered'\n", encoding="utf-8")
+        target_rel = os.path.relpath(target, ROOT)
+        m = mission(
+            mission_id="mission_fast_closer_alias",
+            objective="Inspect the required source floor.",
+            objective_style="open_investigation",
+            allowed_roots=[],
+            allowed_paths=[target_rel],
+            allowed_tool_classes=["read"],
+            tool_budget=3,
+            must_inspect=[target_rel],
+            evidence_collection_mode="prefetch_floor",
+            exploration_policy={"after_required_floor": "close_immediately", "min_optional_actions_after_floor": 0, "max_optional_actions_after_floor": 0, "require_contradiction_search": False},
+        )
+        ledger = EvidenceLedger(mission_id=m.mission_id, tool_budget_remaining=m.tool_budget)
+        calls = []
+        old_alias = os.environ.get("RUNTIME_FINAL_REPORT_MODEL_ALIAS")
+        old_timeout = os.environ.get("RUNTIME_FINAL_REPORT_MODEL_TIMEOUT_SECONDS")
+        old_source_floor_closer = os.environ.get("RUNTIME_SOURCE_FLOOR_MODEL_CLOSER")
+        os.environ["RUNTIME_FINAL_REPORT_MODEL_ALIAS"] = "mission-a2-flash"
+        os.environ["RUNTIME_FINAL_REPORT_MODEL_TIMEOUT_SECONDS"] = "7"
+        os.environ["RUNTIME_SOURCE_FLOOR_MODEL_CLOSER"] = "1"
+
+        def fake_model(messages, tools, timeout, model_alias_override=None):
+            calls.append((timeout, model_alias_override, messages[-1]["content"]))
+            return {
+                "choices": [{
+                    "message": {
+                        "content": (
+                            '{"action_type":"final_report","report":'
+                            f'{{"oss_report_version":"1.0","mission_id":"{m.mission_id}",'
+                            '"status":"PARTIAL","confidence":"LOW",'
+                            f'"files_inspected":[{{"path":"{target_rel}","complete":true}}],'
+                            '"commands_run":[],"findings":[{"claim":"The required source was inspected.",'
+                            f'"evidence_refs":["file:{target_rel}#extract:1"],"confidence":"LOW"}}],'
+                            '"uncertainties":[],"caveats":["No optional exploration was requested."],'
+                            '"escalation_recommendation":"GPT-5.5 review recommended",'
+                            '"missing_fields":[]}}'
+                        )
+                    }
+                }]
+            }
+
+        try:
+            result = run_loop(m, ledger, fake_model, [], None, m.allowed_roots, m.allowed_paths, request_deadline=90)
+        finally:
+            if old_alias is None:
+                os.environ.pop("RUNTIME_FINAL_REPORT_MODEL_ALIAS", None)
+            else:
+                os.environ["RUNTIME_FINAL_REPORT_MODEL_ALIAS"] = old_alias
+            if old_timeout is None:
+                os.environ.pop("RUNTIME_FINAL_REPORT_MODEL_TIMEOUT_SECONDS", None)
+            else:
+                os.environ["RUNTIME_FINAL_REPORT_MODEL_TIMEOUT_SECONDS"] = old_timeout
+            if old_source_floor_closer is None:
+                os.environ.pop("RUNTIME_SOURCE_FLOOR_MODEL_CLOSER", None)
+            else:
+                os.environ["RUNTIME_SOURCE_FLOOR_MODEL_CLOSER"] = old_source_floor_closer
+
+        assert calls, "forced final synthesis should call the model"
+        timeout, alias, prompt = calls[0]
+        assert timeout <= 7, calls
+        assert alias == "mission-a2-flash", calls
+        assert "required source floor" in prompt.lower(), prompt
+        assert result["report"]["closure_status"] == "MODEL_NARRATED_RUNTIME_CLOSED", result
 
 
 def assert_open_investigation_redirects_to_pending_required_source():
@@ -4332,12 +4642,16 @@ def main():
     assert_runtime_model_alias_uses_fallback_on_model_failure()
     assert_readonly_mission_writes_artifact_bundle()
     assert_visible_commentary_close_adds_terminal_lifecycle_event()
+    assert_a3_allowed_paths_become_required_inspection_floor()
     assert_response_emitter_streams_commentary_and_final_phases()
     assert_runtime_mission_time_budget_extends_internal_deadline()
     assert_tool_classes_are_enforced_and_aliases_normalize()
     assert_duplicate_searches_are_suppressed()
     assert_near_deadline_requests_final_report_when_evidence_exists()
     assert_runtime_forces_final_report_after_file_evidence_when_budget_is_low()
+    assert_runtime_closer_accepts_closer_draft_without_tools_or_repair()
+    assert_runtime_closer_timeout_falls_back_once_preserving_complete_status()
+    assert_runtime_closer_tool_call_falls_back_without_repair_loop()
     assert_runtime_traces_followup_search_after_file_evidence()
     assert_duplicate_range_read_is_served_from_cached_evidence()
     assert_duplicate_full_read_returns_cached_extracts_and_requests_report()
@@ -4376,6 +4690,8 @@ def main():
     assert_open_investigation_runtime_answer_graph_can_complete_after_model_timeout()
     assert_open_investigation_runtime_answer_graph_stays_partial_when_obligations_remain_open()
     assert_open_investigation_prefetch_reads_required_sources_before_model_loop()
+    assert_source_floor_only_prefetch_closes_without_final_model_timeout()
+    assert_runtime_final_synthesis_uses_fast_bounded_closer_alias()
     assert_open_investigation_redirects_to_pending_required_source()
     assert_open_investigation_reports_insufficient_evidence_when_shape_missing()
     assert_open_investigation_escalates_on_contradiction_marker()

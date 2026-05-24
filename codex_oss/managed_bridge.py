@@ -218,6 +218,8 @@ def run_managed_mission_from_body(
                     "stream": False,
                     "tools": [],
                 }
+                if model_alias_override:
+                    payload["_codex_force_non_stream"] = True
                 if idx:
                     log_fn("mission_model_fallback_attempt", mission_id=mission.mission_id, model=payload["model"])
                 try:
@@ -280,6 +282,15 @@ def run_managed_mission_from_body(
                 input_payload={"tier": mission.tier, "apply_mode": getattr(mission, "apply_mode", "")},
             )
             try:
+                artifact_dir = os.path.join(os.getcwd(), ".codex-oss", "missions", mission.mission_id)
+                commentary = VisibleCommentarySink(
+                    mission.mission_id,
+                    artifact_dir,
+                    mode=os.getenv("OSS_VISIBLE_TRACE", "summary"),
+                    stream_callback=commentary_callback,
+                    max_events=int(os.getenv("OSS_VISIBLE_TRACE_MAX_EVENTS", "40") or 40),
+                    max_event_chars=int(os.getenv("OSS_VISIBLE_TRACE_MAX_EVENT_CHARS", "500") or 500),
+                )
                 result = run_implementation_mission(
                     mission=mission,
                     raw_model_alias=raw_model_alias,
@@ -287,6 +298,7 @@ def run_managed_mission_from_body(
                     call_model=call_model,
                     timeout=effective_deadline,
                     project_root=os.getcwd(),
+                    commentary=commentary,
                 )
             finally:
                 release_mission_slot(mission.mission_id)
