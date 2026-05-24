@@ -80,6 +80,7 @@ class ChatStreamAssembler:
         self.text_done = False
         self.text_item_id = self.new_id("msg")
         self.text_parts: List[str] = []
+        self.buffer_text_until_tool_decision = os.getenv("OSS_BUFFER_TOOL_TURN_TEXT", "1") != "0"
         self.reasoning_parts: List[str] = []
         self.thinking_blocks: List[Any] = []
         self.tool_states: Dict[int, ToolStreamState] = {}
@@ -137,6 +138,9 @@ class ChatStreamAssembler:
 
     def on_content_delta(self, text: str) -> None:
         if not text:
+            return
+        if self.buffer_text_until_tool_decision:
+            self.text_parts.append(text)
             return
         idx = self.ensure_text_item()
         chunk_size = int(os.getenv("SSE_CHUNK_SIZE", "256"))
@@ -287,6 +291,7 @@ class ChatStreamAssembler:
         }
 
     def finalize(self) -> JSON:
+        buffered_text = "".join(self.text_parts)
         for idx in sorted(self.tool_states):
             st = self.tool_states[idx]
             self._ensure_tool_added(st, force=True)
@@ -302,6 +307,7 @@ class ChatStreamAssembler:
                         "type": "response.function_call_arguments.done",
                         "output_index": st.output_index,
                         "item_id": st.item_id,
+                        "name": self.restore_tool_name(st.raw_name or "tool", self.reverse_name_map),
                         "arguments": args,
                     },
                 )
@@ -311,7 +317,12 @@ class ChatStreamAssembler:
                 )
                 st.done = True
 
-        if self.text_started and not self.text_done:
+        if self.buffer_text_until_tool_decision and buffered_text and not self.tool_states:
+            self.buffer_text_until_tool_decision = False
+            self.text_parts = []
+            self.on_content_delta(buffered_text)
+
+        if self.text_started and not self.text_done and not self.tool_states:
             text = "".join(self.text_parts)
             idx = next(i for i, (kind, key) in enumerate(self.output_order) if kind == "message" and key == "text")
             self._write_sse(
@@ -343,7 +354,7 @@ class ChatStreamAssembler:
 
         output_by_index: Dict[int, JSON] = {}
         for idx, (kind, key) in enumerate(self.output_order):
-            if kind == "message":
+            if kind == "message" and not self.tool_states:
                 item = self._final_message_item()
                 if item:
                     output_by_index[idx] = item

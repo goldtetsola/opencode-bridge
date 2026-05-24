@@ -22,6 +22,7 @@ from bridge import build_direct_loop_terminal_report
 from bridge import build_pending_child_not_fulfilled_report
 from bridge import build_response_from_pending_child
 from bridge import complete_pending_reads_from_bridge
+from bridge import complete_declared_reads_from_bridge
 from bridge import build_context_pack
 from bridge import build_context_pack_deterministic_report
 from bridge import build_patch_contract_report
@@ -41,6 +42,7 @@ from bridge import StoredResponse
 from bridge import should_use_direct_agent_loop
 from bridge import direct_loop_terminal_decision
 from bridge import direct_loop_required_sources_satisfied
+from bridge import declared_read_floor_only
 from bridge import tool_output_indicates_failure
 from bridge import validate_report_output
 from bridge import verification_contract_requested
@@ -316,6 +318,169 @@ def assert_direct_loop_turn_count_survives_response_projection():
     assembler.finalize()
     assert captured[-1]["tool_exchange_count"] == 3, captured[-1]
     assert captured[-1]["task_max_exchanges"] == 6, captured[-1]
+
+
+def assert_tool_call_turns_do_not_project_progress_as_terminal_messages():
+    captured = []
+
+    def stored_response_factory(**kwargs):
+        return kwargs
+
+    body = {"input": []}
+    chat_resp = {
+        "choices": [{
+            "message": {
+                "content": "Step 1 complete. Running step 2.",
+                "tool_calls": [{
+                    "id": "call_next",
+                    "type": "function",
+                    "function": {
+                        "name": "exec_command",
+                        "arguments": '{"cmd":"rtk read docs/CONTINUITY.md"}',
+                    },
+                }],
+            },
+        }],
+    }
+    resp = build_response_object_from_chat(
+        body=body,
+        chat_resp=chat_resp,
+        base_messages=[{"role": "user", "content": "task"}],
+        model_alias="ocg-test",
+        model_upstream="test",
+        reverse_name_map={},
+        state_put=captured.append,
+        stored_response_factory=stored_response_factory,
+        repair_chat_history=lambda messages, outputs: list(messages),
+        extract_budget=lambda messages: 6,
+        restore_tool_name=lambda name, reverse: name,
+        new_id=lambda prefix: f"{prefix}_1",
+        now=lambda: 1,
+        json_dumps=json.dumps,
+        as_text=str,
+        response_id="resp_tool_projection",
+        created_at=1,
+    )
+    assert [item["type"] for item in resp["output"]] == ["function_call"], resp["output"]
+    assert resp["output"][0]["call_id"] == "call_next", resp
+    assert captured[-1]["messages"][-1]["content"] == "Step 1 complete. Running step 2.", captured[-1]
+
+    captured.clear()
+    sse_events = []
+    assembler = ChatStreamAssembler(
+        body=body,
+        base_messages=[{"role": "user", "content": "task"}],
+        model_alias="ocg-test",
+        model_upstream="test",
+        reverse_name_map={},
+        response_id="resp_stream_tool_projection",
+        created_at=1,
+        write_sse=lambda event, data: sse_events.append((event, data)),
+        write_progress=lambda note: None,
+        state_put=captured.append,
+        stored_response_factory=stored_response_factory,
+        build_response_shell=lambda *args, **kwargs: {"output": kwargs.get("output", [])},
+        repair_chat_history=lambda messages, outputs: list(messages),
+        extract_budget=lambda messages: 6,
+        restore_tool_name=lambda name, reverse: name,
+        new_id=lambda prefix: f"{prefix}_1",
+        json_dumps=json.dumps,
+        as_text=str,
+    )
+    assembler.on_chunk({"choices": [{"delta": {"content": "Step 1 complete. Running step 2."}}]})
+    assembler.on_chunk({"choices": [{"delta": {"tool_calls": [{
+        "index": 0,
+        "id": "call_stream_next",
+        "function": {
+            "name": "exec_command",
+            "arguments": '{"cmd":"rtk read docs/CONTINUITY.md"}',
+        },
+    }]}}]})
+    stream_resp = assembler.finalize()
+    assert [item["type"] for item in stream_resp["output"]] == ["function_call"], stream_resp["output"]
+    assert stream_resp["output"][0]["call_id"] == "call_stream_next", stream_resp
+    done_events = [
+        data
+        for event, data in sse_events
+        if event == "response.function_call_arguments.done"
+    ]
+    assert done_events, sse_events
+    assert done_events[-1]["name"] == "exec_command", done_events[-1]
+    assert "call_id" not in done_events[-1], done_events[-1]
+    item_done_events = [
+        data
+        for event, data in sse_events
+        if event == "response.output_item.done"
+    ]
+    assert item_done_events[-1]["item"]["call_id"] == "call_stream_next", item_done_events[-1]
+    assert not any(
+        event == "response.output_item.added"
+        and isinstance(data, dict)
+        and (data.get("item") or {}).get("type") == "message"
+        for event, data in sse_events
+    ), sse_events
+    assert captured[-1]["messages"][-1]["content"] == "Step 1 complete. Running step 2.", captured[-1]
+
+
+def assert_pending_child_sse_replay_is_adoptable_shape():
+    class FakeHandler:
+        _emit_sse_items_and_completed = Handler._emit_sse_items_and_completed
+        _compact_completed_response = Handler._compact_completed_response
+
+        def __init__(self):
+            self.events = []
+            self.close_connection = False
+
+        def _send_sse_headers(self):
+            pass
+
+        def _write_sse(self, event, data):
+            self.events.append((event, data))
+
+        def _safe_write(self, data):
+            self.events.append(("[DONE]", data.decode("utf-8")))
+
+    resp = {
+        "id": "resp_child",
+        "object": "response",
+        "created_at": 1,
+        "status": "completed",
+        "model": "ocg-test",
+        "previous_response_id": "resp_parent",
+        "output": [{
+            "type": "function_call",
+            "id": "fc_second",
+            "call_id": "call_second",
+            "name": "exec_command",
+            "arguments": '{"cmd":"rtk read docs/CONTINUITY.md"}',
+            "status": "completed",
+        }],
+    }
+    fake = FakeHandler()
+    Handler._send_sse(fake, resp)
+    semantic = [(event, data) for event, data in fake.events if event != "[DONE]"]
+    names = [event for event, _ in semantic]
+    assert names == [
+        "response.created",
+        "response.in_progress",
+        "response.output_item.added",
+        "response.function_call_arguments.delta",
+        "response.function_call_arguments.done",
+        "response.output_item.done",
+        "response.completed",
+    ], names
+    sequence_numbers = [data["sequence_number"] for _, data in semantic]
+    assert sequence_numbers == list(range(1, len(semantic) + 1)), sequence_numbers
+    assert semantic[0][1]["response"]["status"] == "in_progress", semantic[0]
+    assert semantic[0][1]["response"]["output"] == [], semantic[0]
+    assert semantic[1][1]["response"]["previous_response_id"] == "resp_parent", semantic[1]
+    done_args = semantic[4][1]
+    assert done_args["arguments"] == '{"cmd":"rtk read docs/CONTINUITY.md"}', done_args
+    assert "call_id" not in done_args, done_args
+    assert semantic[5][1]["item"]["call_id"] == "call_second", semantic[5]
+    assert semantic[6][1]["response"]["status"] == "completed", semantic[6]
+    assert semantic[6][1]["response"]["previous_response_id"] == "resp_parent", semantic[6]
+    assert fake.close_connection is True
 
 
 def assert_shell_rtk_read_counts_as_read_evidence():
@@ -754,6 +919,75 @@ def assert_server_side_read_completion_prefers_model_authored_report():
     assert "# Visible Commentary" in prompts[0], prompts[0]
 
 
+def assert_declared_read_floor_completes_before_pending_adoption_recovery():
+    handoff_obj = {
+        "schema_version": 1,
+        "role": "Scout",
+        "goal": "Read required files",
+        "task_type": "scout",
+        "owned_paths": [],
+        "read_only_paths": ["README.md", "bridge.py", "tests/test_protocol_conformance.py"],
+        "forbidden_actions": ["do not write files"],
+        "verification_steps": ["read listed files"],
+        "deliverable_fields": ["files inspected", "confidence", "caveats"],
+        "completion_rule": "stop after deliverable",
+        "escalation_rule": "stop if blocked",
+    }
+    handoff = "OSS_HANDOFF_JSON:\n" + json.dumps(handoff_obj)
+    envelope = parse_task_envelope(handoff)
+    assert declared_read_floor_only(envelope), envelope
+
+    executed = []
+    messages = [
+        {"role": "user", "content": handoff},
+        {"role": "assistant", "content": "", "tool_calls": [{
+            "id": "call_readme",
+            "type": "function",
+            "function": {"name": "exec_command", "arguments": '{"cmd":"rtk read README.md"}'},
+        }]},
+        {"role": "tool", "tool_call_id": "call_readme", "content": "README contents"},
+    ]
+
+    def fake_executor(path, workdir):
+        executed.append((path, workdir))
+        return 0, f"contents for {path}"
+
+    def fake_finalizer(prompt, timeout):
+        assert "Do not call tools" in prompt, prompt
+        assert "README contents" in prompt, prompt
+        assert "contents for bridge.py" in prompt, prompt
+        return (
+            "COMPLETE\n"
+            "Files inspected: README.md, bridge.py, tests/test_protocol_conformance.py\n"
+            "Findings: All declared read-only sources were inspected by the bridge-owned evidence floor.\n"
+            "Confidence: HIGH\n"
+            "Caveats: No writes were performed."
+        )
+
+    report = complete_declared_reads_from_bridge(
+        parent_response_id="resp_parent",
+        messages=messages,
+        handoff_text=handoff,
+        project_root=ROOT,
+        executor=fake_executor,
+        finalizer_call=fake_finalizer,
+        finalizer_timeout_seconds=3,
+        reason="declared_read_floor_completed_by_bridge",
+    )
+    assert report.startswith("COMPLETE"), report
+    assert "MODEL_AUTHORED_SERVER_SIDE_READ_COMPLETION" in report, report
+    assert "Reason: declared_read_floor_completed_by_bridge" in report, report
+    assert "pending_tool_call_not_adopted_recovered_by_bridge" not in report, report
+    assert executed == [
+        ("bridge.py", ROOT),
+        ("tests/test_protocol_conformance.py", ROOT),
+    ], executed
+
+    search_handoff = dict(handoff_obj)
+    search_handoff["verification_steps"] = ["search read-only paths for foo"]
+    assert not declared_read_floor_only(parse_task_envelope("OSS_HANDOFF_JSON:\n" + json.dumps(search_handoff)))
+
+
 def assert_server_side_read_completion_falls_back_when_model_report_invalid():
     handoff = (
         "READ-ONLY PATHS: docs/visible-commentary.md\n"
@@ -783,6 +1017,60 @@ def assert_server_side_read_completion_falls_back_when_model_report_invalid():
     )
     assert "DETERMINISTIC_SERVER_SIDE_READ_COMPLETION" in report, report
     assert "Running the first verification step" not in report, report
+
+
+def assert_declared_read_floor_deterministic_report_names_proactive_boundary():
+    handoff = (
+        "READ-ONLY PATHS: docs/visible-commentary.md\n"
+        "DELIVERABLE: files inspected, confidence, caveats"
+    )
+    report = complete_declared_reads_from_bridge(
+        parent_response_id="resp_parent",
+        messages=[{"role": "user", "content": handoff}],
+        handoff_text=handoff,
+        project_root=ROOT,
+        executor=lambda path, workdir: (0, "visible commentary docs"),
+        finalizer_call=lambda prompt, timeout: "",
+        finalizer_timeout_seconds=3,
+        reason="declared_read_floor_completed_by_bridge",
+    )
+    assert "DETERMINISTIC_SERVER_SIDE_READ_COMPLETION" in report, report
+    assert "Reason: declared_read_floor_completed_by_bridge" in report, report
+    assert "avoid client continuation replay" in report, report
+    assert "consumer did not adopt" not in report, report
+
+
+def assert_declared_read_floor_uses_portable_local_reader_by_default():
+    with tempfile.TemporaryDirectory(dir=ROOT) as d:
+        root = Path(d)
+        (root / "docs").mkdir()
+        (root / "docs" / "one.md").write_text("portable one", encoding="utf-8")
+        (root / "two.txt").write_text("portable two", encoding="utf-8")
+        handoff_obj = {
+            "schema_version": 1,
+            "role": "Scout",
+            "goal": "Read fixed files",
+            "task_type": "scout",
+            "owned_paths": [],
+            "read_only_paths": ["docs/one.md", "two.txt"],
+            "forbidden_actions": ["do not write files"],
+            "verification_steps": ["read listed files"],
+            "deliverable_fields": ["files inspected", "confidence", "caveats"],
+            "completion_rule": "stop after deliverable",
+            "escalation_rule": "stop if blocked",
+        }
+        handoff = "OSS_HANDOFF_JSON:\n" + json.dumps(handoff_obj)
+        report = complete_declared_reads_from_bridge(
+            parent_response_id="resp_parent",
+            messages=[{"role": "user", "content": handoff}],
+            handoff_text=handoff,
+            project_root=str(root),
+            finalizer_call=lambda prompt, timeout: "",
+            reason="declared_read_floor_completed_by_bridge",
+        )
+        assert report.startswith("COMPLETE"), report
+        assert "docs/one.md" in report and "two.txt" in report, report
+        assert "file not found" not in report, report
 
 
 def assert_placeholder_read_paths_are_ignored_and_inline_target_recovers():
@@ -892,6 +1180,16 @@ def assert_shell_read_path_with_spaces_is_preserved():
     assert effective_tool_kind("exec_command", {"cmd": command}, "shell") == "read"
 
 
+def assert_shell_read_path_redirection_is_ignored():
+    command = "rtk read /Users/goldtetsola/.codex/skills/napkin/SKILL.md 2>&1"
+    path, _ = normalize_tool_args({"cmd": command}, "exec_command")
+    assert path == "/Users/goldtetsola/.codex/skills/napkin/SKILL.md", path
+
+    command = "cat docs/CONTINUITY.md > /tmp/out.txt"
+    path, _ = normalize_tool_args({"cmd": command}, "exec_command")
+    assert path == "docs/CONTINUITY.md", path
+
+
 def assert_streamed_read_finalizer_sends_heartbeats_while_blocked():
     class Emitter:
         response_id = "resp_wait"
@@ -973,8 +1271,11 @@ def main():
     assert_continuation_synthesis_uses_streaming_transport()
     assert_direct_read_only_utility_prefers_live_agent_loop()
     assert_direct_loop_turn_count_survives_response_projection()
+    assert_tool_call_turns_do_not_project_progress_as_terminal_messages()
+    assert_pending_child_sse_replay_is_adoptable_shape()
     assert_shell_rtk_read_counts_as_read_evidence()
     assert_shell_read_path_with_spaces_is_preserved()
+    assert_shell_read_path_redirection_is_ignored()
     assert_turn_count_can_be_recovered_from_history()
     assert_direct_loop_stops_after_required_source_is_read()
     assert_direct_loop_detects_repeated_completed_source()
@@ -984,7 +1285,10 @@ def main():
     assert_orphan_tool_output_can_bind_pending_child_lineage()
     assert_pending_child_adoption_failure_can_complete_reads_server_side()
     assert_server_side_read_completion_prefers_model_authored_report()
+    assert_declared_read_floor_completes_before_pending_adoption_recovery()
     assert_server_side_read_completion_falls_back_when_model_report_invalid()
+    assert_declared_read_floor_deterministic_report_names_proactive_boundary()
+    assert_declared_read_floor_uses_portable_local_reader_by_default()
     assert_placeholder_read_paths_are_ignored_and_inline_target_recovers()
     assert_handoff_extraction_prefers_current_user_task_over_repo_memory()
     assert_inline_required_paths_ignore_negative_mentions()

@@ -89,7 +89,12 @@ def build_response_object_from_chat(
             }
         )
 
-    if content:
+    # A Responses tool-call turn must project as a tool-call turn. Some Codex
+    # consumers treat a normal assistant message in the same output as terminal
+    # progress and stop before adopting the pending function_call. Preserve the
+    # upstream text in chat history for the next model turn, but do not expose it
+    # as a public output message when tools are pending.
+    if content and not tool_calls_out:
         output.append(
             {
                 "type": "message",

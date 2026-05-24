@@ -571,8 +571,29 @@ def _shell_parts(command: str) -> list[str]:
         return []
 
 
+def _strip_shell_redirection_parts(parts: list[str]) -> list[str]:
+    """Drop shell redirection tokens so read-path normalization stays semantic."""
+    cleaned: list[str] = []
+    skip_next = False
+    for part in parts:
+        if skip_next:
+            skip_next = False
+            continue
+        if part in ("|", "||", "&&", ";"):
+            break
+        if part in (">", ">>", "<", "2>", "2>>", "1>", "1>>"):
+            skip_next = True
+            continue
+        if re.match(r"^\d?>&\d+$", part) or re.match(r"^\d?>.*$", part) or re.match(r"^\d?<.*$", part):
+            continue
+        cleaned.append(part)
+    return cleaned
+
+
 def _read_path_from_shell_command(command: str) -> Optional[str]:
-    parts = _shell_parts(command)
+    if re.search(r"<[^>]*(?:file|files|dir|dirs|path|paths)[^>]*>", command, flags=re.IGNORECASE):
+        return None
+    parts = _strip_shell_redirection_parts(_shell_parts(command))
     if len(parts) >= 3 and parts[0] == "rtk" and parts[1] == "read":
         path = " ".join(parts[2:])
     elif len(parts) >= 2 and parts[0] == "cat":
@@ -1783,16 +1804,27 @@ def _completed_read_evidence_from_history(messages: list) -> dict:
     return evidence
 
 
-def _default_rtk_read_executor(path: str, workdir: str) -> tuple:
+def _default_local_read_executor(path: str, workdir: str) -> tuple:
+    """Read declared local sources without depending on repo-specific shell tools."""
     try:
-        proc = subprocess.run(
-            ["rtk", "read", path],
-            cwd=workdir,
-            capture_output=True,
-            text=True,
-            timeout=float(os.getenv("OSS_SERVER_SIDE_READ_TIMEOUT_SECONDS", "20")),
-        )
-        return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
+        root = os.path.abspath(workdir or os.getcwd())
+        target = path if os.path.isabs(path) else os.path.abspath(os.path.join(root, path))
+        target = os.path.abspath(target)
+        if not os.path.exists(target):
+            return 1, f"file not found: {path}"
+        if os.path.isdir(target):
+            return 1, f"path is a directory, not a readable file: {path}"
+        max_bytes = int(os.getenv("OSS_SERVER_SIDE_READ_MAX_BYTES", "1048576"))
+        size = os.path.getsize(target)
+        with open(target, "rb") as f:
+            data = f.read(max_bytes + 1)
+        truncated = len(data) > max_bytes
+        if truncated:
+            data = data[:max_bytes]
+        text = data.decode("utf-8", errors="replace")
+        if truncated or size > len(data):
+            text += f"\n[server-side read truncated at {max_bytes} bytes of {size} total bytes]"
+        return 0, text
     except Exception as exc:
         return 1, str(exc)
 
@@ -1800,21 +1832,32 @@ def _default_rtk_read_executor(path: str, workdir: str) -> tuple:
 def build_server_side_read_completion_report(
     *,
     parent_response_id: str,
-    child_state: StoredResponse,
+    child_state: Optional[StoredResponse],
     required_paths: list,
     evidence: dict,
     failures: list,
+    reason: str = "pending_tool_call_not_adopted_recovered_by_bridge",
 ) -> str:
     completed_paths = set(evidence.keys())
     missing = _remaining_required_paths(required_paths, completed_paths)
     status = "COMPLETE" if not missing and not failures else "PARTIAL"
+    if reason == "declared_read_floor_completed_by_bridge":
+        caveat = (
+            "Caveats: The bridge completed the declared read-only evidence floor "
+            "server-side to avoid client continuation replay; no writes were performed."
+        )
+    else:
+        caveat = (
+            "Caveats: The consumer did not adopt a pending read tool call, so the bridge completed "
+            "the declared read-only evidence floor deterministically from the task ledger."
+        )
     lines = [
         status,
         "Synthesis status: DETERMINISTIC_SERVER_SIDE_READ_COMPLETION",
-        "Reason: pending_tool_call_not_adopted_recovered_by_bridge",
+        f"Reason: {reason}",
         f"Parent response: {parent_response_id}",
-        f"Pending response: {child_state.response_id}",
-        f"Replay count: {child_state.pending_replay_count}",
+        f"Pending response: {child_state.response_id if child_state else 'none'}",
+        f"Replay count: {child_state.pending_replay_count if child_state else 0}",
         f"Files inspected: {', '.join(sorted(completed_paths)) if completed_paths else 'none'}",
         f"Missing required sources: {', '.join(missing) if missing else 'none'}",
         "No writes performed: true",
@@ -1831,8 +1874,7 @@ def build_server_side_read_completion_report(
         lines.extend(f"- {failure}" for failure in failures)
     lines.extend([
         "Confidence: HIGH" if status == "COMPLETE" else "Confidence: MEDIUM",
-        "Caveats: The consumer did not adopt a pending read tool call, so the bridge completed "
-        "the declared read-only evidence floor deterministically from the task ledger.",
+        caveat,
     ])
     return "\n".join(lines)
 
@@ -1884,6 +1926,7 @@ def try_model_authored_server_side_read_report(
     failures: list,
     finalizer_call,
     timeout_seconds: float,
+    reason: str = "pending_tool_call_not_adopted_recovered_by_bridge",
     log_fn=None,
 ) -> str:
     """Return natural model-authored read report when a bounded finalizer succeeds."""
@@ -1914,6 +1957,7 @@ def try_model_authored_server_side_read_report(
     audit = (
         "\n\nBridge evidence audit:\n"
         "Synthesis status: MODEL_AUTHORED_SERVER_SIDE_READ_COMPLETION\n"
+        f"Reason: {reason}\n"
         "Evidence-gathering status: PASS\n"
         f"Files inspected: {', '.join(sorted(completed)) if completed else 'none'}\n"
         f"Missing required sources: {', '.join(missing_paths) if missing_paths else 'none'}\n"
@@ -1922,6 +1966,81 @@ def try_model_authored_server_side_read_report(
     if log_fn:
         log_fn("server_side_read_model_finalizer_ok", text_len=len(text))
     return text + audit
+
+
+def _execute_missing_declared_reads(
+    *,
+    required_paths: list,
+    evidence: dict,
+    failures: list,
+    read_executor,
+    workdir: str,
+) -> None:
+    for required in _remaining_required_paths(required_paths, set(evidence.keys())):
+        exit_code, output = read_executor(required, workdir)
+        if exit_code == 0:
+            excerpt, redacted = _safe_evidence_excerpt(output)
+            evidence[required] = {
+                "path": required,
+                "source": "bridge_server_side_read",
+                "exit_code": exit_code,
+                "output_chars": len(output),
+                "output_sha256": _hash_text(output),
+                "output_excerpt": excerpt,
+                "redactions_applied": redacted,
+            }
+        else:
+            failures.append(f"{required}: exit_code={exit_code} output={str(output)[:200]}")
+
+
+def complete_declared_reads_from_bridge(
+    *,
+    parent_response_id: str,
+    messages: list,
+    handoff_text: str,
+    project_root: str,
+    executor=None,
+    finalizer_call=None,
+    finalizer_timeout_seconds: float = 12,
+    reason: str = "declared_read_floor_completed_by_bridge",
+    log_fn=None,
+) -> str:
+    """Complete a declared read-only evidence floor without waiting for client adoption."""
+    envelope = parse_task_envelope(handoff_text)
+    required_paths = required_paths_from_envelope(envelope, handoff_text)
+    if not required_paths:
+        return ""
+    read_executor = executor or _default_local_read_executor
+    evidence = _completed_read_evidence_from_history(messages)
+    failures: list[str] = []
+    workdir = _workdir_from_history(messages, project_root)
+    _execute_missing_declared_reads(
+        required_paths=required_paths,
+        evidence=evidence,
+        failures=failures,
+        read_executor=read_executor,
+        workdir=workdir,
+    )
+    model_report = try_model_authored_server_side_read_report(
+        handoff_text=handoff_text,
+        required_paths=required_paths,
+        evidence=evidence,
+        failures=failures,
+        finalizer_call=finalizer_call,
+        timeout_seconds=finalizer_timeout_seconds,
+        reason=reason,
+        log_fn=log_fn,
+    )
+    if model_report:
+        return model_report
+    return build_server_side_read_completion_report(
+        parent_response_id=parent_response_id,
+        child_state=None,
+        required_paths=required_paths,
+        evidence=evidence,
+        failures=failures,
+        reason=reason,
+    )
 
 
 def complete_pending_reads_from_bridge(
@@ -1939,7 +2058,7 @@ def complete_pending_reads_from_bridge(
     required_paths = required_paths_from_envelope(envelope, handoff_text)
     if not required_paths:
         return ""
-    read_executor = executor or _default_rtk_read_executor
+    read_executor = executor or _default_local_read_executor
     evidence = _completed_read_evidence_from_history(child_state.messages)
     failures = []
     workdir = _workdir_from_history(child_state.messages, project_root)
@@ -1975,21 +2094,13 @@ def complete_pending_reads_from_bridge(
         else:
             failures.append(f"{required}: exit_code={exit_code} output={str(output)[:200]}")
 
-    for required in _remaining_required_paths(required_paths, set(evidence.keys())):
-        exit_code, output = read_executor(required, workdir)
-        if exit_code == 0:
-            excerpt, redacted = _safe_evidence_excerpt(output)
-            evidence[required] = {
-                "path": required,
-                "source": "bridge_server_side_read",
-                "exit_code": exit_code,
-                "output_chars": len(output),
-                "output_sha256": _hash_text(output),
-                "output_excerpt": excerpt,
-                "redactions_applied": redacted,
-            }
-        else:
-            failures.append(f"{required}: exit_code={exit_code} output={str(output)[:200]}")
+    _execute_missing_declared_reads(
+        required_paths=required_paths,
+        evidence=evidence,
+        failures=failures,
+        read_executor=read_executor,
+        workdir=workdir,
+    )
 
     model_report = try_model_authored_server_side_read_report(
         handoff_text=handoff_text,
@@ -1998,6 +2109,7 @@ def complete_pending_reads_from_bridge(
         failures=failures,
         finalizer_call=finalizer_call,
         timeout_seconds=finalizer_timeout_seconds,
+        reason="pending_tool_call_not_adopted_recovered_by_bridge",
         log_fn=log_fn,
     )
     if model_report:
@@ -2009,6 +2121,7 @@ def complete_pending_reads_from_bridge(
         required_paths=required_paths,
         evidence=evidence,
         failures=failures,
+        reason="pending_tool_call_not_adopted_recovered_by_bridge",
     )
 
 
@@ -2068,6 +2181,17 @@ def verification_contract_requested(envelope: dict) -> bool:
         if any(word in lowered for word in ("run ", "test", "diff --check", "typecheck", "lint", "doctor", "verify")):
             return True
     return False
+
+
+def declared_read_floor_only(envelope: dict) -> bool:
+    """Return true for simple read-only source floors the bridge can safely complete."""
+    if not envelope.get("read_only_paths"):
+        return False
+    for step in envelope.get("verification_steps", []):
+        lowered = str(step or "").lower()
+        if any(token in lowered for token in ("grep", "search", "find ", "locate", "test", "lint", "typecheck")):
+            return False
+    return True
 
 
 def output_claims_verification(text: str) -> bool:
@@ -3940,6 +4064,32 @@ class Handler(BaseHTTPRequestHandler):
             required_fields=required_fields_for_evidence,
         )
 
+        if (
+            os.getenv("OSS_PROACTIVE_SERVER_SIDE_READ_FLOOR", "1") != "0"
+            and prev_state
+            and exit_code == 0
+            and mode in ("context_pack", "context_pack_report")
+            and declared_read_floor_only(envelope)
+            and not _has_evidence_ledger(body)
+        ):
+            repaired_messages = repair_chat_history(prev_state.messages, tool_outputs)
+            report_text = complete_declared_reads_from_bridge(
+                parent_response_id=str(prev_id or prev_state.response_id),
+                messages=repaired_messages,
+                handoff_text=handoff_text,
+                project_root=os.getcwd(),
+                finalizer_call=self._server_side_read_finalizer_call(model_alias),
+                finalizer_timeout_seconds=float(os.getenv("OSS_SERVER_SIDE_READ_FINALIZER_TIMEOUT_SECONDS", "12")),
+                reason="declared_read_floor_completed_by_bridge",
+                log_fn=APP.log,
+            )
+            if report_text:
+                APP.log("proactive_server_side_read_floor_complete", mode=mode)
+                emitter = ResponseEmitter(self, new_id("resp"), model_alias, bool(body.get("stream")))
+                emitter.emit_text_message(report_text)
+                emitter.complete()
+                return
+
         if prev_id and prev_state and mode in ("context_pack", "context_pack_report"):
             pending_child = APP.state.find_pending_child(str(prev_id))
             if pending_child:
@@ -4373,7 +4523,10 @@ class Handler(BaseHTTPRequestHandler):
         """Return a bounded no-tool finalizer callable for recovered read evidence."""
         def call(prompt: str, timeout_seconds: float) -> str:
             preferred = os.getenv("OSS_SERVER_SIDE_READ_FINALIZER_MODEL", "").strip()
-            candidates = [preferred or model_alias]
+            default_model = preferred or "deepseek-v4-flash"
+            candidates = [default_model]
+            if model_alias not in candidates:
+                candidates.append(model_alias)
             for fallback in APP.continuation_fallbacks:
                 if fallback not in candidates:
                     candidates.append(fallback)
@@ -4807,11 +4960,30 @@ class Handler(BaseHTTPRequestHandler):
 
     def _send_sse(self, resp_obj: JSON) -> None:
         self._send_sse_headers()
-        self._write_sse("response.created", {"type": "response.created", "response": {**resp_obj, "output": []}})
-        self._emit_sse_items_and_completed(resp_obj)
+        response_id = str(resp_obj.get("id") or "")
+        created_response = {**resp_obj, "status": "in_progress", "output": []}
+        self._write_sse(
+            "response.created",
+            {
+                "type": "response.created",
+                "response": created_response,
+                "response_id": response_id,
+                "sequence_number": 1,
+            },
+        )
+        self._write_sse(
+            "response.in_progress",
+            {
+                "type": "response.in_progress",
+                "response": created_response,
+                "response_id": response_id,
+                "sequence_number": 2,
+            },
+        )
+        self._emit_sse_items_and_completed(resp_obj, sequence_start=2)
 
-    def _emit_sse_items_and_completed(self, resp_obj: JSON) -> None:
-        sequence_number = 0
+    def _emit_sse_items_and_completed(self, resp_obj: JSON, *, sequence_start: int = 0) -> None:
+        sequence_number = sequence_start
         response_id = str(resp_obj.get("id") or "")
 
         def emit(event: str, payload: JSON) -> None:
@@ -4923,6 +5095,7 @@ class Handler(BaseHTTPRequestHandler):
                         "type": "response.function_call_arguments.done",
                         "output_index": idx,
                         "item_id": item.get("id"),
+                        "name": item.get("name"),
                         "arguments": args,
                     },
                 )
