@@ -67,6 +67,8 @@ def assert_agent_command_discipline():
             assert needle in text, f"{rel_path} missing {needle!r}"
         for needle in forbidden:
             assert needle not in text, f"{rel_path} contains public-repo-hostile text {needle!r}"
+        assert "Do not self-certify bridge routing or live OSS synthesis." in text or "do not self-certify bridge routing or live OSS synthesis." in text, rel_path
+        assert "codex-oss doctor --live-model" in text, rel_path
 
 
 def assert_runtime_agents_are_mission_controlled():
@@ -85,6 +87,8 @@ def assert_installer_templates_match_policy():
     text = read("codex_oss/installer.py")
     assert "COMMAND_DISCIPLINE" in text
     assert "Do not assume private helper tools are installed." in text
+    assert "Do not self-certify bridge routing or live OSS synthesis." in text
+    assert "codex-oss doctor --live-model" in text
     assert "ls --tree" in text
     assert "Always prefix with `rtk `" not in text
     assert "opencode_bridge" in text

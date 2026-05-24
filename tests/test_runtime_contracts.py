@@ -632,6 +632,27 @@ def assert_readonly_mission_writes_artifact_bundle():
         shutil.rmtree(root)
 
 
+def assert_visible_commentary_close_adds_terminal_lifecycle_event():
+    from codex_oss.visible_commentary import VisibleCommentarySink
+
+    with tempfile.TemporaryDirectory(dir=ROOT) as d:
+        sink = VisibleCommentarySink("mission_visible_close_test", d)
+        sink.emit(
+            "mission_started",
+            "Mission accepted",
+            "Mission started.",
+            phase="PLAN",
+            source="runtime",
+        )
+        sink.close({"status": "PARTIAL", "confidence": "LOW", "closure_source": "model_report"})
+        with open(os.path.join(d, "visible_commentary.jsonl"), encoding="utf-8") as handle:
+            events = [json.loads(line) for line in handle if line.strip()]
+        event_types = [event["event_type"] for event in events]
+        assert event_types == ["mission_started", "mission_partial"], event_types
+        assert events[-1]["safe_for_user"] is True, events[-1]
+        assert os.path.exists(os.path.join(d, "summary.md"))
+
+
 def assert_response_emitter_streams_commentary_and_final_phases():
     class FakeWFile:
         def __init__(self):
@@ -4310,6 +4331,7 @@ def main():
     assert_runtime_model_alias_requires_mission_and_maps_reasoning_model()
     assert_runtime_model_alias_uses_fallback_on_model_failure()
     assert_readonly_mission_writes_artifact_bundle()
+    assert_visible_commentary_close_adds_terminal_lifecycle_event()
     assert_response_emitter_streams_commentary_and_final_phases()
     assert_runtime_mission_time_budget_extends_internal_deadline()
     assert_tool_classes_are_enforced_and_aliases_normalize()

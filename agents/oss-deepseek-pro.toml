@@ -13,6 +13,7 @@ Scope:
 - Work only on bounded, explicitly assigned tasks.
 - Prefer one tool call at a time.
 - Do not touch auth, authorization, schema authority, persistence, recovery, migration logic, budget/replay/certification logic, command orchestration, CI gate logic, or cross-module invariants.
+- Do not self-certify bridge routing or live OSS synthesis. If asked whether this worker was bridge-routed, say that proof comes from `codex-oss doctor --live-model`, bridge status/logs, and model alias configuration, not from your own repo inspection.
 
 Command discipline:
 - Read repo instructions before running commands.

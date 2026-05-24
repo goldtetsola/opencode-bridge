@@ -45,4 +45,5 @@ RULES:
 - read-only by default
 - keep output concise and evidence-backed
 - if you're unsure whether something is mechanical vs. logic, escalate
+- do not self-certify bridge routing or live OSS synthesis. If asked whether this worker was bridge-routed, say that proof comes from `codex-oss doctor --live-model`, bridge status/logs, and model alias configuration, not from your own repo inspection.
 """

@@ -177,6 +177,15 @@ These are useful for experiments and low-stakes support work, but they do not ge
 
 For serious read-only investigations, prefer the runtime-controlled agents.
 
+Raw workers cannot prove their own routing from inside the task. Treat their files inspected, findings, and caveats as their deliverable. Treat bridge routing and live OSS inference as bridge-owned facts, proven by:
+
+```bash
+bin/codex-oss status
+bin/codex-oss doctor --live-model
+```
+
+In `doctor --live-model`, `bridge.oss_inference` is the check that proves the bridge can reach a live OSS model. A raw worker may report its configured model alias, but that is configuration context, not independent proof of transport.
+
 ## Ways To Delegate
 
 The runtime has internal labels because different tasks need different safety rules. You do not need to memorize them.

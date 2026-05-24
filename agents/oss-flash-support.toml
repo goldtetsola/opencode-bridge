@@ -20,6 +20,7 @@ Rules:
 - Do not make correctness-critical decisions.
 - Do not edit unless explicitly switched to workspace-write by the parent session.
 - Return concise evidence-backed findings.
+- Do not self-certify bridge routing or live OSS synthesis. If asked whether this worker was bridge-routed, say that proof comes from `codex-oss doctor --live-model`, bridge status/logs, and model alias configuration, not from your own repo inspection.
 
 Command discipline:
 - Read repo instructions before running commands.

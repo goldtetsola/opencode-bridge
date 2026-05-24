@@ -131,7 +131,36 @@ class VisibleCommentarySink:
             f.write(json.dumps(event, sort_keys=True) + "\n")
 
     def close(self, final_report: JSON | None = None):
+        self._ensure_terminal_lifecycle_event(final_report)
         self._render_summary_md(final_report)
+
+    def _ensure_terminal_lifecycle_event(self, final_report: JSON | None = None):
+        if self.mode == "off":
+            return
+        terminal_events = {"mission_completed", "mission_failed", "mission_partial", "mission_escalated"}
+        event_types = {str(event.get("event_type", "") or "") for event in self._events if isinstance(event, dict)}
+        if event_types & terminal_events:
+            return
+        status = str((final_report or {}).get("status", "") or "").upper()
+        if status == "COMPLETE":
+            event_type = "mission_completed"
+            title = "Mission completed"
+        elif status == "ESCALATE":
+            event_type = "mission_escalated"
+            title = "Mission escalated"
+        elif status == "FAILED":
+            event_type = "mission_failed"
+            title = "Mission failed"
+        else:
+            event_type = "mission_partial"
+            title = "Mission partially completed"
+        self.emit(
+            event_type,
+            title,
+            f"Final status: {status or 'UNKNOWN'}. Final report and evidence artifacts have been persisted.",
+            phase="REPORT",
+            source="runtime",
+        )
 
     def _render_summary_md(self, final_report: JSON | None = None):
         events = list(self._events)

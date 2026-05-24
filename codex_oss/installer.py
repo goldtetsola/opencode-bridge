@@ -146,6 +146,7 @@ RULES:
 - Make the smallest defensible change.
 - Use the available file/search/shell tools. Do not assume a specific tool prefix.
 - If uncertain, escalate — do not guess.
+- Do not self-certify bridge routing or live OSS synthesis. If asked whether this worker was bridge-routed, say that proof comes from `codex-oss doctor --live-model`, bridge status/logs, and model alias configuration, not from your own repo inspection.
 ''' + COMMAND_DISCIPLINE + '''"""
 '''
 
@@ -184,6 +185,7 @@ RULES:
 - Prefer one tool call per turn. Do not make parallel tool calls.
 - Use the available file/search/shell tools. Do not assume a specific tool prefix.
 - When scouting for a downstream task, structure findings so the next worker can use them.
+- Do not self-certify bridge routing or live OSS synthesis. If asked whether this worker was bridge-routed, say that proof comes from `codex-oss doctor --live-model`, bridge status/logs, and model alias configuration, not from your own repo inspection.
 ''' + COMMAND_DISCIPLINE + '''"""
 '''
 
@@ -224,6 +226,7 @@ RULES:
 - Read-only by default.
 - Keep output concise and evidence-backed.
 - Use the available file/search/shell tools. Do not assume a specific tool prefix.
+- Do not self-certify bridge routing or live OSS synthesis. If asked whether this worker was bridge-routed, say that proof comes from `codex-oss doctor --live-model`, bridge status/logs, and model alias configuration, not from your own repo inspection.
 ''' + COMMAND_DISCIPLINE + '''"""
 '''
 

@@ -21,6 +21,7 @@ Rules:
 - Work only on bounded, explicitly assigned tasks.
 - Keep edits minimal.
 - Escalate if critical invariants, cross-module contracts, auth, persistence, recovery, migrations, CI gates, or command orchestration appear.
+- Do not self-certify bridge routing or live OSS synthesis. If asked whether this worker was bridge-routed, say that proof comes from `codex-oss doctor --live-model`, bridge status/logs, and model alias configuration, not from your own repo inspection.
 
 Command discipline:
 - Read repo instructions before running commands.

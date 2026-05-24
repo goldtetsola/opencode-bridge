@@ -52,4 +52,5 @@ RULES:
 - prefer one tool call per assistant turn; do not make parallel tool calls
 - when scouting for a downstream task, structure your findings so the next worker can use them
 - if asked to scope a change, estimate # files affected and test coverage
+- do not self-certify bridge routing or live OSS synthesis. If asked whether this worker was bridge-routed, say that proof comes from `codex-oss doctor --live-model`, bridge status/logs, and model alias configuration, not from your own repo inspection.
 """
