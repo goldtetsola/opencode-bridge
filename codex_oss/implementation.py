@@ -27,6 +27,12 @@ from codex_oss.runtime import resolve_path
 from codex_oss.runtime.loop import _extract_model_text
 from codex_oss.runtime.policy import is_critical_path, scan_secrets
 
+from codex_oss.read_evidence import (
+    build_canonical_patch_evidence,
+    build_implementation_narrative_draft,
+    validate_implementation_narrative_draft,
+)
+
 
 JSON = dict[str, Any]
 
@@ -600,6 +606,13 @@ def _persist_implementation_runtime_artifacts(
         if isinstance(payload, dict):
             _write_json(os.path.join(artifact_dir, filename), payload)
     _write_json(os.path.join(artifact_dir, "report.json"), report)
+    # ── v11: Persist canonical patch evidence and implementation narrative ──
+    canonical_patch = report.get("canonical_patch_evidence")
+    if isinstance(canonical_patch, dict):
+        _write_json(os.path.join(artifact_dir, "canonical_patch_evidence.json"), canonical_patch)
+    impl_narrative = report.get("implementation_narrative")
+    if isinstance(impl_narrative, dict):
+        _write_json(os.path.join(artifact_dir, "implementation_narrative.json"), impl_narrative)
     readiness_graph = validation.get("implementation_readiness_graph")
     if isinstance(readiness_graph, dict):
         _write_json(os.path.join(artifact_dir, "implementation_readiness_graph.json"), readiness_graph)
@@ -3020,6 +3033,30 @@ def _implementation_report(
     )
     model_narrative = _implementation_model_narrative(proposal)
     authority = _implementation_authority(proposal, model_narrative)
+
+    # ── v11: Build canonical patch evidence and validate implementation narrative ──
+    canonical_patch = build_canonical_patch_evidence(
+        mission_id=getattr(mission, "mission_id", ""),
+        owned_paths=list(getattr(mission, "owned_paths", []) or []),
+        changed_paths=list(changed),
+        write_status="applied" if status in ("VERIFIED", "APPLIED_IN_ISOLATION", "APPLIED_TO_WORKSPACE", "APPLIED_IN_TEMP_PROJECT") else "not_applied",
+        readback_status="verified" if status == "VERIFIED" else ("applied" if status in ("APPLIED_IN_ISOLATION", "APPLIED_TO_WORKSPACE") else "failed"),
+        writes_outside_owned_paths=bool(main_workspace_mutated),
+        verification_status="passed" if verification and all(isinstance(v, dict) and v.get("exit_code") == 0 for v in verification) else ("failed" if verification else "skipped"),
+        verification_method="readback_exact_match" if verification else "none",
+        rollback_available=bool(patch_path),
+    )
+
+    impl_narrative = build_implementation_narrative_draft(
+        change_summary=str(model_narrative.get("summary", "") or proposal.get("summary", "") or ""),
+        verification_summary=str(model_narrative.get("verification_intent", "") or ""),
+        risk_summary=str(model_narrative.get("risk_summary", "") or ""),
+        caveats=list(model_narrative.get("caveats", []) or []),
+    )
+    impl_narrative_valid, impl_narrative_errors = validate_implementation_narrative_draft(
+        impl_narrative, list(changed)
+    )
+
     return {
         "implementation_report_version": "1.0",
         "status": status,
@@ -3062,6 +3099,10 @@ def _implementation_report(
         "confidence": "MEDIUM" if status == "VERIFIED" else "LOW",
         "caveats": caveats,
         "gpt_review_required": True,
+        "canonical_patch_evidence": canonical_patch,
+        "implementation_narrative": impl_narrative,
+        "implementation_narrative_valid": impl_narrative_valid,
+        "implementation_narrative_errors": impl_narrative_errors if not impl_narrative_valid else [],
     }
 
 
