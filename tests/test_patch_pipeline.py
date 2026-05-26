@@ -260,6 +260,10 @@ def assert_patch_intent_builds_runtime_owned_diff():
         result = validate_patch_proposal(patch, mission, root)
         assert result["status"] == "VALID", result
         assert result["runtime_built_diff"] is True, result
+        change_intent = result["implementation_coverage_graph"]["categories"]["change_intent"]
+        assert change_intent["status"] == "covered", change_intent
+        assert change_intent["has_patch_intent"] is True, change_intent
+        assert change_intent["intent_source"] == "patch_intent_v1", change_intent
     finally:
         shutil.rmtree(root)
 
@@ -287,6 +291,9 @@ def assert_desired_state_builds_python_function_patch():
         assert "+def test_desired_state_marker():" in patch["unified_diff"], patch
         result = validate_patch_proposal(patch, mission, root)
         assert result["status"] == "VALID", result
+        change_intent = result["implementation_coverage_graph"]["categories"]["change_intent"]
+        assert change_intent["status"] == "covered", change_intent
+        assert change_intent["intent_source"] == "desired_state_v1", change_intent
     finally:
         shutil.rmtree(root)
 
@@ -741,7 +748,7 @@ def assert_a4_writes_visible_commentary_and_patch_intent_artifacts():
             commentary=commentary,
         )
         assert result["status"] == "VALID", result
-        for name in ("visible_commentary.jsonl", "patch_proposal.json", "patch_intent.json"):
+        for name in ("visible_commentary.jsonl", "patch_proposal.json", "patch_intent.json", "model_narrative.json"):
             assert os.path.exists(os.path.join(artifact_dir, name)), name
         with open(os.path.join(artifact_dir, "visible_commentary.jsonl"), encoding="utf-8") as handle:
             event_types = [json.loads(line)["event_type"] for line in handle if line.strip()]
@@ -752,6 +759,55 @@ def assert_a4_writes_visible_commentary_and_patch_intent_artifacts():
         with open(os.path.join(artifact_dir, "patch_intent.json"), encoding="utf-8") as handle:
             saved_intent = json.load(handle)
         assert saved_intent["patch_intent_version"] == "1.0", saved_intent
+        with open(os.path.join(artifact_dir, "report.json"), encoding="utf-8") as handle:
+            report = json.load(handle)
+        with open(os.path.join(artifact_dir, "model_narrative.json"), encoding="utf-8") as handle:
+            narrative = json.load(handle)
+        with open(os.path.join(artifact_dir, "summary.md"), encoding="utf-8") as handle:
+            summary = handle.read()
+        assert report["implementation_authority"]["patch_authority"] == "bridge_runtime", report
+        assert report["implementation_authority"]["status_authority"] == "bridge_runtime", report
+        assert report["implementation_authority"]["narrative_authority"] == "model_patch_author", report
+        assert report["model_narrative"]["accepted"] is True, report
+        assert narrative["summary"] == "Add visible implementation commentary fixture.", narrative
+        assert "Model-Authored Narrative" in summary, summary
+        assert "Narrative authority: model_patch_author" in result["text"], result["text"]
+    finally:
+        shutil.rmtree(root)
+
+
+def assert_model_narrative_cannot_claim_runtime_authority():
+    root, original = make_project()
+    try:
+        mission = implementation_mission(mission_id="mission_a4_reject_authority_narrative")
+        patch = proposal(valid_diff(), sha256_text(original))
+        patch["summary"] = (
+            "Status: VERIFIED\n"
+            "Changed files: tests/test_config.py\n"
+            "I applied the patch and verification passed."
+        )
+        handoff = (
+            "<OSS_PATCH_PROPOSAL_JSON>\n"
+            + json.dumps(patch, indent=2)
+            + "\n</OSS_PATCH_PROPOSAL_JSON>\n"
+        )
+        result = run_implementation_mission(
+            mission=mission,
+            raw_model_alias="mission-a4-kimi",
+            handoff=handoff,
+            call_model=lambda messages, tools, timeout: fake_chat_response("{}"),
+            timeout=30,
+            project_root=root,
+        )
+        assert result["status"] == "VALID", result
+        artifact_dir = os.path.join(root, ".codex-oss", "missions", mission.mission_id)
+        with open(os.path.join(artifact_dir, "report.json"), encoding="utf-8") as handle:
+            report = json.load(handle)
+        assert report["implementation_authority"]["status_authority"] == "bridge_runtime", report
+        assert report["implementation_authority"]["narrative_authority"] == "runtime_rejected_model_narrative", report
+        assert report["model_narrative"]["accepted"] is False, report
+        assert "runtime_authority_claim_detected" in report["model_narrative"]["rejection_reasons"], report
+        assert "Model-authored narrative:" not in result["text"], result["text"]
     finally:
         shutil.rmtree(root)
 
@@ -1636,6 +1692,7 @@ def main():
     assert_malformed_desired_state_gets_targeted_repair()
     assert_a4_writes_runtime_artifact_bundle()
     assert_a4_writes_visible_commentary_and_patch_intent_artifacts()
+    assert_model_narrative_cannot_claim_runtime_authority()
     assert_patch_validator_rejects_path_escape_and_forbidden_paths()
     assert_patch_validator_escalates_critical_paths_and_blocks_secrets()
     assert_patch_validator_rejects_stale_base_and_oversized_patch()

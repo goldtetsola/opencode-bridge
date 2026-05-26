@@ -14,6 +14,7 @@ from .certify import certify_project
 from .legacy import archive_legacy_missions
 from .metrics import broad_low_risk_runtime_status, summarize_missions
 from .mission_compiler import compile_handoff_v1, compile_mission_v1
+from .native_polish import run_native_polish_smoke
 from .decision_trace import read_decision_trace
 from .proofs import refresh_claim_proofs
 from .raw_lane import run_raw_probe, summarize_raw_probes
@@ -179,6 +180,16 @@ def main():
     burnin.add_argument("--project", type=str, default=None, help="Project root path")
     burnin.add_argument("--suite", choices=["proof", "operational", "all"], default="proof", help="Which evidence suite to generate and evaluate")
     burnin.add_argument("--json", action="store_true", help="Machine-readable output")
+
+    smoke = sub.add_parser("smoke", help="Run product-level OSS bridge smoke checks")
+    smoke_sub = smoke.add_subparsers(dest="smoke_command", help="Smoke checks")
+    native_polish = smoke_sub.add_parser("native-polish", help="Prove the native-like OSS subagent surface")
+    native_polish.add_argument("--project", type=str, default=None, help="Project root path")
+    native_polish.add_argument("--port", type=int, default=4000, help="Bridge port")
+    native_polish.add_argument("--base-url", default=None, help="Bridge base URL, default http://127.0.0.1:<port>/v1")
+    native_polish.add_argument("--auth", default=None, help="Bearer token, default LITELLM_MASTER_KEY/PROXY_API_KEY")
+    native_polish.add_argument("--timeout", type=float, default=120, help="HTTP timeout per smoke request")
+    native_polish.add_argument("--json", action="store_true", help="Machine-readable output")
 
     certify = sub.add_parser("certify", help="Run explicit certification gates and write certification artifacts")
     certify.add_argument("--project", type=str, default=None, help="Project root path")
@@ -475,6 +486,9 @@ def main():
                 print(f"- {key}: {value.get('status')} ({value.get('basis')})")
         sys.exit(0 if report["claim_status"].get("all_supported") else 1)
 
+    elif args.command == "smoke":
+        sys.exit(_smoke(args))
+
     elif args.command == "certify":
         project_root = args.project or os.getcwd()
         report = certify_project(project_root, target=args.target, refresh=not bool(args.no_refresh))
@@ -617,6 +631,36 @@ def _mission(args) -> int:
     if args.mission_command == "run":
         return _mission_run(args)
     print("Usage: codex-oss mission <template|compile|run>")
+    return 1
+
+
+def _smoke(args) -> int:
+    if args.smoke_command == "native-polish":
+        project_root = args.project or os.getcwd()
+        base_url = (args.base_url or f"http://127.0.0.1:{args.port}/v1").rstrip("/")
+        auth = args.auth or os.getenv("PROXY_API_KEY") or os.getenv("LITELLM_MASTER_KEY") or "sk-local-codex-bridge"
+        report = run_native_polish_smoke(
+            project_root,
+            base_url=base_url,
+            auth=auth,
+            timeout=float(args.timeout),
+        )
+        if args.json:
+            print(json_dumps_safe(report))
+        else:
+            print(f"Project: {report['project_root']}")
+            print(f"Native polish: {'PASS' if report.get('ok') else 'FAIL'}")
+            for check in report.get("checks", []):
+                print(f"- {check.get('status')}: {check.get('name')} — {check.get('message')}")
+                if check.get("fix") and check.get("status") != "PASS":
+                    print(f"  Fix: {check.get('fix')}")
+                details = check.get("details")
+                if isinstance(details, dict):
+                    for key in ("mission_id", "visible_commentary_path", "summary_path"):
+                        if details.get(key):
+                            print(f"  {key}: {details[key]}")
+        return 0 if report.get("ok") else 1
+    print("Usage: codex-oss smoke native-polish")
     return 1
 
 

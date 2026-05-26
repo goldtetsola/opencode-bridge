@@ -98,24 +98,42 @@ def build_implementation_coverage_graph(
     # ── change_intent ──
     proposal_source = str(proposal.get("proposal_source", "") or "raw_patch_proposal_v1")
     is_runtime_built = proposal_source in {"desired_state_v1", "patch_recipe_v1", "patch_intent_v1"}
-    has_desired_state = bool(proposal.get("desired_state"))
-    has_patch_recipe = bool(proposal.get("patch_recipe"))
-    has_patch_intent = bool(proposal.get("patch_intent_version"))
-    intent_required = is_runtime_built or has_desired_state or has_patch_recipe or has_patch_intent
+    has_desired_state = isinstance(proposal.get("desired_state"), dict)
+    has_patch_recipe = isinstance(proposal.get("patch_recipe"), dict)
+    has_patch_intent = (
+        isinstance(proposal.get("patch_intent"), dict)
+        or str(proposal.get("patch_intent_version", "") or "") == "1.0"
+    )
+    has_any_intent_source = has_desired_state or has_patch_recipe or has_patch_intent
+    intent_required = is_runtime_built or has_any_intent_source
     intent_obligations: list[JSON] = [
+        {
+            "id": "change_intent:runtime_source",
+            "kind": "runtime_intent_source",
+            "required": intent_required,
+            "status": "satisfied" if has_any_intent_source else ("missing" if intent_required else "waived"),
+            "reason": "" if has_any_intent_source else ("No DesiredStateV1, PatchRecipeV1, or PatchIntentV1 source was preserved." if intent_required else "Not required for raw patch proposals."),
+        },
         {
             "id": "change_intent:desired_state",
             "kind": "desired_state",
-            "required": intent_required,
-            "status": "satisfied" if has_desired_state else ("missing" if intent_required else "waived"),
-            "reason": "" if has_desired_state else ("No desired state specified in proposal." if intent_required else "Not required for raw patch proposals."),
+            "required": False,
+            "status": "satisfied" if has_desired_state else "waived",
+            "reason": "" if has_desired_state else "DesiredStateV1 was not the selected intent source.",
         },
         {
             "id": "change_intent:patch_recipe",
             "kind": "patch_recipe",
-            "required": intent_required,
-            "status": "satisfied" if has_patch_recipe or has_patch_intent else ("missing" if intent_required else "waived"),
-            "reason": "" if has_patch_recipe or has_patch_intent else ("No patch recipe or intent specified in proposal." if intent_required else "Not required for raw patch proposals."),
+            "required": False,
+            "status": "satisfied" if has_patch_recipe else "waived",
+            "reason": "" if has_patch_recipe else "PatchRecipeV1 was not the selected intent source.",
+        },
+        {
+            "id": "change_intent:patch_intent",
+            "kind": "patch_intent",
+            "required": False,
+            "status": "satisfied" if has_patch_intent else "waived",
+            "reason": "" if has_patch_intent else "PatchIntentV1 was not the selected intent source.",
         },
     ]
     intent_satisfied = [o for o in intent_obligations if o.get("status") in {"satisfied", "waived"}]
@@ -126,7 +144,15 @@ def build_implementation_coverage_graph(
         "total_count": intent_required_count or 1,
         "obligations": intent_obligations,
         "has_desired_state": has_desired_state,
-        "has_patch_recipe": has_patch_recipe or has_patch_intent,
+        "has_patch_recipe": has_patch_recipe,
+        "has_patch_intent": has_patch_intent,
+        "has_any_intent_source": has_any_intent_source,
+        "intent_source": (
+            "desired_state_v1" if has_desired_state else
+            "patch_recipe_v1" if has_patch_recipe else
+            "patch_intent_v1" if has_patch_intent else
+            "raw_patch_proposal_v1"
+        ),
         "reason": "Change intent is fully specified." if len(intent_satisfied) >= intent_required_count else "Change intent is incomplete.",
     }
 
@@ -255,7 +281,7 @@ def build_implementation_coverage_graph(
 
     next_actions = []
     if category_statuses.get("change_intent") in {"missing", "partial"}:
-        next_actions.append({"action": "specify_change_intent", "detail": "Add desired_state and patch_recipe to the proposal."})
+        next_actions.append({"action": "specify_change_intent", "detail": "Add DesiredStateV1, PatchRecipeV1, or PatchIntentV1 to the proposal."})
     if category_statuses.get("source_evidence") == "missing":
         next_actions.append({"action": "inspect_source_files", "detail": "Read the relevant source files before proposing."})
     if category_statuses.get("target_knowledge") in {"missing", "partial"}:

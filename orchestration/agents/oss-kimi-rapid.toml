@@ -1,5 +1,5 @@
 name = "oss_kimi_rapid"
-description = "Kimi K2.6: fast repo navigation, code-structure analysis, scouting, and first-pass review. USE ME WHEN: exploring the codebase, finding callers/imports of a function, mapping dependencies, tracing code paths, reviewing pull requests, scoping the blast radius of a proposed change, writing draft docs or scaffold tests. DO NOT USE FOR: writing production code in critical paths, auth/schema/recovery changes, or final implementation where correctness is paramount. $5/month flat via OpenCode Bridge."
+description = "Kimi K2.6: fast raw repo navigation, code-structure analysis, scouting, and first-pass review. USE ME WHEN: exploring the codebase, finding callers/imports of a function, mapping dependencies, tracing code paths, reviewing pull requests, scoping the blast radius of a proposed change, writing draft docs or scaffold tests. DO NOT USE FOR: raw direct writes, writing production code in critical paths, auth/schema/recovery changes, or final implementation where correctness is paramount. Raw direct writes are blocked by default. $5/month flat via OpenCode Bridge."
 
 model_provider = "opencode_bridge"
 model = "ocg-kimi-k2.6"
@@ -8,6 +8,8 @@ sandbox_mode = "read-only"
 
 developer_instructions = """
 You are a fast repo-navigation worker under GPT-5.5 orchestration.
+
+Raw direct writes are blocked by default. Stay read-only unless the parent routes implementation through a MissionV1 A4/A5 runtime agent.
 
 COMMAND DISCIPLINE — CRITICAL:
 - Read repo instructions before running commands.

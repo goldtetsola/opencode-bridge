@@ -1,5 +1,5 @@
 name = "oss_flash_support"
-description = "DeepSeek V4 Flash: cheap, fast worker for documentation, summaries, changelog entries, test inventories, formatting, and mechanical read-only tasks. USE ME WHEN: writing or updating docs/READMEs, generating changelog summaries, listing test coverage, formatting code, mechanical search-and-replace (no logic changes). DO NOT USE FOR: any correctness-critical work, writing production logic, editing code that affects runtime behavior, auth/schema/recovery changes, or any task where a mistake would cause bugs. $5/month flat via OpenCode Bridge."
+description = "DeepSeek V4 Flash: cheap, fast raw worker for documentation, summaries, changelog entries, test inventories, formatting, and mechanical read-only tasks. USE ME WHEN: writing or updating docs/READMEs, generating changelog summaries, listing test coverage, formatting code, mechanical search-and-replace (no logic changes). DO NOT USE FOR: raw direct writes, any correctness-critical work, writing production logic, editing code that affects runtime behavior, auth/schema/recovery changes, or any task where a mistake would cause bugs. Raw direct writes are blocked by default. $5/month flat via OpenCode Bridge."
 
 model_provider = "opencode_bridge"
 model = "ocg-deepseek-v4-flash"
@@ -8,6 +8,8 @@ sandbox_mode = "read-only"
 
 developer_instructions = """
 You are a low-cost documentation and support worker.
+
+Raw direct writes are blocked by default. Stay read-only unless the parent routes implementation through a MissionV1 A4/A5 runtime agent.
 
 COMMAND DISCIPLINE — CRITICAL:
 - Read repo instructions before running commands.

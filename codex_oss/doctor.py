@@ -217,6 +217,39 @@ def _check_agents(root: Path, report: DoctorReport):
             report.add(f"agents.{name}.reasoning", "PASS",
                 f"'{name}' reasoning={reasoning}")
 
+    required_agents = {
+        "oss-deepseek-investigator.toml": "mission-a3-deepseek",
+        "oss-deepseek-implementer.toml": "mission-a5-deepseek",
+        "oss-flash-context.toml": "mission-a2-flash",
+        "oss-kimi-investigator.toml": "mission-a3-kimi",
+    }
+    for filename, expected_model in required_agents.items():
+        path = agents_dir / filename
+        if not path.exists():
+            report.add(
+                f"agents.required.{filename}",
+                "FAIL",
+                f"Required runtime agent template {filename} is missing",
+                "Run `codex-oss install --force`, then restart/reload Codex so the agent registry refreshes",
+            )
+            continue
+        cfg = _read_toml(path)
+        name = cfg.get("name", path.stem)
+        model = cfg.get("model", "")
+        if model != expected_model:
+            report.add(
+                f"agents.required.{name}",
+                "FAIL",
+                f"Required runtime agent {name} uses model={model!r}, expected {expected_model!r}",
+                "Run `codex-oss install --force`, then restart/reload Codex so the agent registry refreshes",
+            )
+        else:
+            report.add(
+                f"agents.required.{name}",
+                "PASS",
+                f"Required runtime agent {name} is installed with {expected_model}",
+            )
+
 
 def _check_agreements(root: Path, report: DoctorReport):
     agreements = root / "AGENTS.md"

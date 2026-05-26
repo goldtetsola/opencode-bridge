@@ -67,6 +67,28 @@ def assert_patch_shell_verification_returns_observed_report():
     assert "Verification status: observed" in decision.text, decision.text
 
 
+def assert_shell_append_to_ignored_owned_path_counts_as_changed():
+    rel = "tmp/legacy-owned-append.txt"
+    decision = handle_bounded_patch_continuation(
+        envelope={"owned_paths": [rel]},
+        tool_kind="write",
+        tool_output_text="",
+        compacted_output="",
+        exit_code=0,
+        target_path=rel,
+        turn=2,
+        max_exchanges=2,
+        project_root=ROOT,
+        collect_owned_path_changes=lambda owned, root: [],
+        path_is_within_owned_paths=lambda path, owned, root: path == rel,
+        build_patch_contract_report=patch_report,
+        tool_output_indicates_failure=lambda text: False,
+    )
+    assert decision.handled, decision
+    assert decision.text.startswith("PARTIAL\n"), decision.text
+    assert f"Changed owned paths: {rel}" in decision.text, decision.text
+
+
 def assert_patch_write_can_continue_for_verification():
     decision = handle_bounded_patch_continuation(
         envelope={
@@ -463,6 +485,7 @@ def main():
     assert_legacy_mode_decision_defaults_are_initialized()
     assert_exact_write_creates_and_reads_back()
     assert_patch_shell_verification_returns_observed_report()
+    assert_shell_append_to_ignored_owned_path_counts_as_changed()
     assert_patch_write_can_continue_for_verification()
     assert_context_pack_falls_back_on_intent_text()
     assert_context_pack_repairs_model_report_missing_required_field()

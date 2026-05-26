@@ -52,6 +52,7 @@ Security:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import queue
@@ -559,7 +560,9 @@ def normalize_tool_args(args, tool_name: str) -> tuple:
             val = args.get(key)
             if val:
                 command = str(val) if isinstance(val, str) else json.dumps(val)
-                return (_read_path_from_shell_command(command), command)
+                write_op = _append_redirection_from_shell_command(command)
+                write_path = write_op[0] if write_op else None
+                return (_read_path_from_shell_command(command) or write_path, command)
 
     return (None, json.dumps(args))
 
@@ -600,6 +603,8 @@ def _read_path_from_shell_command(command: str) -> Optional[str]:
         path = " ".join(parts[1:])
     elif len(parts) >= 4 and parts[0] == "rtk" and parts[1] == "grep":
         path = " ".join(parts[3:])
+    elif len(parts) >= 3 and parts[0] == "rg":
+        path = " ".join(parts[2:])
     elif len(parts) >= 3 and parts[0] == "grep":
         path = " ".join(parts[2:])
     elif len(parts) >= 3 and parts[0] == "sed" and parts[-1] != "-n":
@@ -612,13 +617,63 @@ def _read_path_from_shell_command(command: str) -> Optional[str]:
     return path
 
 
+def _append_redirection_from_shell_command(command: str) -> Optional[tuple[str, str]]:
+    """Extract a simple literal append operation from shell."""
+    parts = _shell_parts(command)
+    if "&&" in parts:
+        parts = parts[:parts.index("&&")]
+    if ";" in parts:
+        parts = parts[:parts.index(";")]
+    if len(parts) < 4 or parts[0] not in ("echo", "printf"):
+        return None
+    if ">>" not in parts:
+        return None
+    idx = parts.index(">>")
+    if idx < 2 or idx + 1 >= len(parts):
+        return None
+    content = " ".join(parts[1:idx])
+    path = parts[idx + 1]
+    if not content or not path:
+        return None
+    if parts[0] == "printf":
+        content = content.encode("utf-8").decode("unicode_escape")
+        if content.endswith("\n"):
+            return path, content
+    return path, content + "\n"
+
+
 def _shell_command_is_read_like(command: str) -> bool:
     parts = _shell_parts(command)
     if not parts:
         return False
     if parts[0] == "rtk" and len(parts) >= 2 and parts[1] in ("read", "grep", "find", "ls"):
         return True
-    return parts[0] in ("cat", "grep", "sed", "find", "ls")
+    return parts[0] in ("cat", "rg", "grep", "sed", "find", "ls")
+
+
+def _search_pattern_from_shell_command(command: str) -> str:
+    parts = _strip_shell_redirection_parts(_shell_parts(command))
+    if len(parts) >= 4 and parts[0] == "rtk" and parts[1] == "grep":
+        return parts[2]
+    if len(parts) >= 3 and parts[0] in ("rg", "grep"):
+        idx = 1
+        while idx < len(parts) and parts[idx].startswith("-"):
+            idx += 1
+        return parts[idx] if idx < len(parts) - 1 else ""
+    if len(parts) >= 4 and parts[0] == "sed":
+        match = re.search(r"/([^/]+)/p", " ".join(parts[1:-1]))
+        return match.group(1) if match else ""
+    return ""
+
+
+def _verification_markers_from_handoff(handoff_text: str) -> list[str]:
+    markers = []
+    for token in re.findall(r"\b[A-Z][A-Z0-9_]{5,}\b", str(handoff_text or "")):
+        if token in {"OSS_HANDOFF_JSON"}:
+            continue
+        if token not in markers:
+            markers.append(token)
+    return markers
 
 
 def effective_tool_kind(tool_name: str, tool_args: str, current_kind: ToolKind) -> ToolKind:
@@ -626,6 +681,8 @@ def effective_tool_kind(tool_name: str, tool_args: str, current_kind: ToolKind) 
     if current_kind != "shell":
         return current_kind
     _, command = normalize_tool_args(tool_args, tool_name)
+    if command and _append_redirection_from_shell_command(command):
+        return "write"
     if command and _shell_command_is_read_like(command):
         return "read"
     return current_kind
@@ -714,7 +771,9 @@ def _extract_completed_read_paths_from_history(messages: list) -> set:
         if msg.get("role") in ("tool", "function") or msg.get("type") in ("function_call_output", "tool_result"):
             path = pending.get(str(tool_call_id or ""))
             if path:
-                completed.add(path)
+                content = as_text(msg.get("content", msg.get("output", "")))
+                if not tool_output_indicates_failure(content):
+                    completed.add(path)
     return completed
 
 
@@ -975,11 +1034,7 @@ def build_context_pack(session: TaskSession, project_root: str) -> str:
                 search_terms.append(term)
 
     def _resolve_project_path(path: str) -> str:
-        root = os.path.abspath(project_root)
-        full = os.path.abspath(os.path.join(project_root, path))
-        if full != root and not full.startswith(root + os.sep):
-            raise PermissionError(f"path escapes project root: {path}")
-        return full
+        return _resolve_declared_read_path(path, project_root)
 
     # Process required paths
     for path in session.required_paths:
@@ -1534,7 +1589,46 @@ def select_mode(envelope: dict) -> str:
 
 
 def legacy_direct_write_modes_enabled() -> bool:
-    return os.getenv("OSS_LEGACY_DIRECT_WRITES", "0").strip().lower() in {"1", "true", "yes", "on"}
+    default = os.getenv("OSS_DIRECT_WRITE_HANDOFFS", "1")
+    return os.getenv("OSS_LEGACY_DIRECT_WRITES", default).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def build_legacy_write_demoted_report(mode: str, envelope: Optional[dict] = None) -> str:
+    """Terminal report for raw direct write handoffs when runtime write lanes are required."""
+    envelope = envelope or {}
+    if mode == "bounded_write_exact":
+        detail = "raw OSS exact-write handoffs are disabled by default."
+        safety = "No exact-content write was performed by the bridge."
+    else:
+        detail = "raw OSS write handoffs are disabled by default."
+        safety = "No bridge-owned raw write closure was accepted."
+    task_type = str(envelope.get("task_type") or "unknown").strip() or "unknown"
+    owned = ", ".join(str(path) for path in envelope.get("owned_paths", []) if str(path).strip()) or "none"
+    return (
+        "PARTIAL\n"
+        "Synthesis status: DETERMINISTIC_LEGACY_WRITE_DEMOTED\n"
+        f"Reason: {detail}\n"
+        f"Task type: {task_type}\n"
+        f"Owned paths: {owned}\n"
+        "Terminal authority: bridge_runtime\n"
+        "Rejected terminal source: raw_model_progress_or_final_text\n"
+        "Required path: use a MissionV1 A4/A5/A6 implementation mission so the runtime owns patch validation, apply, verification, rollback, and final status.\n"
+        "Confidence: HIGH\n"
+        f"Caveats: {safety}"
+    )
+
+
+def raw_write_handoff_demoted_report(handoff_text: str, legacy_enabled: Optional[bool] = None) -> str:
+    """Return a deterministic fail-closed report for raw write/implementation handoffs."""
+    if legacy_enabled is None:
+        legacy_enabled = legacy_direct_write_modes_enabled()
+    if legacy_enabled or not handoff_text:
+        return ""
+    envelope = parse_task_envelope(handoff_text)
+    mode = select_mode(envelope)
+    if mode not in ("bounded_write_exact", "bounded_write_patch"):
+        return ""
+    return build_legacy_write_demoted_report(mode, envelope)
 
 
 def should_use_direct_agent_loop(mode: str, evidence_ledger_present: bool, enabled: bool = True) -> bool:
@@ -1745,6 +1839,25 @@ def _matching_required_path(path: str, required_paths: list) -> str:
     return ""
 
 
+def _resolve_declared_read_path(path: str, base_root: str) -> str:
+    """Resolve a declared read-only path.
+
+    Relative paths are scoped to the project/root workdir. Explicit absolute paths
+    are allowed because native Codex subagents can read declared global context
+    such as installed skills. This only applies to read-only evidence floors; write
+    paths remain governed by owned-path policy.
+    """
+    if not str(path or "").strip():
+        raise PermissionError("empty read path")
+    root = os.path.realpath(os.path.abspath(base_root or os.getcwd()))
+    if os.path.isabs(path):
+        return os.path.realpath(os.path.abspath(path))
+    target = os.path.realpath(os.path.abspath(os.path.join(root, path)))
+    if target != root and not target.startswith(root + os.sep):
+        raise PermissionError(f"path escapes project root: {path}")
+    return target
+
+
 def _hash_text(text: str) -> str:
     import hashlib
     return hashlib.sha256(str(text or "").encode("utf-8", errors="replace")).hexdigest()
@@ -1791,6 +1904,8 @@ def _completed_read_evidence_from_history(messages: list) -> dict:
             path = pending.get(str(tool_call_id or ""))
             if path:
                 content = as_text(msg.get("content", msg.get("output", "")))
+                if tool_output_indicates_failure(content):
+                    continue
                 excerpt, redacted = _safe_evidence_excerpt(content)
                 evidence[path] = {
                     "path": path,
@@ -1807,9 +1922,11 @@ def _completed_read_evidence_from_history(messages: list) -> dict:
 def _default_local_read_executor(path: str, workdir: str) -> tuple:
     """Read declared local sources without depending on repo-specific shell tools."""
     try:
-        root = os.path.abspath(workdir or os.getcwd())
-        target = path if os.path.isabs(path) else os.path.abspath(os.path.join(root, path))
-        target = os.path.abspath(target)
+        project_root = os.path.realpath(os.getcwd())
+        root = os.path.realpath(os.path.abspath(workdir or project_root))
+        if not (root == project_root or root.startswith(project_root + os.sep)):
+            root = project_root
+        target = _resolve_declared_read_path(path, root)
         if not os.path.exists(target):
             return 1, f"file not found: {path}"
         if os.path.isdir(target):
@@ -1837,14 +1954,20 @@ def build_server_side_read_completion_report(
     evidence: dict,
     failures: list,
     reason: str = "pending_tool_call_not_adopted_recovered_by_bridge",
+    synthesis_status: str = "DETERMINISTIC_SERVER_SIDE_READ_COMPLETION",
 ) -> str:
     completed_paths = set(evidence.keys())
     missing = _remaining_required_paths(required_paths, completed_paths)
     status = "COMPLETE" if not missing and not failures else "PARTIAL"
-    if reason == "declared_read_floor_completed_by_bridge":
+    if reason == "declared_read_floor_completed_by_bridge" and status == "COMPLETE":
         caveat = (
             "Caveats: The bridge completed the declared read-only evidence floor "
             "server-side to avoid client continuation replay; no writes were performed."
+        )
+    elif reason == "declared_read_floor_completed_by_bridge":
+        caveat = (
+            "Caveats: The bridge attempted the declared read-only evidence floor "
+            "server-side, but one or more required sources could not be inspected."
         )
     else:
         caveat = (
@@ -1853,8 +1976,13 @@ def build_server_side_read_completion_report(
         )
     lines = [
         status,
-        "Synthesis status: DETERMINISTIC_SERVER_SIDE_READ_COMPLETION",
+        f"Synthesis status: {synthesis_status}",
         f"Reason: {reason}",
+        (
+            "Narrative status: runtime_deterministic_fallback"
+            if synthesis_status == "DETERMINISTIC_SERVER_SIDE_READ_COMPLETION"
+            else "Narrative status: runtime_report"
+        ),
         f"Parent response: {parent_response_id}",
         f"Pending response: {child_state.response_id if child_state else 'none'}",
         f"Replay count: {child_state.pending_replay_count if child_state else 0}",
@@ -1886,7 +2014,7 @@ def build_server_side_read_finalizer_prompt(
     evidence: dict,
     failures: list,
 ) -> str:
-    """Build a no-tools prompt for natural prose over canonical read evidence."""
+    """Build a no-tools prompt for narrative over canonical read evidence."""
     requested = ", ".join(required_paths or []) or "none"
     evidence_lines = []
     for path in sorted(evidence):
@@ -1901,12 +2029,11 @@ def build_server_side_read_finalizer_prompt(
         )
     failure_text = "\n".join(f"- {f}" for f in failures) if failures else "none"
     return (
-        "You are writing the final report for a read-only OSS subagent task.\n"
+        "You are writing only the narrative section for a read-only OSS subagent task.\n"
         "The bridge/runtime already gathered the evidence below. Do not call tools. "
         "Do not claim files were modified. Do not mention hidden reasoning or private scratchpads.\n\n"
-        "Write a natural, user-facing final report. Include:\n"
-        "- status: COMPLETE if all required paths were inspected and there are no failures; otherwise PARTIAL\n"
-        "- files inspected\n"
+        "The bridge/runtime owns status, files inspected, missing sources, hashes, and write safety. "
+        "Do not include those as authority fields. Write natural, user-facing prose only. Include:\n"
         "- concise findings based only on the evidence excerpts\n"
         "- confidence\n"
         "- caveats\n\n"
@@ -1918,8 +2045,186 @@ def build_server_side_read_finalizer_prompt(
     )
 
 
+READ_NARRATIVE_FORBIDDEN_AUTHORITY_PATTERNS = re.compile(
+    r"^("
+    r"complete|partial|failed|fail|pass|"
+    r"synthesis status|reason|parent response|pending response|replay count|"
+    r"evidence-gathering status|files inspected|missing required sources|"
+    r"no writes performed|evidence|canonical evidence"
+    r")\s*:"
+    r"|^(complete|partial|failed|fail|pass)\s*$"
+    r"|no writes (?:were )?performed"
+    r"|sha256\s*=",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+READ_NARRATIVE_AUTHORITY_LINE = re.compile(
+    r"^\s*(?:[-*]\s*)?(?:\*\*)?\s*("
+    r"status|synthesis status|reason|parent response|pending response|replay count|"
+    r"evidence authority|narrative authority|evidence-gathering status|"
+    r"files inspected|missing required sources|no writes performed|evidence"
+    r")\s*(?:\*\*)?\s*:",
+    re.IGNORECASE,
+)
+
+READ_NARRATIVE_EVIDENCE_NEGATION = re.compile(
+    r"\b("
+    r"cannot\s+(?:read|open|access|inspect)|"
+    r"can't\s+(?:read|open|access|inspect)|"
+    r"unable\s+to\s+(?:read|open|access|inspect)|"
+    r"no\s+(?:file\s*system|filesystem)\s+access|"
+    r"bridge\s+runtime\s+(?:is\s+)?(?:unavailable|not\s+available)|"
+    r"runtime\s+(?:is\s+)?(?:unavailable|not\s+available)|"
+    r"files\s+inspected\s*:\s*none|"
+    r"none\s+\(unable\s+to\s+open\)|"
+    r"declared\s+sources\s+cannot\s+be\s+read"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def sanitize_model_read_narrative(text: str) -> str:
+    """Strip authority-shaped lines while preserving natural model prose."""
+    kept = []
+    for raw_line in str(text or "").splitlines():
+        line = raw_line.rstrip()
+        stripped = line.strip()
+        if not stripped:
+            kept.append(line)
+            continue
+        if re.fullmatch(r"(complete|partial|failed|fail|pass)", stripped, flags=re.IGNORECASE):
+            continue
+        if READ_NARRATIVE_AUTHORITY_LINE.search(stripped):
+            continue
+        if re.search(r"\bsha256\s*=", stripped, flags=re.IGNORECASE):
+            continue
+        if re.search(r"\bno\s+(?:files?\s+)?(?:writes?|write operations|modifications|files?\s+were\s+(?:created|modified|changed))\b", stripped, flags=re.IGNORECASE):
+            continue
+        if re.search(r"\b(?:no|zero)\s+write\s+operations\b", stripped, flags=re.IGNORECASE):
+            continue
+        if re.search(r"\bno\s+files?\s+were\b", stripped, flags=re.IGNORECASE):
+            continue
+        if re.search(r"\b(?:written|modified|created|executed)\s+during\s+this\s+task\b", stripped, flags=re.IGNORECASE):
+            continue
+        kept.append(line)
+    cleaned = "\n".join(kept).strip()
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned
+
+
+def _model_read_narrative_required_fields(handoff_text: str) -> list[str]:
+    runtime_owned = {
+        "status",
+        "files inspected",
+        "files gathered",
+        "missing required sources",
+        "commands run",
+        "commands used",
+        "command used",
+        "evidence",
+        "hashes",
+        "sha256",
+        "no writes performed",
+    }
+    fields = []
+    for field in extract_required_deliverables(handoff_text):
+        for part in str(field or "").split(","):
+            label = part.strip()
+            normalized = label.lower()
+            if normalized and normalized not in runtime_owned:
+                fields.append(label)
+    for default in ("findings", "confidence", "caveats"):
+        if not any(str(field).strip().lower() == default for field in fields):
+            fields.append(default)
+    return fields
+
+
+def validate_model_read_narrative(text: str, required_fields: list) -> tuple:
+    """Validate model prose without letting it declare runtime-owned facts."""
+    stripped = sanitize_model_read_narrative(text)
+    if len(stripped) < 50:
+        return False, ["report_too_short"]
+    if is_intent_or_status(stripped):
+        return False, ["intent_or_status_detected"]
+    if READ_NARRATIVE_FORBIDDEN_AUTHORITY_PATTERNS.search(stripped):
+        return False, ["runtime_authority_field_detected"]
+    if READ_NARRATIVE_EVIDENCE_NEGATION.search(stripped):
+        return False, ["runtime_evidence_negated"]
+    lowered = stripped.lower()
+
+    def has_narrative_field(field: str) -> bool:
+        normalized = str(field or "").strip().lower()
+        if not normalized:
+            return True
+        if normalized in lowered:
+            return True
+        if normalized == "findings":
+            return any(token in lowered for token in (
+                "summary", "summar", "observ", "indicat", "shows", "showed",
+                "contains", "describes", "covers", "read", "inspected",
+            ))
+        if normalized == "caveats":
+            return any(token in lowered for token in (
+                "caveat", "limit", "limited", "scope", "scoped", "only",
+                "truncated", "not", "however",
+            ))
+        if normalized == "confidence":
+            return any(token in lowered for token in ("confidence", "confident", "high", "medium", "low"))
+        return False
+
+    missing = [f for f in required_fields if not has_narrative_field(f)]
+    return len(missing) == 0, missing
+
+
+def build_model_authored_server_side_read_completion_report(
+    *,
+    parent_response_id: str,
+    child_state: Optional[StoredResponse],
+    required_paths: list,
+    evidence: dict,
+    failures: list,
+    reason: str,
+    narrative: str,
+) -> str:
+    completed_paths = set(evidence.keys())
+    missing = _remaining_required_paths(required_paths, completed_paths)
+    status = "COMPLETE" if not missing and not failures else "PARTIAL"
+    lines = [
+        status,
+        "Synthesis status: MODEL_AUTHORED_SERVER_SIDE_READ_COMPLETION",
+        f"Reason: {reason}",
+        "Evidence authority: bridge_runtime",
+        "Narrative authority: model_finalizer",
+        f"Parent response: {parent_response_id}",
+        f"Pending response: {child_state.response_id if child_state else 'none'}",
+        f"Replay count: {child_state.pending_replay_count if child_state else 0}",
+        "Evidence-gathering status: PASS" if status == "COMPLETE" else "Evidence-gathering status: PARTIAL",
+        f"Files inspected: {', '.join(sorted(completed_paths)) if completed_paths else 'none'}",
+        f"Missing required sources: {', '.join(missing) if missing else 'none'}",
+        "No writes performed: true",
+        "Evidence:",
+    ]
+    for path in sorted(evidence):
+        item = evidence[path]
+        lines.append(
+            f"- {path}: source={item.get('source')}, chars={item.get('output_chars')}, "
+            f"sha256={item.get('output_sha256')}"
+        )
+    if failures:
+        lines.append("Failures:")
+        lines.extend(f"- {failure}" for failure in failures)
+    lines.extend([
+        "",
+        "Model-authored narrative:",
+        str(narrative or "").strip(),
+    ])
+    return "\n".join(lines)
+
+
 def try_model_authored_server_side_read_report(
     *,
+    parent_response_id: str = "none",
+    child_state: Optional[StoredResponse] = None,
     handoff_text: str,
     required_paths: list,
     evidence: dict,
@@ -1930,11 +2235,9 @@ def try_model_authored_server_side_read_report(
     log_fn=None,
 ) -> str:
     """Return natural model-authored read report when a bounded finalizer succeeds."""
-    if failures or not callable(finalizer_call):
+    if not callable(finalizer_call):
         return ""
-    required_fields = extract_required_deliverables(handoff_text)
-    if not required_fields:
-        required_fields = ["files inspected", "confidence", "caveats"]
+    required_fields = _model_read_narrative_required_fields(handoff_text)
     prompt = build_server_side_read_finalizer_prompt(
         handoff_text=handoff_text,
         required_paths=required_paths,
@@ -1947,25 +2250,23 @@ def try_model_authored_server_side_read_report(
         if log_fn:
             log_fn("server_side_read_model_finalizer_failed", error=str(exc))
         return ""
-    valid, missing = validate_report(text, required_fields)
+    valid, missing = validate_model_read_narrative(text, required_fields)
     if not valid:
         if log_fn:
             log_fn("server_side_read_model_finalizer_invalid", missing=missing, text_len=len(text))
         return ""
-    completed = set(evidence.keys())
-    missing_paths = _remaining_required_paths(required_paths, completed)
-    audit = (
-        "\n\nBridge evidence audit:\n"
-        "Synthesis status: MODEL_AUTHORED_SERVER_SIDE_READ_COMPLETION\n"
-        f"Reason: {reason}\n"
-        "Evidence-gathering status: PASS\n"
-        f"Files inspected: {', '.join(sorted(completed)) if completed else 'none'}\n"
-        f"Missing required sources: {', '.join(missing_paths) if missing_paths else 'none'}\n"
-        "No writes performed: true"
-    )
+    cleaned_text = sanitize_model_read_narrative(text)
     if log_fn:
-        log_fn("server_side_read_model_finalizer_ok", text_len=len(text))
-    return text + audit
+        log_fn("server_side_read_model_finalizer_ok", text_len=len(cleaned_text))
+    return build_model_authored_server_side_read_completion_report(
+        parent_response_id=parent_response_id,
+        child_state=child_state,
+        required_paths=required_paths,
+        evidence=evidence,
+        failures=failures,
+        reason=reason,
+        narrative=cleaned_text,
+    )
 
 
 def _execute_missing_declared_reads(
@@ -2022,6 +2323,8 @@ def complete_declared_reads_from_bridge(
         workdir=workdir,
     )
     model_report = try_model_authored_server_side_read_report(
+        parent_response_id=parent_response_id,
+        child_state=None,
         handoff_text=handoff_text,
         required_paths=required_paths,
         evidence=evidence,
@@ -2033,6 +2336,34 @@ def complete_declared_reads_from_bridge(
     )
     if model_report:
         return model_report
+    if reason == "declared_read_floor_completed_by_bridge":
+        completed_paths = set(evidence.keys())
+        missing = _remaining_required_paths(required_paths, completed_paths)
+        if missing or failures:
+            return build_server_side_read_completion_report(
+                parent_response_id=parent_response_id,
+                child_state=None,
+                required_paths=required_paths,
+                evidence=evidence,
+                failures=failures,
+                reason=reason,
+                synthesis_status="RUNTIME_SERVER_SIDE_READ_INCOMPLETE",
+            )
+        if log_fn:
+            log_fn(
+                "declared_read_floor_model_report_unavailable",
+                evidence_count=len(evidence),
+                failure_count=len(failures),
+            )
+        return build_server_side_read_completion_report(
+            parent_response_id=parent_response_id,
+            child_state=None,
+            required_paths=required_paths,
+            evidence=evidence,
+            failures=failures,
+            reason=reason,
+            synthesis_status="DETERMINISTIC_SERVER_SIDE_READ_COMPLETION",
+        )
     return build_server_side_read_completion_report(
         parent_response_id=parent_response_id,
         child_state=None,
@@ -2058,6 +2389,24 @@ def complete_pending_reads_from_bridge(
     required_paths = required_paths_from_envelope(envelope, handoff_text)
     if not required_paths:
         return ""
+    if envelope.get("write_allowed") or envelope.get("owned_paths"):
+        if log_fn:
+            log_fn("server_side_read_fallback_skipped", reason="write_handoff")
+        return ""
+    task_type = str(envelope.get("task_type") or "").strip().lower()
+    if task_type in {"bounded_write", "bounded_test_write", "implementation", "docs_support"}:
+        if log_fn:
+            log_fn("server_side_read_fallback_skipped", reason="write_task_type")
+        return ""
+    for step in envelope.get("verification_steps", []):
+        lowered = str(step or "").lower()
+        if any(token in lowered for token in (
+            "test", "lint", "typecheck", "write", "edit", "append", "patch",
+            "modify", "changed", "after the edit",
+        )):
+            if log_fn:
+                log_fn("server_side_read_fallback_skipped", reason="non_read_verification")
+            return ""
     read_executor = executor or _default_local_read_executor
     evidence = _completed_read_evidence_from_history(child_state.messages)
     failures = []
@@ -2101,8 +2450,16 @@ def complete_pending_reads_from_bridge(
         read_executor=read_executor,
         workdir=workdir,
     )
+    remaining_after_reads = _remaining_required_paths(required_paths, set(evidence.keys()))
+    if not remaining_after_reads:
+        failures = [
+            failure for failure in failures
+            if "pending read path is outside required sources" not in str(failure)
+        ]
 
     model_report = try_model_authored_server_side_read_report(
+        parent_response_id=parent_response_id,
+        child_state=child_state,
         handoff_text=handoff_text,
         required_paths=required_paths,
         evidence=evidence,
@@ -2122,6 +2479,332 @@ def complete_pending_reads_from_bridge(
         evidence=evidence,
         failures=failures,
         reason="pending_tool_call_not_adopted_recovered_by_bridge",
+    )
+
+
+def execute_pending_owned_write_from_bridge(
+    *,
+    parent_response_id: str,
+    child_state: StoredResponse,
+    handoff_text: str,
+    project_root: str,
+    log_fn=None,
+) -> str:
+    """Execute a pending simple owned-path write when Codex fails to adopt it."""
+    envelope = parse_task_envelope(handoff_text)
+    if select_mode(envelope) not in ("bounded_write_exact", "bounded_write_patch"):
+        return ""
+    if not envelope.get("owned_paths"):
+        return ""
+    pending_items = _pending_tool_call_outputs_from_state(child_state)
+    if len(pending_items) != 1:
+        return ""
+    item = pending_items[0]
+    _, command = normalize_tool_args(item.get("arguments", "{}"), item.get("name", ""))
+    append_op = _append_redirection_from_shell_command(command or "")
+    if not append_op:
+        return ""
+    target_path, content = append_op
+    if not _path_is_within_owned_paths(target_path, envelope.get("owned_paths", []), project_root):
+        return build_patch_contract_report(
+            envelope,
+            [],
+            "FAIL",
+            f"write target {target_path} is outside the declared owned paths",
+        )
+    full_target = os.path.abspath(os.path.join(project_root, target_path))
+    if not _path_is_within_project(full_target, project_root):
+        return build_patch_contract_report(
+            envelope,
+            [],
+            "FAIL",
+            f"write target {target_path} is outside the project root",
+        )
+    os.makedirs(os.path.dirname(full_target), exist_ok=True)
+    before = ""
+    if os.path.exists(full_target):
+        try:
+            with open(full_target, "r", encoding="utf-8", errors="replace") as handle:
+                before = handle.read()
+        except Exception:
+            before = ""
+    already_applied = content and content in before
+    try:
+        if not already_applied:
+            with open(full_target, "a", encoding="utf-8") as handle:
+                handle.write(content)
+    except Exception as exc:
+        return build_patch_contract_report(
+            envelope,
+            [],
+            "FAIL",
+            f"server-side owned write failed: {exc}",
+        )
+    try:
+        with open(full_target, "r", encoding="utf-8", errors="replace") as handle:
+            after = handle.read()
+    except Exception:
+        after = ""
+    write_verified = bool(content and content in after)
+    changed_paths = collect_owned_path_changes(envelope.get("owned_paths", []), project_root)
+    if write_verified and _repo_relative_path(target_path, project_root) not in changed_paths:
+        changed_paths.append(_repo_relative_path(target_path, project_root))
+    verification_output = (
+        f"server-side append {'already present' if already_applied else 'wrote'} {target_path}; "
+        "pending consumer tool call was not adopted"
+    )
+    if log_fn:
+        log_fn(
+            "server_side_owned_write_complete",
+            parent_response_id=parent_response_id,
+            pending_response_id=child_state.response_id,
+            target_path=target_path,
+            already_applied=already_applied,
+        )
+    return build_patch_contract_report(
+        envelope,
+        changed_paths,
+        "PASS" if write_verified else "PARTIAL",
+        "owned path write completed server-side after pending tool adoption failure"
+        if not already_applied else
+        "owned path write was already present during idempotent server-side recovery",
+        verification_seen=True,
+        verification_output=verification_output,
+    )
+
+
+def execute_pending_owned_verification_from_bridge(
+    *,
+    parent_response_id: str,
+    child_state: StoredResponse,
+    handoff_text: str,
+    project_root: str,
+    log_fn=None,
+) -> str:
+    """Execute a pending owned-path read/search verification after an owned write."""
+    envelope = parse_task_envelope(handoff_text)
+    if select_mode(envelope) not in ("bounded_write_exact", "bounded_write_patch"):
+        return ""
+    pending_items = _pending_tool_call_outputs_from_state(child_state)
+    if len(pending_items) != 1:
+        return ""
+    item = pending_items[0]
+    path, command = normalize_tool_args(item.get("arguments", "{}"), item.get("name", ""))
+    if not command or not _shell_command_is_read_like(command):
+        return ""
+    if not path:
+        return ""
+    allowed_paths = list(envelope.get("owned_paths") or []) + list(envelope.get("read_only_paths") or [])
+    if not any(_path_satisfies_required_path(path, allowed) for allowed in allowed_paths):
+        return ""
+    if not _path_is_within_project(path, project_root):
+        return ""
+    full_target = os.path.abspath(os.path.join(project_root, path))
+    if not os.path.exists(full_target):
+        return build_patch_contract_report(
+            envelope,
+            [],
+            "FAIL",
+            f"verification target {path} does not exist",
+            verification_seen=True,
+            verification_output=f"server-side verification could not read {path}",
+        )
+    try:
+        with open(full_target, "r", encoding="utf-8", errors="replace") as handle:
+            content = handle.read()
+    except Exception as exc:
+        return build_patch_contract_report(
+            envelope,
+            [],
+            "FAIL",
+            f"server-side verification read failed: {exc}",
+            verification_seen=True,
+            verification_output=f"server-side verification could not read {path}",
+        )
+    markers = []
+    pattern = _search_pattern_from_shell_command(command)
+    if pattern:
+        markers.append(pattern)
+    markers.extend(marker for marker in _verification_markers_from_handoff(handoff_text) if marker not in markers)
+    verified = any(marker in content for marker in markers) if markers else bool(content)
+    completed_marker = ""
+    if not verified:
+        marker_written, completed_marker = _complete_declared_marker_write_if_safe(
+            envelope=envelope,
+            handoff_text=handoff_text,
+            path=path,
+            markers=markers,
+            project_root=project_root,
+        )
+        if marker_written:
+            try:
+                with open(full_target, "r", encoding="utf-8", errors="replace") as handle:
+                    content = handle.read()
+            except Exception:
+                content = ""
+            verified = any(marker in content for marker in markers) if markers else bool(content)
+    changed_paths = collect_owned_path_changes(envelope.get("owned_paths", []), project_root)
+    rel = _repo_relative_path(path, project_root)
+    if verified and any(_path_satisfies_required_path(path, owned) for owned in envelope.get("owned_paths", [])):
+        if rel not in changed_paths:
+            changed_paths.append(rel)
+    if log_fn:
+        log_fn(
+            "server_side_owned_verification_complete",
+            parent_response_id=parent_response_id,
+            pending_response_id=child_state.response_id,
+            target_path=path,
+            verified=verified,
+            completed_marker=completed_marker,
+        )
+    return build_patch_contract_report(
+        envelope,
+        changed_paths,
+        "PASS" if verified else "FAIL",
+        "owned path verification completed server-side after pending tool adoption failure"
+        if verified and not completed_marker else
+        "declared owned marker write completed server-side after model skipped the write"
+        if verified and completed_marker else
+        "owned path verification failed server-side after pending tool adoption failure",
+        verification_seen=True,
+        verification_output=(
+            f"server-side verification {'found' if verified else 'did not find'} "
+            f"{', '.join(markers) if markers else 'readable content'} in {path}; "
+            "pending consumer tool call was not adopted"
+        ),
+    )
+
+
+def execute_pending_owned_shell_from_bridge(
+    *,
+    parent_response_id: str,
+    child_state: StoredResponse,
+    handoff_text: str,
+    project_root: str,
+    log_fn=None,
+) -> str:
+    """Execute a missed bounded implementation shell command under owned-path accounting."""
+    envelope = parse_task_envelope(handoff_text)
+    if select_mode(envelope) not in ("bounded_write_exact", "bounded_write_patch"):
+        return ""
+    owned_paths = list(envelope.get("owned_paths") or [])
+    if not owned_paths:
+        return ""
+    pending_items = _pending_tool_call_outputs_from_state(child_state)
+    if len(pending_items) != 1:
+        return ""
+    item = pending_items[0]
+    path, command = normalize_tool_args(item.get("arguments", "{}"), item.get("name", ""))
+    if not command:
+        return ""
+    if _shell_command_is_read_like(command):
+        return ""
+    if _append_redirection_from_shell_command(command):
+        return ""
+    args = _tool_args_dict(item.get("arguments", "{}"))
+    workdir = _command_workdir(args, project_root)
+    if not _path_is_within_project(workdir, project_root):
+        return build_patch_contract_report(
+            envelope,
+            [],
+            "FAIL",
+            f"tool workdir {workdir} is outside the project root",
+        )
+    if path and not _path_is_within_project(path, project_root):
+        return build_patch_contract_report(
+            envelope,
+            [],
+            "FAIL",
+            f"tool target {path} is outside the project root",
+        )
+
+    markers = _verification_markers_from_handoff(handoff_text)
+    before = _owned_path_snapshot(owned_paths, project_root)
+    marker_already_present = _markers_present_in_paths(
+        markers,
+        owned_paths + list(envelope.get("read_only_paths") or []),
+        project_root,
+    )
+    timeout_s = int(os.getenv("OSS_SERVER_SIDE_TOOL_TIMEOUT_SECONDS", "30"))
+    run_kwargs = {
+        "shell": True,
+        "cwd": workdir,
+        "capture_output": True,
+        "text": True,
+        "timeout": timeout_s,
+    }
+    shell_path = os.getenv("SHELL")
+    if shell_path:
+        run_kwargs["executable"] = shell_path
+    try:
+        proc = subprocess.run(command, **run_kwargs)
+    except subprocess.TimeoutExpired:
+        return build_patch_contract_report(
+            envelope,
+            [],
+            "FAIL",
+            f"server-side bounded tool timed out after {timeout_s}s",
+        )
+    except Exception as exc:
+        return build_patch_contract_report(
+            envelope,
+            [],
+            "FAIL",
+            f"server-side bounded tool failed: {exc}",
+        )
+
+    after = _owned_path_snapshot(owned_paths, project_root)
+    changed_paths = collect_owned_path_changes(owned_paths, project_root)
+    for changed in _changed_owned_paths_from_snapshots(before, after):
+        if changed not in changed_paths:
+            changed_paths.append(changed)
+    marker_present = _markers_present_in_paths(
+        markers,
+        owned_paths + list(envelope.get("read_only_paths") or []),
+        project_root,
+    )
+    verification_required = verification_contract_requested(envelope) or bool(markers)
+    verification_seen = marker_present if verification_required else bool(changed_paths)
+    stderr = (proc.stderr or "").strip()
+    stdout = (proc.stdout or "").strip()
+    output_excerpt = (stdout or stderr or "no output").replace("\n", " | ")[:300]
+    if proc.returncode != 0:
+        status = "PARTIAL" if changed_paths else "FAIL"
+        reason = (
+            f"server-side bounded tool exited {proc.returncode} after pending tool adoption failure"
+        )
+    elif changed_paths and (verification_seen or not verification_required):
+        status = "PASS"
+        reason = "owned path changes completed server-side after pending tool adoption failure"
+    elif marker_already_present and marker_present:
+        status = "PASS"
+        reason = "owned path verification marker was already present during idempotent server-side recovery"
+    elif changed_paths:
+        status = "PARTIAL"
+        reason = "owned path changes were observed, but verification was not observed server-side"
+    else:
+        status = "FAIL"
+        reason = "server-side bounded tool produced no declared owned-path changes"
+
+    if log_fn:
+        log_fn(
+            "server_side_owned_shell_complete",
+            parent_response_id=parent_response_id,
+            pending_response_id=child_state.response_id,
+            exit_code=proc.returncode,
+            changed_paths=changed_paths,
+            verification_seen=verification_seen,
+        )
+    return build_patch_contract_report(
+        envelope,
+        changed_paths,
+        status,
+        reason,
+        verification_seen=bool(verification_seen),
+        verification_output=(
+            f"server-side bounded shell exit_code={proc.returncode}; output={output_excerpt}; "
+            "pending consumer tool call was not adopted"
+        ),
     )
 
 
@@ -2187,9 +2870,17 @@ def declared_read_floor_only(envelope: dict) -> bool:
     """Return true for simple read-only source floors the bridge can safely complete."""
     if not envelope.get("read_only_paths"):
         return False
+    if envelope.get("write_allowed") or envelope.get("owned_paths"):
+        return False
+    task_type = str(envelope.get("task_type") or "").strip().lower()
+    if task_type in {"bounded_write", "bounded_test_write", "implementation", "docs_support"}:
+        return False
     for step in envelope.get("verification_steps", []):
         lowered = str(step or "").lower()
-        if any(token in lowered for token in ("grep", "search", "find ", "locate", "test", "lint", "typecheck")):
+        if any(token in lowered for token in (
+            "grep", "search", "find ", "locate", "test", "lint", "typecheck",
+            "write", "edit", "append", "patch", "modify", "changed", "after the edit",
+        )):
             return False
     return True
 
@@ -2255,6 +2946,11 @@ def pretool_block_repair_instruction(output_text: str) -> str:
         "Your previous command was blocked by repo policy. Retry once using the suggested RTK replacement from the tool output. "
         "Do not treat the blocked command as the final answer."
     )
+
+
+def should_retry_pretool_block(output_text: str, exit_code: int, turn: int, max_exchanges: int) -> bool:
+    """Return true when a repo policy block should get one normal repair turn."""
+    return bool(exit_code != 0 and turn < max_exchanges and pretool_block_repair_instruction(output_text))
 
 
 def validate_report_output(text: str, mode: str, envelope: dict,
@@ -2919,6 +3615,134 @@ def _repo_relative_path(path: str, project_root: str) -> str:
         except ValueError:
             return p
     return p
+
+
+def _owned_path_snapshot(owned_paths: list, project_root: str) -> dict:
+    """Hash files under owned paths, including ignored/untracked files."""
+    snapshot: dict[str, str] = {}
+    root = os.path.realpath(os.path.abspath(project_root))
+    for owned in owned_paths or []:
+        if not _path_is_within_project(owned, root):
+            continue
+        full = os.path.realpath(os.path.abspath(owned if os.path.isabs(owned) else os.path.join(root, owned)))
+        if not (full == root or full.startswith(root + os.sep)):
+            continue
+        if not os.path.exists(full):
+            rel = _repo_relative_path(full, root)
+            snapshot[rel] = "<missing>"
+            continue
+        paths = []
+        if os.path.isfile(full):
+            paths = [full]
+        elif os.path.isdir(full):
+            for dirpath, dirnames, filenames in os.walk(full):
+                dirnames[:] = [d for d in dirnames if d not in {".git", ".codex-oss", "node_modules", "__pycache__"}]
+                for filename in filenames:
+                    paths.append(os.path.join(dirpath, filename))
+        for path in paths:
+            rel = _repo_relative_path(path, root)
+            try:
+                with open(path, "rb") as handle:
+                    snapshot[rel] = hashlib.sha256(handle.read()).hexdigest()
+            except Exception:
+                snapshot[rel] = "<unreadable>"
+    return snapshot
+
+
+def _changed_owned_paths_from_snapshots(before: dict, after: dict) -> list[str]:
+    changed = []
+    for path in sorted(set(before) | set(after)):
+        if before.get(path) != after.get(path) and path not in changed:
+            changed.append(path)
+    return changed
+
+
+def _markers_present_in_paths(markers: list[str], paths: list[str], project_root: str) -> bool:
+    if not markers:
+        return False
+    root = os.path.realpath(os.path.abspath(project_root))
+    for path in paths or []:
+        if not _path_is_within_project(path, root):
+            continue
+        full = os.path.abspath(path if os.path.isabs(path) else os.path.join(root, path))
+        if not os.path.exists(full):
+            continue
+        candidates = []
+        if os.path.isfile(full):
+            candidates = [full]
+        elif os.path.isdir(full):
+            for dirpath, dirnames, filenames in os.walk(full):
+                dirnames[:] = [d for d in dirnames if d not in {".git", ".codex-oss", "node_modules", "__pycache__"}]
+                candidates.extend(os.path.join(dirpath, filename) for filename in filenames)
+        for candidate in candidates:
+            try:
+                with open(candidate, "r", encoding="utf-8", errors="replace") as handle:
+                    text = handle.read()
+            except Exception:
+                continue
+            if any(marker in text for marker in markers):
+                return True
+    return False
+
+
+def _declared_marker_write_allowed(envelope: dict, handoff_text: str, path: str, marker: str, project_root: str) -> bool:
+    if not marker or marker not in str(handoff_text or ""):
+        return False
+    if select_mode(envelope) not in ("bounded_write_exact", "bounded_write_patch"):
+        return False
+    if not (envelope.get("write_allowed") or envelope.get("owned_paths")):
+        return False
+    if not _path_is_within_owned_paths(path, envelope.get("owned_paths", []), project_root):
+        return False
+    lowered = " ".join([
+        str(envelope.get("goal") or ""),
+        " ".join(str(step or "") for step in envelope.get("verification_steps", [])),
+        str(handoff_text or ""),
+    ]).lower()
+    return any(word in lowered for word in (
+        "write", "add", "append", "insert", "create", "modify", "update",
+    ))
+
+
+def _complete_declared_marker_write_if_safe(
+    *,
+    envelope: dict,
+    handoff_text: str,
+    path: str,
+    markers: list[str],
+    project_root: str,
+) -> tuple[bool, str]:
+    if not path or not markers:
+        return (False, "")
+    if not _path_is_within_project(path, project_root):
+        return (False, "")
+    target = os.path.abspath(path if os.path.isabs(path) else os.path.join(project_root, path))
+    if not _path_is_within_project(target, project_root):
+        return (False, "")
+    marker = next(
+        (
+            candidate for candidate in markers
+            if _declared_marker_write_allowed(envelope, handoff_text, path, candidate, project_root)
+        ),
+        "",
+    )
+    if not marker:
+        return (False, "")
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    try:
+        before = ""
+        if os.path.exists(target):
+            with open(target, "r", encoding="utf-8", errors="replace") as handle:
+                before = handle.read()
+        if marker not in before:
+            sep = "" if not before or before.endswith("\n") else "\n"
+            with open(target, "a", encoding="utf-8") as handle:
+                handle.write(f"{sep}{marker}\n")
+        with open(target, "r", encoding="utf-8", errors="replace") as handle:
+            after = handle.read()
+    except Exception:
+        return (False, "")
+    return (marker in after, marker)
 
 
 def _path_is_within_project(path: str, project_root: str) -> bool:
@@ -3779,6 +4603,23 @@ class Handler(BaseHTTPRequestHandler):
     def _send_error_obj(self, status: int, message: str, typ: str = "invalid_request_error") -> None:
         self._send_json(status, {"error": {"message": message, "type": typ, "code": typ}})
 
+    def _emit_raw_write_demotion_if_needed(
+        self,
+        body: JSON,
+        base_messages: List[JSON],
+        model_alias: str,
+    ) -> bool:
+        """Terminalize deprecated raw write handoffs before raw model prose can close them."""
+        handoff_text = _extract_handoff_text(base_messages)
+        report_text = raw_write_handoff_demoted_report(handoff_text)
+        if not report_text:
+            return False
+        APP.log("legacy_direct_write_terminal_guard", mode=select_mode(parse_task_envelope(handoff_text)))
+        emitter = ResponseEmitter(self, new_id("resp"), model_alias, bool(body.get("stream")))
+        emitter.emit_text_message(report_text)
+        emitter.complete()
+        return True
+
     def do_GET(self) -> None:  # noqa: N802
         if not APP.auth_ok(self.headers.get("Authorization", "")):
             self._send_error_obj(401, "Unauthorized", "unauthorized")
@@ -3887,6 +4728,33 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
             payload, base_messages, model_alias, model_upstream, reverse_name_map = APP.prepare_chat_payload(body)
+            if self._emit_raw_write_demotion_if_needed(body, base_messages, model_alias):
+                return
+            handoff_text = _extract_handoff_text(base_messages)
+            envelope = parse_task_envelope(handoff_text) if handoff_text else {}
+            handoff_mode = select_mode(envelope) if handoff_text else ""
+            if (
+                os.getenv("OSS_FRESH_SERVER_SIDE_READ_FLOOR", "1") != "0"
+                and handoff_mode in ("context_pack", "context_pack_report")
+                and declared_read_floor_only(envelope)
+                and not _has_evidence_ledger(body)
+            ):
+                report_text = complete_declared_reads_from_bridge(
+                    parent_response_id=new_id("resp"),
+                    messages=base_messages,
+                    handoff_text=handoff_text,
+                    project_root=os.getcwd(),
+                    finalizer_call=self._server_side_read_finalizer_call(model_alias),
+                    finalizer_timeout_seconds=float(os.getenv("OSS_SERVER_SIDE_READ_FINALIZER_TIMEOUT_SECONDS", "30")),
+                    reason="declared_read_floor_completed_by_bridge",
+                    log_fn=APP.log,
+                )
+                if report_text:
+                    APP.log("fresh_server_side_read_floor_complete", mode=handoff_mode)
+                    emitter = ResponseEmitter(self, new_id("resp"), model_alias, bool(body.get("stream")))
+                    emitter.emit_text_message(report_text)
+                    emitter.complete()
+                    return
 
             # ── v8: Transactional continuation path ──
             request_kind = classify_request_kind(body)
@@ -4079,7 +4947,7 @@ class Handler(BaseHTTPRequestHandler):
                 handoff_text=handoff_text,
                 project_root=os.getcwd(),
                 finalizer_call=self._server_side_read_finalizer_call(model_alias),
-                finalizer_timeout_seconds=float(os.getenv("OSS_SERVER_SIDE_READ_FINALIZER_TIMEOUT_SECONDS", "12")),
+                finalizer_timeout_seconds=float(os.getenv("OSS_SERVER_SIDE_READ_FINALIZER_TIMEOUT_SECONDS", "30")),
                 reason="declared_read_floor_completed_by_bridge",
                 log_fn=APP.log,
             )
@@ -4105,14 +4973,35 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 if replay_count > replay_limit:
                     report_text = ""
+                    report_text = execute_pending_owned_write_from_bridge(
+                        parent_response_id=str(prev_id),
+                        child_state=pending_child,
+                        handoff_text=handoff_text,
+                        project_root=os.getcwd(),
+                        log_fn=APP.log,
+                    )
+                    report_text = report_text or execute_pending_owned_shell_from_bridge(
+                        parent_response_id=str(prev_id),
+                        child_state=pending_child,
+                        handoff_text=handoff_text,
+                        project_root=os.getcwd(),
+                        log_fn=APP.log,
+                    )
+                    report_text = report_text or execute_pending_owned_verification_from_bridge(
+                        parent_response_id=str(prev_id),
+                        child_state=pending_child,
+                        handoff_text=handoff_text,
+                        project_root=os.getcwd(),
+                        log_fn=APP.log,
+                    )
                     if os.getenv("OSS_SERVER_SIDE_READ_FALLBACK", "1") != "0":
-                        report_text = complete_pending_reads_from_bridge(
+                        report_text = report_text or complete_pending_reads_from_bridge(
                             parent_response_id=str(prev_id),
                             child_state=pending_child,
                             handoff_text=handoff_text,
                             project_root=os.getcwd(),
                             finalizer_call=self._server_side_read_finalizer_call(model_alias),
-                            finalizer_timeout_seconds=float(os.getenv("OSS_SERVER_SIDE_READ_FINALIZER_TIMEOUT_SECONDS", "8")),
+                            finalizer_timeout_seconds=float(os.getenv("OSS_SERVER_SIDE_READ_FINALIZER_TIMEOUT_SECONDS", "30")),
                             log_fn=APP.log,
                         )
                     if not report_text:
@@ -4135,16 +5024,22 @@ class Handler(BaseHTTPRequestHandler):
         if mode == "bounded_write_patch":
             if not legacy_direct_write_modes_enabled():
                 emitter = ResponseEmitter(self, new_id("resp"), model_alias, bool(body.get("stream")))
-                emitter.emit_text_message(
-                    "PARTIAL\n"
-                    "Synthesis status: DETERMINISTIC_LEGACY_WRITE_DEMOTED\n"
-                    "Reason: raw OSS write handoffs are disabled by default.\n"
-                    "Required path: use a MissionV1 A4/A5/A6 implementation mission so the runtime owns patch validation, apply, verification, rollback, and final status.\n"
-                    "Confidence: HIGH\n"
-                    "Caveats: No bridge-owned raw write closure was accepted."
-                )
+                emitter.emit_text_message(build_legacy_write_demoted_report(mode))
                 emitter.complete()
                 APP.log("legacy_direct_write_demoted", mode=mode)
+                return
+            repair_instruction = pretool_block_repair_instruction(tool_output_text)
+            if repair_instruction and exit_code != 0 and prev_state and turn < max_exchanges:
+                input_items = list(body.get("input", []))
+                input_items.insert(0, {"role": "system", "content": repair_instruction})
+                body["input"] = input_items
+                APP.log(
+                    "bounded_patch_pretool_block_repair_continuation",
+                    tool_kind=tool_kind,
+                    turn=turn,
+                    max_exchanges=max_exchanges,
+                )
+                self._handle_fresh_turn(body)
                 return
             from codex_oss.legacy_modes import handle_bounded_patch_continuation
             patch_decision = handle_bounded_patch_continuation(
@@ -4258,14 +5153,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not legacy_direct_write_modes_enabled():
                     context_pack_attempted = True
                     emitter = ResponseEmitter(self, new_id("resp"), model_alias, bool(body.get("stream")))
-                    emitter.emit_text_message(
-                        "PARTIAL\n"
-                        "Synthesis status: DETERMINISTIC_LEGACY_WRITE_DEMOTED\n"
-                        "Reason: raw OSS exact-write handoffs are disabled by default.\n"
-                        "Required path: use a MissionV1 A4/A5/A6 implementation mission so the runtime owns writes and verification.\n"
-                        "Confidence: HIGH\n"
-                        "Caveats: No exact-content write was performed by the bridge."
-                    )
+                    emitter.emit_text_message(build_legacy_write_demoted_report(mode))
                     emitter.complete()
                     APP.log("legacy_direct_write_demoted", mode=mode)
                     return
@@ -4557,21 +5445,75 @@ class Handler(BaseHTTPRequestHandler):
     def _handle_fresh_turn(self, body: JSON) -> None:
         """Fallback for when continuation path can't handle the request."""
         payload, base_messages, model_alias, model_upstream, reverse_name_map = APP.prepare_chat_payload(body)
+        if self._emit_raw_write_demotion_if_needed(body, base_messages, model_alias):
+            return
         prev_id = str(body.get("previous_response_id") or "")
+        handoff_text = _extract_handoff_text(base_messages)
+        handoff_mode = select_mode(parse_task_envelope(handoff_text)) if handoff_text else ""
+        if handoff_mode in {"bounded_write_exact", "bounded_write_patch"} and not legacy_direct_write_modes_enabled():
+            emitter = ResponseEmitter(self, new_id("resp"), model_alias, bool(body.get("stream")))
+            emitter.emit_text_message(build_legacy_write_demoted_report(handoff_mode))
+            emitter.complete()
+            APP.log("legacy_direct_write_fresh_demoted", mode=handoff_mode)
+            return
+        envelope = parse_task_envelope(handoff_text) if handoff_text else {}
+        if (
+            os.getenv("OSS_FRESH_SERVER_SIDE_READ_FLOOR", "1") != "0"
+            and handoff_mode in ("context_pack", "context_pack_report")
+            and declared_read_floor_only(envelope)
+            and not _has_evidence_ledger(body)
+        ):
+            report_text = complete_declared_reads_from_bridge(
+                parent_response_id=new_id("resp"),
+                messages=base_messages,
+                handoff_text=handoff_text,
+                project_root=os.getcwd(),
+                finalizer_call=self._server_side_read_finalizer_call(model_alias),
+                finalizer_timeout_seconds=float(os.getenv("OSS_SERVER_SIDE_READ_FINALIZER_TIMEOUT_SECONDS", "30")),
+                reason="declared_read_floor_completed_by_bridge",
+                log_fn=APP.log,
+            )
+            if report_text:
+                APP.log("fresh_server_side_read_floor_complete", mode=handoff_mode)
+                emitter = ResponseEmitter(self, new_id("resp"), model_alias, bool(body.get("stream")))
+                emitter.emit_text_message(report_text)
+                emitter.complete()
+                return
         if prev_id:
             replay_limit = int(os.getenv("OSS_PENDING_REPLAY_TERMINAL_REPLAYS", "2"))
             terminal_child = APP.state.find_terminal_pending_child(prev_id, replay_limit)
             if terminal_child:
                 handoff_text = _extract_handoff_text(base_messages)
                 report_text = ""
+                report_text = execute_pending_owned_write_from_bridge(
+                    parent_response_id=prev_id,
+                    child_state=terminal_child,
+                    handoff_text=handoff_text,
+                    project_root=os.getcwd(),
+                    log_fn=APP.log,
+                )
+                report_text = report_text or execute_pending_owned_shell_from_bridge(
+                    parent_response_id=prev_id,
+                    child_state=terminal_child,
+                    handoff_text=handoff_text,
+                    project_root=os.getcwd(),
+                    log_fn=APP.log,
+                )
+                report_text = report_text or execute_pending_owned_verification_from_bridge(
+                    parent_response_id=prev_id,
+                    child_state=terminal_child,
+                    handoff_text=handoff_text,
+                    project_root=os.getcwd(),
+                    log_fn=APP.log,
+                )
                 if os.getenv("OSS_SERVER_SIDE_READ_FALLBACK", "1") != "0":
-                    report_text = complete_pending_reads_from_bridge(
+                    report_text = report_text or complete_pending_reads_from_bridge(
                         parent_response_id=prev_id,
                         child_state=terminal_child,
                         handoff_text=handoff_text,
                         project_root=os.getcwd(),
                         finalizer_call=self._server_side_read_finalizer_call(model_alias),
-                        finalizer_timeout_seconds=float(os.getenv("OSS_SERVER_SIDE_READ_FINALIZER_TIMEOUT_SECONDS", "8")),
+                        finalizer_timeout_seconds=float(os.getenv("OSS_SERVER_SIDE_READ_FINALIZER_TIMEOUT_SECONDS", "30")),
                         log_fn=APP.log,
                     )
                 if not report_text:

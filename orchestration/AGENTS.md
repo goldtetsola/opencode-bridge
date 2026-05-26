@@ -72,6 +72,8 @@ Direct OSS subagents are not guaranteed to know local command wrappers or platfo
 - Do not paste full file contents or raw tool output into the final answer; summarize and cite paths/lines.
 - The requested output format is mandatory. If the worker cannot satisfy it, it must return LOW confidence with caveats instead of dumping evidence.
 - For A2/A3 read-only investigation, prefer MissionV1 through the bridge runtime over broad shell access.
+- For higher-assurance implementation, prefer `oss_deepseek_implementer` with MissionV1 A4/A5; runtime owns patch construction, apply, verification, rollback, and final status.
+- `oss_deepseek_pro` may perform bounded low-risk implementation when the handoff declares owned paths and verification. Other raw workers remain read-only support/scout lanes.
 
 ---
 
@@ -102,7 +104,11 @@ Write changelog, summarize changes, test inventory, format code.
 
 **Bounded implementation**
 Single file/module change. Tests exist for target code. Requirements clear.
-→ Delegate to `oss_deepseek_pro` (workspace-write, fork_turns: "none", handoff required)
+→ Delegate to `oss_deepseek_implementer` (runtime-controlled MissionV1 A4/A5, fork_turns: "none", handoff required)
+
+**Raw implementation research**
+Use only for controlled baselines or patch-intent drafting.
+→ Delegate to `oss_deepseek_pro` only as a raw/manual experimental baseline. Raw direct writes are blocked by default.
 
 **Ambiguous scope**
 → Delegate to `oss_kimi_investigator` first (runtime-controlled scout). Then based on findings, delegate or escalate.
@@ -111,6 +117,7 @@ Single file/module change. Tests exist for target code. Requirements clear.
 
 - Verify confidence marker (HIGH/MEDIUM/LOW). Reject results without one.
 - Verify files inspected and changed are listed.
+- For implementation, verify the runtime artifact owns patch/apply/verify/status before accepting the report.
 - LOW confidence → escalate to GPT-5.4 immediately.
 - MEDIUM + correctness-critical → escalate.
 - Never accept OSS output touching safety-critical paths.
@@ -119,7 +126,7 @@ Single file/module change. Tests exist for target code. Requirements clear.
 
 - At most 2 OSS agents active at once.
 - Kimi + Flash can run in parallel (read-only).
-- DeepSeek runs alone if writing files.
+- DeepSeek runtime implementation runs alone if applying patches.
 
 ---
 
@@ -130,7 +137,8 @@ Single file/module change. Tests exist for target code. Requirements clear.
 | `oss_kimi_investigator` | mission-a3-kimi (runtime) | Repo nav, review, scouting | read-only |
 | `oss_deepseek_investigator` | mission-a3-deepseek (runtime) | Reasoning-heavy read-only investigation | read-only |
 | `oss_flash_context` | mission-a2-flash (runtime) | Cheap context/report tasks | read-only |
-| `oss_deepseek_pro` | deepseek-v4-pro (raw experimental) | Bounded impl/debugging baseline | workspace-write |
+| `oss_deepseek_implementer` | mission-a5-deepseek (runtime) | Bounded implementation via MissionV1 A4/A5; runtime owns patch/apply/verify/status | runtime-controlled |
+| `oss_deepseek_pro` | deepseek-v4-pro (raw experimental) | Bounded low-risk implementation, debugging, and patch drafting | workspace-write |
 | `oss_kimi_rapid` | kimi-k2.6 (raw experimental) | Manual repo nav baseline | read-only |
 | `oss_flash_support` | deepseek-v4-flash (raw experimental) | Manual docs/support baseline | read-only |
 

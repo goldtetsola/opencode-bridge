@@ -152,6 +152,7 @@ Use these for normal work.
 | `oss_kimi_investigator` | `mission-a3-kimi` | General read-only investigations |
 | `oss_deepseek_investigator` | `mission-a3-deepseek` | Deeper read-only investigations |
 | `oss_flash_context` | `mission-a2-flash` | Cheap context gathering and lookups |
+| `oss_deepseek_implementer` | `mission-a5-deepseek` | Bounded implementation through MissionV1 A4/A5 |
 
 Runtime-controlled agents require a MissionV1 handoff:
 
@@ -167,7 +168,7 @@ Use `fork_turns: "none"` or the equivalent "do not fork context" option when spa
 
 ### Raw OSS Agents
 
-These are useful for experiments and low-stakes support work, but they do not get the full MissionV1 runtime control plane.
+These are useful for experiments and low-stakes support work, but they do not get the full MissionV1 runtime control plane. `oss_deepseek_pro` can perform bounded low-risk implementation when the handoff declares owned paths and verification. Use `oss_deepseek_implementer` with MissionV1 A4/A5 when you want runtime-owned patch validation, apply, verification, rollback, and final status.
 
 | Agent | Model |
 |---|---|
@@ -176,15 +177,19 @@ These are useful for experiments and low-stakes support work, but they do not ge
 | `oss_flash_support` | `ocg-deepseek-v4-flash` |
 
 For serious read-only investigations, prefer the runtime-controlled agents.
+For higher-assurance implementation, runtime owns patch construction, apply, verification, rollback, and final status. The model owns narrative, patch intent, and rationale only.
 
 Raw workers cannot prove their own routing from inside the task. Treat their files inspected, findings, and caveats as their deliverable. Treat bridge routing and live OSS inference as bridge-owned facts, proven by:
 
 ```bash
 bin/codex-oss status
 bin/codex-oss doctor --live-model
+bin/codex-oss smoke native-polish
 ```
 
 In `doctor --live-model`, `bridge.oss_inference` is the check that proves the bridge can reach a live OSS model. A raw worker may report its configured model alias, but that is configuration context, not independent proof of transport.
+
+`smoke native-polish` checks the user-facing surface: the runtime implementation agent is installed, raw writes demote safely, A5 can apply and verify an isolated patch, visible commentary is recorded, and the main workspace stays unchanged.
 
 ## Ways To Delegate
 
@@ -363,6 +368,7 @@ bin/codex-oss stop
 bin/codex-oss restart --port 4000
 bin/codex-oss status
 bin/codex-oss doctor --network
+bin/codex-oss smoke native-polish
 ```
 
 ### Missions and Artifacts

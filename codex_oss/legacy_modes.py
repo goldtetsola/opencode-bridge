@@ -507,8 +507,16 @@ def handle_bounded_patch_continuation(
     tool_output_indicates_failure: Callable[[str], bool],
 ) -> LegacyModeDecision:
     """Handle bounded patch verification/write continuation branches."""
+    def _visible_changed_paths() -> List[str]:
+        changed = collect_owned_path_changes(envelope.get("owned_paths", []), project_root)
+        if target_path and path_is_within_owned_paths(target_path, envelope.get("owned_paths", []), project_root):
+            rel = os.path.relpath(target_path, project_root) if os.path.isabs(target_path) else os.path.normpath(target_path)
+            if rel and rel not in changed:
+                changed.append(rel)
+        return changed
+
     if tool_kind == "shell":
-        changed_paths = collect_owned_path_changes(envelope.get("owned_paths", []), project_root)
+        changed_paths = _visible_changed_paths()
         failed = exit_code != 0 or tool_output_indicates_failure(tool_output_text)
         if not changed_paths:
             status = "FAIL" if failed else "PARTIAL"
@@ -550,7 +558,7 @@ def handle_bounded_patch_continuation(
             log_fields={"target_path": target_path, "owned_paths": owned_paths},
         )
 
-    changed_paths = collect_owned_path_changes(owned_paths, project_root)
+    changed_paths = _visible_changed_paths()
     if not changed_paths:
         return LegacyModeDecision(
             True,

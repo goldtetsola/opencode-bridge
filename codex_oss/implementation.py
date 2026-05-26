@@ -40,6 +40,17 @@ DEFAULT_DENY_ROOTS = (
     "node_modules/",
 )
 
+IMPLEMENTATION_NARRATIVE_FORBIDDEN_AUTHORITY_PATTERNS = re.compile(
+    r"^("
+    r"status|changed files|patch artifact|main workspace mutated|"
+    r"validation|verification|gpt review required|runtime built diff"
+    r")\s*:"
+    r"|\b(?:i|we|the model)\s+(?:applied|modified|changed|verified|validated)\b"
+    r"|\bmain workspace (?:was )?mutated\b"
+    r"|\bverification (?:passed|failed)\b",
+    re.IGNORECASE | re.MULTILINE,
+)
+
 
 def run_implementation_mission(
     mission: Any,
@@ -279,6 +290,8 @@ def render_patch_validation_report(mission: Any, report: JSON) -> str:
     changed = report.get("changed_files", []) or []
     reasons = report.get("reasons", []) or []
     checks = report.get("checks", {}) or {}
+    authority = report.get("implementation_authority", {}) if isinstance(report.get("implementation_authority"), dict) else {}
+    model_narrative = report.get("model_narrative", {}) if isinstance(report.get("model_narrative"), dict) else {}
     lines = [
         "OSS_PATCH_VALIDATION_BEGIN",
         f"Mission: {mission.mission_id}",
@@ -287,9 +300,19 @@ def render_patch_validation_report(mission: Any, report: JSON) -> str:
         f"Changed files: {', '.join(changed) if changed else 'none'}",
         f"Proposal source: {report.get('proposal_source', 'unknown')}",
         f"Runtime built diff: {str(bool(report.get('runtime_built_diff', False))).lower()}",
+        f"Patch authority: {authority.get('patch_authority', 'bridge_runtime')}",
+        f"Narrative authority: {authority.get('narrative_authority', 'runtime_no_model_narrative')}",
         f"Model repair count: {report.get('model_repair_count', 0)}",
         "GPT review required: true",
     ]
+    if model_narrative.get("accepted"):
+        lines.append("Model-authored narrative:")
+        for key in ("summary", "risk_summary", "verification_intent"):
+            value = str(model_narrative.get(key, "") or "")
+            if value:
+                lines.append(f"- {value}")
+        for caveat in model_narrative.get("caveats", []) or []:
+            lines.append(f"- Caveat: {caveat}")
     if reasons:
         lines.append("Reasons:")
         lines.extend(f"- {reason}" for reason in reasons)
@@ -307,6 +330,8 @@ def render_implementation_report(mission: Any, report: JSON) -> str:
     changed = report.get("changed_files", []) or []
     verification = report.get("verification", []) or []
     caveats = report.get("caveats", []) or []
+    authority = report.get("implementation_authority", {}) if isinstance(report.get("implementation_authority"), dict) else {}
+    model_narrative = report.get("model_narrative", {}) if isinstance(report.get("model_narrative"), dict) else {}
     lines = [
         "OSS_IMPLEMENTATION_REPORT_BEGIN",
         f"Mission: {mission.mission_id}",
@@ -314,12 +339,25 @@ def render_implementation_report(mission: Any, report: JSON) -> str:
         f"Status: {report.get('status', 'FAILED')}",
         f"Changed files: {', '.join(changed) if changed else 'none'}",
         f"Patch artifact: {report.get('patch_artifact', '')}",
+        f"Report artifact: {report.get('report_artifact', '')}",
+        f"Summary: {report.get('summary_path', '')}",
+        f"Visible trace: {report.get('visible_commentary_path', '')}",
         f"Main workspace mutated: {str(bool(report.get('main_workspace_mutated', False))).lower()}",
         f"Proposal source: {report.get('proposal_source', 'unknown')}",
         f"Runtime built diff: {str(bool(report.get('runtime_built_diff', False))).lower()}",
+        f"Patch authority: {authority.get('patch_authority', 'bridge_runtime')}",
+        f"Narrative authority: {authority.get('narrative_authority', 'runtime_no_model_narrative')}",
         f"Model repair count: {report.get('model_repair_count', 0)}",
         "GPT review required: true",
     ]
+    if model_narrative.get("accepted"):
+        lines.append("Model-authored narrative:")
+        for key in ("summary", "risk_summary", "verification_intent"):
+            value = str(model_narrative.get(key, "") or "")
+            if value:
+                lines.append(f"- {value}")
+        for caveat in model_narrative.get("caveats", []) or []:
+            lines.append(f"- Caveat: {caveat}")
     if verification:
         lines.append("Verification:")
         for item in verification:
@@ -329,7 +367,20 @@ def render_implementation_report(mission: Any, report: JSON) -> str:
         lines.append("Caveats:")
         lines.extend(f"- {caveat}" for caveat in caveats)
     lines.append("OSS_IMPLEMENTATION_REPORT_JSON:")
-    lines.append(json.dumps(report, indent=2, sort_keys=True))
+    if os.getenv("OSS_INLINE_REPORT_JSON", "0").strip().lower() in {"1", "true", "yes", "on"}:
+        lines.append(json.dumps(report, indent=2, sort_keys=True))
+    else:
+        compact = {
+            "status": report.get("status", "FAILED"),
+            "changed_files": changed,
+            "main_workspace_mutated": bool(report.get("main_workspace_mutated", False)),
+            "runtime_built_diff": bool(report.get("runtime_built_diff", False)),
+            "report_artifact": report.get("report_artifact", ""),
+            "patch_artifact": report.get("patch_artifact", ""),
+            "summary_path": report.get("summary_path", ""),
+            "visible_commentary_path": report.get("visible_commentary_path", ""),
+        }
+        lines.append(json.dumps(compact, indent=2, sort_keys=True))
     lines.append("OSS_IMPLEMENTATION_REPORT_END")
     return "\n".join(lines)
 
@@ -355,6 +406,107 @@ def _proposal_commentary_message(proposal: JSON) -> str:
     else:
         prefix = "The runtime captured a model-authored patch proposal for validation."
     return f"{prefix} Target files: {', '.join(changed) if changed else 'none'}."
+
+
+def _implementation_authority(proposal: JSON, model_narrative: JSON) -> JSON:
+    proposal_source = str(proposal.get("proposal_source", "") or "raw_patch_proposal_v1")
+    runtime_built_diff = proposal_source in {"desired_state_v1", "patch_recipe_v1", "patch_intent_v1"}
+    narrative_authority = str(model_narrative.get("narrative_authority", "") or "runtime_no_model_narrative")
+    return {
+        "schema_version": "implementation_authority.v1",
+        "patch_authority": "bridge_runtime",
+        "diff_source": proposal_source,
+        "runtime_built_diff": runtime_built_diff,
+        "status_authority": "bridge_runtime",
+        "changed_files_authority": "bridge_runtime",
+        "validation_authority": "bridge_runtime",
+        "apply_authority": "bridge_runtime",
+        "verification_authority": "bridge_runtime",
+        "artifact_authority": "bridge_runtime",
+        "narrative_authority": narrative_authority,
+        "model_may_author": ["intent", "summary", "risk_assessment", "caveats"],
+        "model_must_not_author": ["status", "changed_files", "apply_result", "verification_result", "workspace_mutation"],
+    }
+
+
+def _implementation_model_narrative(proposal: JSON) -> JSON:
+    summary, summary_secret = _safe_model_narrative_text(proposal.get("summary"), 600)
+    risk_summary, risk_secret = _risk_narrative_text(proposal.get("risk_assessment"))
+    verification_intent, verification_secret = _verification_intent_text(proposal.get("verification_plan"))
+    caveats, caveat_secret = _narrative_list(proposal.get("caveats"), 5, 300)
+    body = "\n".join(
+        part for part in [summary, risk_summary, verification_intent] + caveats
+        if str(part).strip()
+    )
+    rejection_reasons = []
+    if not body.strip():
+        rejection_reasons.append("empty_model_narrative")
+    if summary_secret or risk_secret or verification_secret or caveat_secret:
+        rejection_reasons.append("secret_redacted_from_model_narrative")
+    if IMPLEMENTATION_NARRATIVE_FORBIDDEN_AUTHORITY_PATTERNS.search(body):
+        rejection_reasons.append("runtime_authority_claim_detected")
+    accepted = not rejection_reasons
+    return {
+        "schema_version": "implementation_model_narrative.v1",
+        "accepted": accepted,
+        "narrative_authority": "model_patch_author" if accepted else "runtime_rejected_model_narrative",
+        "source_fields": ["proposal.summary", "proposal.risk_assessment", "proposal.verification_plan", "proposal.caveats"],
+        "summary": summary if accepted else "",
+        "risk_summary": risk_summary if accepted else "",
+        "verification_intent": verification_intent if accepted else "",
+        "caveats": caveats if accepted else [],
+        "rejection_reasons": rejection_reasons,
+        "runtime_authority_boundaries": ["status", "changed_files", "apply_result", "verification_result", "workspace_mutation"],
+    }
+
+
+def _safe_model_narrative_text(value: Any, max_chars: int) -> tuple[str, bool]:
+    text = str(value or "").strip()
+    if not text:
+        return "", False
+    redacted, found_secret = scan_secrets(text[:max_chars])
+    return redacted.strip(), found_secret
+
+
+def _risk_narrative_text(value: Any) -> tuple[str, bool]:
+    if not isinstance(value, dict):
+        return "", False
+    parts = []
+    risk_tier = str(value.get("risk_tier", "") or "").strip()
+    blast_radius = str(value.get("blast_radius", "") or "").strip()
+    if risk_tier:
+        parts.append(f"Risk tier: {risk_tier}")
+    if blast_radius:
+        parts.append(f"Blast radius: {blast_radius}")
+    return _safe_model_narrative_text("; ".join(parts), 500)
+
+
+def _verification_intent_text(value: Any) -> tuple[str, bool]:
+    if not isinstance(value, list):
+        return "", False
+    reasons = []
+    for item in value[:3]:
+        if not isinstance(item, dict):
+            continue
+        reason = str(item.get("reason", "") or "").strip()
+        if reason:
+            reasons.append(reason)
+    if not reasons:
+        return "", False
+    return _safe_model_narrative_text("Verification intent: " + "; ".join(reasons), 700)
+
+
+def _narrative_list(value: Any, max_items: int, max_chars: int) -> tuple[list[str], bool]:
+    if not isinstance(value, list):
+        return [], False
+    items = []
+    found_any_secret = False
+    for item in value[:max_items]:
+        text, found_secret = _safe_model_narrative_text(item, max_chars)
+        if text:
+            items.append(text)
+        found_any_secret = found_any_secret or found_secret
+    return items, found_any_secret
 
 
 def _emit_validation_commentary(commentary: Any | None, validation: JSON, phase: str) -> None:
@@ -436,6 +588,9 @@ def _persist_implementation_runtime_artifacts(
     certification: JSON | None = None,
 ) -> None:
     _write_json(os.path.join(artifact_dir, "patch_proposal.json"), proposal)
+    model_narrative = report.get("model_narrative") if isinstance(report.get("model_narrative"), dict) else validation.get("model_narrative")
+    if isinstance(model_narrative, dict):
+        _write_json(os.path.join(artifact_dir, "model_narrative.json"), model_narrative)
     source_payloads = [
         ("patch_intent.json", proposal.get("patch_intent")),
         ("patch_recipe.json", proposal.get("patch_recipe")),
@@ -502,6 +657,8 @@ def _implementation_ledger(
     report: JSON,
     certification: JSON | None = None,
 ) -> JSON:
+    model_narrative = report.get("model_narrative") if isinstance(report.get("model_narrative"), dict) else {}
+    authority = report.get("implementation_authority") if isinstance(report.get("implementation_authority"), dict) else {}
     return {
         "implementation_ledger_version": "1.0",
         "mission_id": getattr(mission, "mission_id", ""),
@@ -519,6 +676,8 @@ def _implementation_ledger(
         "verification_commands": [item.get("command", []) for item in verification if isinstance(item, dict)],
         "verification_exit_codes": [item.get("exit_code") for item in verification if isinstance(item, dict)],
         "certification_status": str((certification or {}).get("status", "") or ""),
+        "narrative_authority": str(authority.get("narrative_authority", "") or ""),
+        "model_narrative_accepted": bool(model_narrative.get("accepted", False)),
         "main_workspace_mutated": bool(report.get("main_workspace_mutated", False)),
         "rollback_artifact": str(((report.get("rollback") or {}) if isinstance(report.get("rollback"), dict) else {}).get("artifact", "") or ""),
         "gpt_review_required": bool(report.get("gpt_review_required", True)),
@@ -564,6 +723,17 @@ def _implementation_trace_jsonl(
                 "approved_for_workspace_apply": bool(certification.get("approved_for_workspace_apply", False)),
                 "approved_count": int(certification.get("approved_count", 0) or 0),
                 "min_reviewer_approvals": int(certification.get("min_reviewer_approvals", 0) or 0),
+            }
+        )
+    model_narrative = report.get("model_narrative") if isinstance(report.get("model_narrative"), dict) else {}
+    if model_narrative:
+        events.append(
+            {
+                "step": len(events) + 1,
+                "phase": "narrative",
+                "status": "accepted" if model_narrative.get("accepted") else "rejected",
+                "narrative_authority": str(model_narrative.get("narrative_authority", "") or ""),
+                "rejection_reasons": list(model_narrative.get("rejection_reasons", []) or []),
             }
         )
     events.append(
@@ -624,6 +794,30 @@ def _implementation_summary_md(
                 f"- Approved For Workspace Apply: {str(bool(certification.get('approved_for_workspace_apply', False))).lower()}",
             ]
         )
+    model_narrative = report.get("model_narrative") if isinstance(report.get("model_narrative"), dict) else {}
+    authority = report.get("implementation_authority") if isinstance(report.get("implementation_authority"), dict) else {}
+    if authority:
+        lines.extend(
+            [
+                "",
+                "## Authority",
+                f"- Patch Authority: {str(authority.get('patch_authority', '') or '')}",
+                f"- Status Authority: {str(authority.get('status_authority', '') or '')}",
+                f"- Verification Authority: {str(authority.get('verification_authority', '') or '')}",
+                f"- Narrative Authority: {str(authority.get('narrative_authority', '') or '')}",
+            ]
+        )
+    if model_narrative.get("accepted"):
+        lines.extend(["", "## Model-Authored Narrative"])
+        for key in ("summary", "risk_summary", "verification_intent"):
+            value = str(model_narrative.get(key, "") or "")
+            if value:
+                lines.append(f"- {value}")
+        for caveat in model_narrative.get("caveats", []) or []:
+            lines.append(f"- Caveat: {caveat}")
+    elif model_narrative:
+        reasons = ", ".join(model_narrative.get("rejection_reasons", []) or []) or "not accepted"
+        lines.extend(["", "## Model-Authored Narrative", f"- Rejected: {reasons}"])
     if verification:
         lines.extend(["", "## Verification"])
         for item in verification:
@@ -2739,12 +2933,17 @@ def _validation_report(
     proposal = proposal or {}
     proposal_source = str(proposal.get("proposal_source", "") or "raw_patch_proposal_v1")
     runtime_built_diff = proposal_source in {"desired_state_v1", "patch_recipe_v1", "patch_intent_v1"}
+    model_narrative = _implementation_model_narrative(proposal)
+    authority = _implementation_authority(proposal, model_narrative)
     return {
         "patch_validation_version": "1.0",
         "status": status,
         "report_source": "runtime",
+        "closure_source": "runtime_patch_authority_model_narrative" if model_narrative.get("accepted") else "runtime_patch_authority",
         "proposal_source": proposal_source,
         "runtime_built_diff": runtime_built_diff,
+        "implementation_authority": authority,
+        "model_narrative": model_narrative,
         "model_repair_count": int(getattr(mission, "model_repair_count", 0) or 0) if mission is not None else 0,
         "semantic_review_ok": bool(checks.get("semantic_review_ok", False)),
         "semantic_review_score": int(checks.get("semantic_review_score", 0) or 0),
@@ -2819,14 +3018,19 @@ def _implementation_report(
         if isinstance(readiness_graph, dict)
         else {}
     )
+    model_narrative = _implementation_model_narrative(proposal)
+    authority = _implementation_authority(proposal, model_narrative)
     return {
         "implementation_report_version": "1.0",
         "status": status,
         "report_source": "runtime",
+        "closure_source": "runtime_patch_authority_model_narrative" if model_narrative.get("accepted") else "runtime_patch_authority",
         "explorer_model": getattr(mission, "last_reasoning_model", ""),
         "patch_model": getattr(mission, "runtime_model_alias", ""),
         "proposal_source": proposal_source,
         "runtime_built_diff": runtime_built_diff,
+        "implementation_authority": authority,
+        "model_narrative": model_narrative,
         "model_repair_count": int(getattr(mission, "model_repair_count", 0) or 0),
         "workspace_policy": workspace_policy,
         "execution_mode": execution_mode or getattr(mission, "apply_mode", ""),
@@ -2838,6 +3042,7 @@ def _implementation_report(
         "verification_scope": _verification_scope(validation.get("changed_files", []) or [], verification),
         "changed_files": changed,
         "patch_artifact": patch_path,
+        "report_artifact": os.path.join(os.path.dirname(patch_path), "report.json"),
         "certification_artifact": (
             os.path.join(os.path.dirname(patch_path), "certification.json")
             if certification is not None
@@ -2875,7 +3080,7 @@ def _relativize_report_paths(report: JSON, project_root: str) -> JSON:
             rollback_copy = dict(rollback)
             rollback_copy["artifact"] = os.path.relpath(rollback_artifact, project_root)
             result["rollback"] = rollback_copy
-    for key in ("visible_commentary_path", "summary_path"):
+    for key in ("report_artifact", "visible_commentary_path", "summary_path"):
         path = str(result.get(key, "") or "")
         if path and os.path.isabs(path):
             result[key] = os.path.relpath(path, project_root)

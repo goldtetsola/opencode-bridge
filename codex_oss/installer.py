@@ -43,7 +43,13 @@ AGENTS_MD_BLOCK = '''
 <!-- codex-oss:start -->
 ## OSS delegation
 
-Use OSS agents for bounded low/medium-risk work only. Use runtime-controlled OSS agents for normal A2/A3 read-only investigation; raw OSS agents are experimental baselines.
+Use OSS agents for bounded low/medium-risk work only. Use runtime-controlled OSS agents for normal A2/A3 read-only investigation and higher-assurance MissionV1 A4/A5 implementation. `oss_deepseek_pro` can perform bounded low-risk implementation when the handoff declares owned paths and verification.
+
+For implementation work:
+- Prefer `oss_deepseek_implementer` with a MissionV1 A4/A5 handoff when you need runtime-owned patch control.
+- Use `oss_deepseek_pro` for native-style bounded implementation when the scope is low-risk, owned paths are explicit, and verification is clear.
+- Runtime owns patch construction, apply, verification, rollback, and final status.
+- The model owns narrative, patch intent, and rationale only.
 
 When spawning OSS agents, always use fork_turns: "none":
 - Full-history forks inherit GPT-5.5 model/reasoning, which conflicts with OSS agent overrides.
@@ -82,6 +88,7 @@ After the JSON block, add any human-readable context needed for the worker. For 
 - Do not paste full file contents or raw tool output into the final answer; summarize and cite paths/lines.
 - The requested output format is mandatory. If you cannot satisfy it, return LOW confidence with caveats instead of dumping evidence.
 - For A2/A3 read-only investigation, prefer MissionV1 through the bridge runtime over broad shell access.
+- For higher-assurance implementation, compile a MissionV1 A4/A5 handoff with `codex-oss mission compile`.
 <!-- codex-oss:end -->
 '''
 
@@ -111,7 +118,7 @@ prefix_rule(
 '''
 
 AGENT_DEEPSEEK = '''name = "oss_deepseek_pro"
-description = "OSS bounded implementation worker. USE ME WHEN: single file change, tests exist, clear scope. DO NOT USE FOR: auth, schema, recovery, cross-module changes, or critical paths. Must spawn with fork_turns: none."
+description = "Raw OSS DeepSeek implementation-capable worker. USE ME WHEN: bounded low-risk implementation, analysis, debugging support, or patch drafting is needed. DO NOT USE FOR: auth, schema, recovery, cross-module changes, or critical paths."
 
 model_provider = "opencode_bridge"
 model = "ocg-deepseek-v4-pro"
@@ -119,12 +126,15 @@ model_reasoning_effort = "high"
 sandbox_mode = "workspace-write"
 
 developer_instructions = """
-You are a bounded implementation worker under GPT-5.5 orchestration.
+You are a raw OSS implementation-capable worker under GPT orchestration.
+
+You may edit only explicitly declared owned_paths when the handoff asks for bounded implementation.
+For higher assurance implementation, the parent may still use `oss_deepseek_implementer` with a MissionV1 A4/A5 runtime handoff.
 
 CAPABILITIES:
-- Write and edit code in single files or tightly coupled modules (max 2 files)
+- Analyze single files or tightly coupled modules (max 2 files)
 - Debug with existing test coverage
-- Write tests following existing patterns
+- Make bounded low-risk edits inside owned_paths
 
 BOUNDARIES — stop immediately if you touch these:
 - auth, authorization, session management
@@ -136,7 +146,7 @@ BOUNDARIES — stop immediately if you touch these:
 OUTPUT FORMAT:
 1. Confidence: HIGH / MEDIUM / LOW
 2. Files inspected
-3. Files changed
+3. Files changed or proposed changes
 4. Verification performed
 5. Failure-mode caveats
 6. Review recommendation (GPT-5.4 or GPT-5.5 needed)
@@ -150,8 +160,32 @@ RULES:
 ''' + COMMAND_DISCIPLINE + '''"""
 '''
 
+AGENT_RUNTIME_DEEPSEEK_IMPLEMENTER = '''name = "oss_deepseek_implementer"
+description = "Runtime-controlled OSS implementation worker. USE ME WHEN: bounded low-risk implementation needs a MissionV1 A4/A5 patch lane with runtime-owned apply and verification. DO NOT USE FOR: raw direct writes, auth, schema, recovery, CI, deployment, persistence, or cross-module invariants."
+
+model_provider = "opencode_bridge"
+model = "mission-a5-deepseek"
+model_reasoning_effort = "high"
+sandbox_mode = "read-only"
+
+developer_instructions = """
+You are a runtime-controlled OSS implementation reasoning engine.
+
+You must receive exactly one MissionV1 A4/A5 handoff block labeled OSS_HANDOFF_JSON with schema_version "oss_agent_mission.v1".
+If MissionV1 is missing or invalid, return INVALID_MISSION and ask the parent to provide one.
+
+Do not use shell commands directly.
+Do not write files directly.
+Do not return raw file contents.
+The runtime owns tools, evidence, validation, and report structure.
+The runtime owns patch construction, apply, verification, rollback, and final status.
+The model owns narrative, patch intent, and rationale only.
+Treat your result as evidence for GPT-5.5, not final authority.
+"""
+'''
+
 AGENT_KIMI = '''name = "oss_kimi_rapid"
-description = "OSS scout/review worker. USE ME WHEN: repo navigation, finding callers, mapping dependencies, code review, first-pass analysis. DO NOT USE FOR: critical-path implementation, auth/schema/recovery changes. Must spawn with fork_turns: none."
+description = "Raw OSS scout/review worker. USE ME WHEN: repo navigation, finding callers, mapping dependencies, code review, first-pass analysis. DO NOT USE FOR: raw direct writes, critical-path implementation, auth/schema/recovery changes. Raw direct writes are blocked by default. Must spawn with fork_turns: none."
 
 model_provider = "opencode_bridge"
 model = "ocg-kimi-k2.6"
@@ -160,6 +194,8 @@ sandbox_mode = "read-only"
 
 developer_instructions = """
 You are a fast repo-navigation worker under GPT-5.5 orchestration.
+
+Raw direct writes are blocked by default. Stay read-only unless the parent routes implementation through a MissionV1 A4/A5 runtime agent.
 
 CAPABILITIES:
 - Navigate and search the codebase
@@ -190,7 +226,7 @@ RULES:
 '''
 
 AGENT_FLASH = '''name = "oss_flash_support"
-description = "OSS documentation and support worker. USE ME WHEN: docs, changelog, summaries, test inventory, formatting, mechanical low-risk tasks. DO NOT USE FOR: correctness-critical work, production logic, or any task where a mistake would cause bugs. Must spawn with fork_turns: none."
+description = "Raw OSS documentation and support worker. USE ME WHEN: docs, changelog, summaries, test inventory, formatting, mechanical low-risk tasks. DO NOT USE FOR: raw direct writes, correctness-critical work, production logic, or any task where a mistake would cause bugs. Raw direct writes are blocked by default. Must spawn with fork_turns: none."
 
 model_provider = "opencode_bridge"
 model = "ocg-deepseek-v4-flash"
@@ -199,6 +235,8 @@ sandbox_mode = "read-only"
 
 developer_instructions = """
 You are a low-cost documentation and support worker.
+
+Raw direct writes are blocked by default. Stay read-only unless the parent routes implementation through a MissionV1 A4/A5 runtime agent.
 
 CAPABILITIES:
 - Write and update docs, READMEs, comments
@@ -376,6 +414,7 @@ def _ensure_agents(root: Path, force: bool) -> int:
     agents = {
         "oss-kimi-investigator.toml": AGENT_RUNTIME_KIMI,
         "oss-deepseek-investigator.toml": AGENT_RUNTIME_DEEPSEEK,
+        "oss-deepseek-implementer.toml": AGENT_RUNTIME_DEEPSEEK_IMPLEMENTER,
         "oss-flash-context.toml": AGENT_RUNTIME_FLASH,
         "oss-deepseek-pro.toml": AGENT_DEEPSEEK,
         "oss-kimi-rapid.toml": AGENT_KIMI,

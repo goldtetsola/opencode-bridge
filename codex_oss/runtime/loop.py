@@ -9,6 +9,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Any, Tuple
 
+from codex_oss.visible_commentary import model_action_public_message, safe_tool_target_text
+
 JSON = Dict[str, Any]
 
 ACTION_RE = re.compile(r'\{[^{}]*"action_type"[^{}]*\}', re.DOTALL)
@@ -64,36 +66,18 @@ class ModelAction:
 
 
 def _tool_target_text(tool_name: str, arguments: Any) -> str:
-    if not isinstance(arguments, dict):
-        return tool_name or "tool"
-    path = str(arguments.get("path", "") or "")
-    pattern = str(arguments.get("pattern", "") or "")
-    if path and pattern:
-        return f"{tool_name} on {path} for `{pattern}`"
-    if path:
-        return f"{tool_name} on {path}"
-    return tool_name or "tool"
+    return safe_tool_target_text(tool_name, arguments)
 
 
 def _model_action_commentary(action: ModelAction) -> str:
-    target = _tool_target_text(action.tool_name, action.arguments)
-    message = f"The model chose {target} as the next investigation step."
-    reason = str(getattr(action, "reason", "") or "").strip()
-    hypothesis = str(getattr(action, "hypothesis", "") or "").strip()
-    expected = str(getattr(action, "expected_information_gain", "") or "").strip()
-    why_not = str(getattr(action, "why_not_report_yet", "") or "").strip()
-    details = []
-    if reason:
-        details.append(f"Reason: {reason}")
-    if hypothesis:
-        details.append(f"Hypothesis: {hypothesis}")
-    if expected:
-        details.append(f"Expected gain: {expected}")
-    if why_not:
-        details.append(f"Not reporting yet: {why_not}")
-    if details:
-        message += " " + " ".join(details)
-    return message
+    return model_action_public_message(
+        action.tool_name,
+        action.arguments,
+        reason=str(getattr(action, "reason", "") or ""),
+        hypothesis=str(getattr(action, "hypothesis", "") or ""),
+        expected_information_gain=str(getattr(action, "expected_information_gain", "") or ""),
+        why_not_report_yet=str(getattr(action, "why_not_report_yet", "") or ""),
+    )
 
 
 def parse_action(text: str, strict: bool = True) -> Optional[ModelAction]:

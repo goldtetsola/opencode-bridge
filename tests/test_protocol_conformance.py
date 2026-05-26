@@ -22,6 +22,9 @@ from bridge import build_direct_loop_terminal_report
 from bridge import build_pending_child_not_fulfilled_report
 from bridge import build_response_from_pending_child
 from bridge import complete_pending_reads_from_bridge
+from bridge import execute_pending_owned_write_from_bridge
+from bridge import execute_pending_owned_shell_from_bridge
+from bridge import execute_pending_owned_verification_from_bridge
 from bridge import complete_declared_reads_from_bridge
 from bridge import build_context_pack
 from bridge import build_context_pack_deterministic_report
@@ -33,6 +36,7 @@ from bridge import effective_tool_kind
 from bridge import normalize_tool_args
 from bridge import parse_task_envelope
 from bridge import pretool_block_repair_instruction
+from bridge import should_retry_pretool_block
 from bridge import required_paths_from_envelope
 from bridge import Handler
 from bridge import ProxyApp
@@ -43,9 +47,13 @@ from bridge import should_use_direct_agent_loop
 from bridge import direct_loop_terminal_decision
 from bridge import direct_loop_required_sources_satisfied
 from bridge import declared_read_floor_only
+from bridge import _append_redirection_from_shell_command
 from bridge import tool_output_indicates_failure
 from bridge import validate_report_output
+from bridge import validate_model_read_narrative
+from bridge import sanitize_model_read_narrative
 from bridge import verification_contract_requested
+from bridge import _default_local_read_executor
 from codex_oss.transport.chat_stream import ChatStreamAssembler
 from codex_oss.transport.response_builder import build_response_object_from_chat
 from codex_oss.doctor import DoctorReport, _check_agreements
@@ -73,9 +81,50 @@ def assert_exact_write_requires_exact_content():
     assert select_mode(exact_envelope) == "bounded_write_exact", exact_envelope
 
 
-def assert_legacy_write_handoffs_do_not_receive_raw_tools_by_default():
+def assert_bounded_write_handoffs_receive_tools_by_default():
     old = os.environ.get("OSS_LEGACY_DIRECT_WRITES")
     os.environ.pop("OSS_LEGACY_DIRECT_WRITES", None)
+    try:
+        app = ProxyApp()
+        body = {
+            "model": "ocg-deepseek-v4-flash",
+            "input": [
+                {
+                    "role": "user",
+                    "content": (
+                        "OSS_HANDOFF_JSON:\n"
+                        "{\"schema_version\":1,\"role\":\"Patch docs\",\"goal\":\"Patch one fixture\","
+                        "\"task_type\":\"docs_support\",\"owned_paths\":[\"tests/fixtures/protocol-doc.md\"],"
+                        "\"read_only_paths\":[],\"forbidden_actions\":[\"Do not edit source\"],"
+                        "\"verification_steps\":[\"Run rtk git diff --check\"],"
+                        "\"deliverable_fields\":[\"changed_sections\",\"verification\",\"caveats\"],"
+                        "\"completion_rule\":\"stop after verification\",\"escalation_rule\":\"stop on scope drift\"}"
+                    ),
+                }
+            ],
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "exec_command",
+                    "description": "Run a shell command",
+                    "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}},
+                }
+            ],
+        }
+        payload, base_messages, _, _, reverse = app.prepare_chat_payload(body)
+        assert "tools" in payload, payload
+        assert reverse != {}, reverse
+        assert "raw OSS write handoff is deprecated" not in base_messages[0]["content"], base_messages
+    finally:
+        if old is None:
+            os.environ.pop("OSS_LEGACY_DIRECT_WRITES", None)
+        else:
+            os.environ["OSS_LEGACY_DIRECT_WRITES"] = old
+
+
+def assert_bounded_write_handoffs_can_be_disabled_explicitly():
+    old = os.environ.get("OSS_LEGACY_DIRECT_WRITES")
+    os.environ["OSS_LEGACY_DIRECT_WRITES"] = "0"
     try:
         app = ProxyApp()
         body = {
@@ -114,6 +163,72 @@ def assert_legacy_write_handoffs_do_not_receive_raw_tools_by_default():
             os.environ["OSS_LEGACY_DIRECT_WRITES"] = old
 
 
+def assert_fresh_raw_write_handoff_demotes_when_disabled():
+    old = os.environ.get("OSS_LEGACY_DIRECT_WRITES")
+    os.environ["OSS_LEGACY_DIRECT_WRITES"] = "0"
+    try:
+        class FakeHandler:
+            _handle_fresh_turn = Handler._handle_fresh_turn
+            _emit_raw_write_demotion_if_needed = Handler._emit_raw_write_demotion_if_needed
+
+            def __init__(self):
+                self.wfile = __import__("io").BytesIO()
+                self.statuses = []
+                self.headers = []
+                self.close_connection = False
+                self.upstream_called = False
+
+            def send_response(self, status):
+                self.statuses.append(status)
+
+            def send_header(self, key, value):
+                self.headers.append((key, value))
+
+            def end_headers(self):
+                pass
+
+            def _call_upstream_with_fallback(self, payload, model_alias, model_upstream):
+                self.upstream_called = True
+                raise AssertionError("fresh raw write demotion must not call upstream")
+
+        body = {
+            "model": "ocg-deepseek-v4-pro",
+            "stream": True,
+            "input": [{
+                "role": "user",
+                "content": (
+                    "OSS_HANDOFF_JSON:\n"
+                    "{\"schema_version\":1,\"role\":\"Bounded writer\",\"goal\":\"Append a scratch marker\","
+                    "\"task_type\":\"bounded_write\",\"owned_paths\":[\"tmp/protocol-write.txt\"],"
+                    "\"read_only_paths\":[\"tmp/protocol-write.txt\"],\"forbidden_actions\":[\"Do not edit other files\"],"
+                    "\"verification_steps\":[\"Read back tmp/protocol-write.txt\"],"
+                    "\"deliverable_fields\":[\"file changed\",\"verification\",\"confidence\",\"caveats\"],"
+                    "\"completion_rule\":\"stop after verification\",\"escalation_rule\":\"stop on scope drift\"}"
+                ),
+            }],
+            "tools": [{
+                "type": "function",
+                "name": "exec_command",
+                "description": "Run a shell command",
+                "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}},
+            }],
+        }
+        fake = FakeHandler()
+        fake._handle_fresh_turn(body)
+        text = fake.wfile.getvalue().decode("utf-8")
+        assert fake.statuses == [200], fake.statuses
+        assert not fake.upstream_called
+        assert "DETERMINISTIC_LEGACY_WRITE_DEMOTED" in text, text
+        assert "response.completed" in text, text
+        assert "MissionV1 A4/A5/A6" in text, text
+        assert "I'll read" not in text and "I’ll read" not in text, text
+    finally:
+        if old is None:
+            os.environ.pop("OSS_LEGACY_DIRECT_WRITES", None)
+        else:
+            os.environ["OSS_LEGACY_DIRECT_WRITES"] = old
+
+
 def assert_no_match_search_is_still_covered():
     handoff = """OSS_HANDOFF_JSON:
 {"schema_version":1,"role":"Read scout","goal":"Search for present and absent terms","task_type":"scout","owned_paths":[],"read_only_paths":["README.md","tests/fixtures"],"forbidden_actions":["Do not edit files"],"verification_steps":["Search read-only paths for terminal_blocker_state, PROTOCOL_TERM_THAT_SHOULD_NOT_EXIST_9f2c"],"deliverable_fields":["summary","evidence_table","confidence","caveats"],"completion_rule":"stop after report","escalation_rule":"stop if source pack is partial"}
@@ -132,6 +247,490 @@ def assert_no_match_search_is_still_covered():
     assert "Synthesis status: FALLBACK" not in report, report
     assert "evidence_coverage:" in report, report
     assert "- status: PASS" in report, report
+
+
+def assert_declared_absolute_read_paths_are_supported():
+    with tempfile.TemporaryDirectory() as tmp, tempfile.NamedTemporaryFile("w", delete=False, suffix=".md") as outside:
+        outside.write("# Global Skill\n\nNative-style subagents can inspect explicitly declared absolute read-only context.\n")
+        outside.flush()
+        outside_path = outside.name
+        try:
+            handoff = (
+                "OSS_HANDOFF_JSON:\n"
+                + json.dumps({
+                    "schema_version": 1,
+                    "role": "Read scout",
+                    "goal": "Inspect one project source and one explicit global source",
+                    "task_type": "scout",
+                    "owned_paths": [],
+                    "read_only_paths": ["README.md", outside_path],
+                    "forbidden_actions": ["Do not edit files"],
+                    "verification_steps": ["Read both declared sources"],
+                    "deliverable_fields": ["files inspected", "confidence", "caveats"],
+                    "completion_rule": "stop after report",
+                    "escalation_rule": "stop if source pack is partial",
+                })
+            )
+            Path(tmp, "README.md").write_text("# Project Readme\n", encoding="utf-8")
+            session = build_task_session({"input": []}, handoff, "resp_absolute_read")
+            pack = build_context_pack(session, tmp)
+            assert "=== README.md" in pack, pack
+            assert f"=== {outside_path}" in pack, pack
+            assert "path escapes project root" not in pack, pack
+            exit_code, output = _default_local_read_executor(outside_path, tmp)
+            assert exit_code == 0, output
+            assert "Global Skill" in output, output
+            envelope = parse_task_envelope(handoff)
+            coverage_ok, missing, covered_paths, _ = evaluate_evidence_coverage(envelope, pack)
+            assert coverage_ok, missing
+            assert outside_path in covered_paths, covered_paths
+        finally:
+            try:
+                os.unlink(outside_path)
+            except FileNotFoundError:
+                pass
+
+
+def assert_bounded_write_handoff_is_not_read_floor_only():
+    handoff = (
+        "OSS_HANDOFF_JSON:\n"
+        + json.dumps({
+            "schema_version": 1,
+            "role": "Bounded implementation smoke worker",
+            "goal": "Append one line to tmp/oss_impl_parity_smoke.txt.",
+            "task_type": "bounded_write",
+            "owned_paths": ["tmp/oss_impl_parity_smoke.txt"],
+            "read_only_paths": ["tmp/oss_impl_parity_smoke.txt"],
+            "forbidden_actions": ["Do not edit any other file"],
+            "verification_steps": [
+                "Read tmp/oss_impl_parity_smoke.txt after the edit and confirm marker is present"
+            ],
+            "deliverable_fields": ["files inspected", "files changed", "verification", "confidence", "caveats"],
+            "completion_rule": "stop after verification",
+            "escalation_rule": "stop on scope drift",
+        })
+    )
+    envelope = parse_task_envelope(handoff)
+    assert select_mode(envelope) == "bounded_write_patch", envelope
+    assert not declared_read_floor_only(envelope), envelope
+    child = StoredResponse(
+        response_id="resp_write_child",
+        model_alias="ocg-deepseek-v4-pro",
+        model_upstream="deepseek-v4-pro",
+        messages=[
+            {"role": "user", "content": handoff},
+            {"role": "assistant", "content": "", "tool_calls": [{
+                "id": "call_read_before_write",
+                "type": "function",
+                "function": {
+                    "name": "exec_command",
+                    "arguments": json.dumps({"cmd": "rtk read tmp/oss_impl_parity_smoke.txt"}),
+                },
+            }]},
+        ],
+        pending_call_ids=["call_read_before_write"],
+        created_at=1,
+        tool_exchange_count=1,
+        task_max_exchanges=6,
+        previous_response_id="resp_parent",
+        pending_replay_count=3,
+    )
+    report = complete_pending_reads_from_bridge(
+        parent_response_id="resp_parent",
+        child_state=child,
+        handoff_text=handoff,
+        project_root=ROOT,
+        executor=lambda path, workdir: (0, "initial\n"),
+        finalizer_call=lambda prompt, timeout: (
+            "Findings: the file was read.\nConfidence: HIGH\nCaveats: write was not attempted."
+        ),
+    )
+    assert report == "", report
+
+
+def assert_pretool_blocks_get_repair_turn_before_bounded_patch_terminalization():
+    output = (
+        "Command blocked by PreToolUse hook: use `rtk read ...` instead of raw `tail`. "
+        "Command: echo marker >> tmp/oss_impl_parity_smoke.txt && tail -1 tmp/oss_impl_parity_smoke.txt"
+    )
+    repair = pretool_block_repair_instruction(output)
+    assert repair, repair
+    assert should_retry_pretool_block(output, exit_code=1, turn=1, max_exchanges=6)
+    assert not should_retry_pretool_block(output, exit_code=1, turn=6, max_exchanges=6)
+    assert not should_retry_pretool_block("normal test failure", exit_code=1, turn=1, max_exchanges=6)
+
+
+def assert_pending_owned_append_can_complete_server_side():
+    with tempfile.TemporaryDirectory(dir=ROOT) as tmp:
+        rel = os.path.relpath(os.path.join(tmp, "owned.txt"), ROOT)
+        Path(ROOT, rel).write_text("initial\n", encoding="utf-8")
+        handoff = (
+            "OSS_HANDOFF_JSON:\n"
+            + json.dumps({
+                "schema_version": 1,
+                "role": "Bounded implementation smoke worker",
+                "goal": f"Append marker to {rel}.",
+                "task_type": "bounded_write",
+                "owned_paths": [rel],
+                "read_only_paths": [rel],
+                "forbidden_actions": ["Do not edit any other file"],
+                "verification_steps": [f"Append OWNED_APPEND_OK to {rel}", f"Read {rel}"],
+                "deliverable_fields": ["files changed", "verification", "confidence", "caveats"],
+                "completion_rule": "stop after verification",
+                "escalation_rule": "stop on scope drift",
+            })
+        )
+        child = StoredResponse(
+            response_id="resp_owned_write_child",
+            model_alias="ocg-deepseek-v4-pro",
+            model_upstream="deepseek-v4-pro",
+            messages=[
+                {"role": "user", "content": handoff},
+                {"role": "assistant", "content": "", "tool_calls": [{
+                    "id": "call_append",
+                    "type": "function",
+                    "function": {
+                        "name": "exec_command",
+                        "arguments": json.dumps({"cmd": f'echo "OWNED_APPEND_OK" >> {rel}'}),
+                    },
+                }]},
+            ],
+            pending_call_ids=["call_append"],
+            created_at=1,
+            tool_exchange_count=1,
+            task_max_exchanges=6,
+            previous_response_id="resp_parent",
+            pending_replay_count=3,
+        )
+        report = execute_pending_owned_write_from_bridge(
+            parent_response_id="resp_parent",
+            child_state=child,
+            handoff_text=handoff,
+            project_root=ROOT,
+        )
+        assert report.startswith("PASS"), report
+        assert "owned path write completed server-side" in report, report
+        assert "OWNED_APPEND_OK" in Path(ROOT, rel).read_text(encoding="utf-8")
+
+
+def assert_pending_owned_append_recovery_is_idempotent_for_ignored_paths():
+    rel = "tmp/protocol-owned-write-recovery.txt"
+    target = Path(ROOT, rel)
+    target.parent.mkdir(exist_ok=True)
+    try:
+        target.write_text("initial\n", encoding="utf-8")
+        handoff = (
+            "OSS_HANDOFF_JSON:\n"
+            + json.dumps({
+                "schema_version": 1,
+                "role": "Bounded implementation smoke worker",
+                "goal": f"Append marker to {rel}.",
+                "task_type": "bounded_write",
+                "owned_paths": [rel],
+                "read_only_paths": [rel],
+                "forbidden_actions": ["Do not edit any other file"],
+                "verification_steps": [f"Append OWNED_IGNORED_OK to {rel}", f"Read {rel}"],
+                "deliverable_fields": ["files changed", "verification", "confidence", "caveats"],
+                "completion_rule": "stop after verification",
+                "escalation_rule": "stop on scope drift",
+            })
+        )
+        child = StoredResponse(
+            response_id="resp_owned_write_ignored_child",
+            model_alias="ocg-deepseek-v4-pro",
+            model_upstream="deepseek-v4-pro",
+            messages=[
+                {"role": "user", "content": handoff},
+                {"role": "assistant", "content": "", "tool_calls": [{
+                    "id": "call_append_ignored",
+                    "type": "function",
+                    "function": {
+                        "name": "exec_command",
+                        "arguments": json.dumps({"cmd": f'echo "OWNED_IGNORED_OK" >> {rel}'}),
+                    },
+                }]},
+            ],
+            pending_call_ids=["call_append_ignored"],
+            created_at=1,
+            tool_exchange_count=1,
+            task_max_exchanges=6,
+            previous_response_id="resp_parent",
+            pending_replay_count=3,
+        )
+        first = execute_pending_owned_write_from_bridge(
+            parent_response_id="resp_parent",
+            child_state=child,
+            handoff_text=handoff,
+            project_root=ROOT,
+        )
+        second = execute_pending_owned_write_from_bridge(
+            parent_response_id="resp_parent",
+            child_state=child,
+            handoff_text=handoff,
+            project_root=ROOT,
+        )
+        text = target.read_text(encoding="utf-8")
+        assert first.startswith("PASS"), first
+        assert second.startswith("PASS"), second
+        assert "Changed owned paths: tmp/protocol-owned-write-recovery.txt" in first, first
+        assert text.count("OWNED_IGNORED_OK") == 1, text
+    finally:
+        try:
+            target.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def assert_shell_append_parser_supports_common_native_forms():
+    assert _append_redirection_from_shell_command('echo "APPEND_OK" >> tmp/file.txt') == (
+        "tmp/file.txt", "APPEND_OK\n"
+    )
+    assert _append_redirection_from_shell_command(
+        "printf 'APPEND_OK\\n' >> tmp/file.txt && sed -n '/APPEND_OK/p' tmp/file.txt"
+    ) == ("tmp/file.txt", "APPEND_OK\n")
+
+
+def assert_pending_owned_verification_can_complete_server_side():
+    rel = "tmp/protocol-owned-verify-recovery.txt"
+    target = Path(ROOT, rel)
+    target.parent.mkdir(exist_ok=True)
+    try:
+        target.write_text("initial\nOWNED_VERIFY_OK\n", encoding="utf-8")
+        handoff = (
+            "OSS_HANDOFF_JSON:\n"
+            + json.dumps({
+                "schema_version": 1,
+                "role": "Bounded implementation smoke worker",
+                "goal": f"Verify OWNED_VERIFY_OK in {rel}.",
+                "task_type": "bounded_write",
+                "owned_paths": [rel],
+                "read_only_paths": [rel],
+                "forbidden_actions": ["Do not edit any other file"],
+                "verification_steps": [f"Search {rel} for OWNED_VERIFY_OK"],
+                "deliverable_fields": ["files changed", "verification", "confidence", "caveats"],
+                "completion_rule": "stop after verification",
+                "escalation_rule": "stop on scope drift",
+            })
+        )
+        child = StoredResponse(
+            response_id="resp_owned_verify_child",
+            model_alias="ocg-deepseek-v4-pro",
+            model_upstream="deepseek-v4-pro",
+            messages=[
+                {"role": "user", "content": handoff},
+                {"role": "assistant", "content": "", "tool_calls": [{
+                    "id": "call_verify",
+                    "type": "function",
+                    "function": {
+                        "name": "exec_command",
+                        "arguments": json.dumps({"cmd": f'rg "OWNED_VERIFY_OK" "{rel}"'}),
+                    },
+                }]},
+            ],
+            pending_call_ids=["call_verify"],
+            created_at=1,
+            tool_exchange_count=1,
+            task_max_exchanges=6,
+            previous_response_id="resp_parent",
+            pending_replay_count=3,
+        )
+        report = execute_pending_owned_verification_from_bridge(
+            parent_response_id="resp_parent",
+            child_state=child,
+            handoff_text=handoff,
+            project_root=ROOT,
+        )
+        assert report.startswith("PASS"), report
+        assert "Verification status: observed" in report, report
+        assert "OWNED_VERIFY_OK" in report, report
+        assert f"Changed owned paths: {rel}" in report, report
+    finally:
+        try:
+            target.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def assert_pending_owned_verification_can_complete_declared_marker_write():
+    rel = "tmp/protocol-owned-declared-marker-recovery.txt"
+    target = Path(ROOT, rel)
+    target.parent.mkdir(exist_ok=True)
+    try:
+        target.write_text("initial\n", encoding="utf-8")
+        handoff = (
+            "OSS_HANDOFF_JSON:\n"
+            + json.dumps({
+                "schema_version": 1,
+                "role": "Bounded implementation smoke worker",
+                "goal": f"Add DECLARED_MARKER_OK to {rel}.",
+                "task_type": "bounded_write",
+                "owned_paths": [rel],
+                "read_only_paths": [rel],
+                "forbidden_actions": ["Do not edit any other file"],
+                "verification_steps": [
+                    f"Write DECLARED_MARKER_OK to {rel} if absent",
+                    f"Read {rel} and confirm DECLARED_MARKER_OK",
+                ],
+                "deliverable_fields": ["files changed", "verification", "confidence", "caveats"],
+                "completion_rule": "stop after verification",
+                "escalation_rule": "stop on scope drift",
+                "write_allowed": True,
+            })
+        )
+        child = StoredResponse(
+            response_id="resp_owned_marker_child",
+            model_alias="ocg-deepseek-v4-pro",
+            model_upstream="deepseek-v4-pro",
+            messages=[
+                {"role": "user", "content": handoff},
+                {"role": "assistant", "content": "", "tool_calls": [{
+                    "id": "call_verify_absent_marker",
+                    "type": "function",
+                    "function": {
+                        "name": "exec_command",
+                        "arguments": json.dumps({"cmd": f'rtk read "{rel}"'}),
+                    },
+                }]},
+            ],
+            pending_call_ids=["call_verify_absent_marker"],
+            created_at=1,
+            tool_exchange_count=1,
+            task_max_exchanges=6,
+            previous_response_id="resp_parent",
+            pending_replay_count=3,
+        )
+        report = execute_pending_owned_verification_from_bridge(
+            parent_response_id="resp_parent",
+            child_state=child,
+            handoff_text=handoff,
+            project_root=ROOT,
+        )
+        assert report.startswith("PASS"), report
+        assert "declared owned marker write completed server-side" in report, report
+        assert f"Changed owned paths: {rel}" in report, report
+        assert target.read_text(encoding="utf-8").count("DECLARED_MARKER_OK") == 1
+    finally:
+        try:
+            target.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def assert_pending_owned_generic_shell_can_complete_multi_file_write_server_side():
+    with tempfile.TemporaryDirectory(dir=ROOT) as tmp:
+        rel_a = os.path.relpath(os.path.join(tmp, "owned-a.txt"), ROOT)
+        rel_b = os.path.relpath(os.path.join(tmp, "owned-b.txt"), ROOT)
+        command = (
+            "python3 -c "
+            + json.dumps(
+                "from pathlib import Path; "
+                f"Path({rel_a!r}).write_text('GENERIC_MULTI_OK a\\n', encoding='utf-8'); "
+                f"Path({rel_b!r}).write_text('GENERIC_MULTI_OK b\\n', encoding='utf-8')"
+            )
+        )
+        handoff = (
+            "OSS_HANDOFF_JSON:\n"
+            + json.dumps({
+                "schema_version": 1,
+                "role": "Bounded implementation worker",
+                "goal": "Write the requested marker to two owned files.",
+                "task_type": "bounded_write",
+                "owned_paths": [rel_a, rel_b],
+                "read_only_paths": [rel_a, rel_b],
+                "forbidden_actions": ["Do not edit any other file"],
+                "verification_steps": ["Confirm GENERIC_MULTI_OK appears in both owned files"],
+                "deliverable_fields": ["files changed", "verification", "confidence", "caveats"],
+                "completion_rule": "stop after verification",
+                "escalation_rule": "stop on scope drift",
+            })
+        )
+        child = StoredResponse(
+            response_id="resp_owned_generic_shell_child",
+            model_alias="ocg-deepseek-v4-pro",
+            model_upstream="deepseek-v4-pro",
+            messages=[
+                {"role": "user", "content": handoff},
+                {"role": "assistant", "content": "", "tool_calls": [{
+                    "id": "call_generic_shell",
+                    "type": "function",
+                    "function": {
+                        "name": "exec_command",
+                        "arguments": json.dumps({"cmd": command}),
+                    },
+                }]},
+            ],
+            pending_call_ids=["call_generic_shell"],
+            created_at=1,
+            tool_exchange_count=1,
+            task_max_exchanges=6,
+            previous_response_id="resp_parent",
+            pending_replay_count=3,
+        )
+        report = execute_pending_owned_shell_from_bridge(
+            parent_response_id="resp_parent",
+            child_state=child,
+            handoff_text=handoff,
+            project_root=ROOT,
+        )
+        assert report.startswith("PASS"), report
+        assert "owned path changes completed server-side" in report, report
+        assert f"Changed owned paths: {rel_a}, {rel_b}" in report, report
+        assert "GENERIC_MULTI_OK a" in Path(ROOT, rel_a).read_text(encoding="utf-8")
+        assert "GENERIC_MULTI_OK b" in Path(ROOT, rel_b).read_text(encoding="utf-8")
+
+
+def assert_pending_owned_generic_shell_rejects_outside_workdir():
+    with tempfile.TemporaryDirectory(dir=ROOT) as tmp, tempfile.TemporaryDirectory() as outside:
+        rel = os.path.relpath(os.path.join(tmp, "owned.txt"), ROOT)
+        handoff = (
+            "OSS_HANDOFF_JSON:\n"
+            + json.dumps({
+                "schema_version": 1,
+                "role": "Bounded implementation worker",
+                "goal": "Write only inside owned file.",
+                "task_type": "bounded_write",
+                "owned_paths": [rel],
+                "read_only_paths": [rel],
+                "forbidden_actions": ["Do not edit any other file"],
+                "verification_steps": ["Confirm OUTSIDE_WORKDIR_BLOCKED does not bypass scope"],
+                "deliverable_fields": ["files changed", "verification", "confidence", "caveats"],
+                "completion_rule": "stop after verification",
+                "escalation_rule": "stop on scope drift",
+            })
+        )
+        child = StoredResponse(
+            response_id="resp_owned_outside_workdir_child",
+            model_alias="ocg-deepseek-v4-pro",
+            model_upstream="deepseek-v4-pro",
+            messages=[
+                {"role": "user", "content": handoff},
+                {"role": "assistant", "content": "", "tool_calls": [{
+                    "id": "call_outside_workdir",
+                    "type": "function",
+                    "function": {
+                        "name": "exec_command",
+                        "arguments": json.dumps({
+                            "cmd": "python3 -c \"print('outside')\"",
+                            "workdir": outside,
+                        }),
+                    },
+                }]},
+            ],
+            pending_call_ids=["call_outside_workdir"],
+            created_at=1,
+            tool_exchange_count=1,
+            task_max_exchanges=6,
+            previous_response_id="resp_parent",
+            pending_replay_count=3,
+        )
+        report = execute_pending_owned_shell_from_bridge(
+            parent_response_id="resp_parent",
+            child_state=child,
+            handoff_text=handoff,
+            project_root=ROOT,
+        )
+        assert report.startswith("FAIL"), report
+        assert "outside the project root" in report, report
 
 
 def assert_incomplete_evidence_blocks_confident_pass():
@@ -896,11 +1495,9 @@ def assert_server_side_read_completion_prefers_model_authored_report():
     def fake_finalizer(prompt, timeout):
         prompts.append(prompt)
         return (
-            "COMPLETE\n"
-            "Files inspected: docs/visible-commentary.md\n"
             "Findings: The doc describes visible runtime progress for OSS agents.\n"
             "Confidence: HIGH\n"
-            "Caveats: Only the requested read-only file was inspected."
+            "Caveats: The narrative is limited to the provided excerpt."
         )
 
     report = complete_pending_reads_from_bridge(
@@ -915,8 +1512,133 @@ def assert_server_side_read_completion_prefers_model_authored_report():
     assert report.startswith("COMPLETE"), report
     assert "MODEL_AUTHORED_SERVER_SIDE_READ_COMPLETION" in report, report
     assert "DETERMINISTIC_SERVER_SIDE_READ_COMPLETION" not in report, report
+    assert "Evidence authority: bridge_runtime" in report, report
+    assert "Narrative authority: model_finalizer" in report, report
+    assert "Files inspected: docs/visible-commentary.md" in report, report
+    assert "Model-authored narrative:" in report, report
     assert prompts and "Do not call tools" in prompts[0], prompts
+    assert "runtime owns status" in prompts[0].lower(), prompts[0]
     assert "# Visible Commentary" in prompts[0], prompts[0]
+
+
+def assert_obsolete_grouped_pending_read_does_not_downgrade_completed_floor():
+    handoff_obj = {
+        "schema_version": 1,
+        "role": "Scout",
+        "goal": "Read required files",
+        "task_type": "scout",
+        "owned_paths": [],
+        "read_only_paths": ["README.md", "bridge.py", "codex_oss/visible_commentary.py"],
+        "forbidden_actions": ["do not write files"],
+        "verification_steps": ["read listed files"],
+        "deliverable_fields": ["files inspected", "confidence", "caveats"],
+        "completion_rule": "stop after deliverable",
+        "escalation_rule": "stop if blocked",
+    }
+    handoff = "OSS_HANDOFF_JSON:\n" + json.dumps(handoff_obj)
+    child = StoredResponse(
+        response_id="resp_child_grouped",
+        model_alias="ocg-deepseek-v4-flash",
+        model_upstream="deepseek-v4-flash",
+        messages=[{"role": "user", "content": handoff}],
+        pending_call_ids=["call_grouped"],
+        created_at=1,
+        tool_exchange_count=1,
+        task_max_exchanges=6,
+        previous_response_id="resp_parent",
+        pending_replay_count=3,
+        output_items_json=json.dumps([{
+            "type": "function_call",
+            "call_id": "call_grouped",
+            "name": "exec_command",
+            "arguments": json.dumps({"cmd": "cat README.md bridge.py codex_oss/visible_commentary.py"}),
+        }]),
+    )
+
+    def fake_executor(path, workdir):
+        return 0, f"contents for {path}"
+
+    report = complete_pending_reads_from_bridge(
+        parent_response_id="resp_parent",
+        child_state=child,
+        handoff_text=handoff,
+        project_root=ROOT,
+        executor=fake_executor,
+        finalizer_call=lambda prompt, timeout: (
+            "Findings: The required read-only files were inspected from bridge evidence.\n"
+            "Confidence: HIGH\n"
+            "Caveats: The summary is limited to the provided excerpts."
+        ),
+    )
+    assert report.startswith("COMPLETE"), report
+    assert "MODEL_AUTHORED_SERVER_SIDE_READ_COMPLETION" in report, report
+    assert "Evidence-gathering status: PASS" in report, report
+    assert "pending read path is outside required sources" not in report, report
+
+
+def assert_blocked_read_outputs_do_not_count_as_successful_inspections():
+    handoff_obj = {
+        "schema_version": 1,
+        "role": "Scout",
+        "goal": "Read required files",
+        "task_type": "scout",
+        "owned_paths": [],
+        "read_only_paths": ["README.md", "bridge.py"],
+        "forbidden_actions": ["do not write files"],
+        "verification_steps": ["read listed files"],
+        "deliverable_fields": ["files inspected", "confidence", "caveats"],
+        "completion_rule": "stop after deliverable",
+        "escalation_rule": "stop if blocked",
+    }
+    handoff = "OSS_HANDOFF_JSON:\n" + json.dumps(handoff_obj)
+    blocked = "Command blocked by PreToolUse hook: use `rtk read ...` instead of raw `cat`."
+    child = StoredResponse(
+        response_id="resp_child_blocked_cat",
+        model_alias="ocg-deepseek-v4-flash",
+        model_upstream="deepseek-v4-flash",
+        messages=[
+            {"role": "user", "content": handoff},
+            {"role": "assistant", "content": "", "tool_calls": [{
+                "id": "call_readme",
+                "type": "function",
+                "function": {"name": "exec_command", "arguments": json.dumps({"cmd": "cat README.md"})},
+            }]},
+            {"role": "tool", "tool_call_id": "call_readme", "content": blocked},
+        ],
+        pending_call_ids=["call_bridge"],
+        created_at=1,
+        tool_exchange_count=1,
+        task_max_exchanges=6,
+        previous_response_id="resp_parent",
+        pending_replay_count=3,
+        output_items_json=json.dumps([{
+            "type": "function_call",
+            "call_id": "call_bridge",
+            "name": "exec_command",
+            "arguments": json.dumps({"cmd": "cat bridge.py"}),
+        }]),
+    )
+
+    def fake_executor(path, workdir):
+        return 0, f"actual file contents for {path}"
+
+    report = complete_pending_reads_from_bridge(
+        parent_response_id="resp_parent",
+        child_state=child,
+        handoff_text=handoff,
+        project_root=ROOT,
+        executor=fake_executor,
+        finalizer_call=lambda prompt, timeout: (
+            "Findings: The required files were inspected from bridge-owned read evidence.\n"
+            "Confidence: HIGH\n"
+            "Caveats: The narrative is limited to the provided excerpts."
+        ),
+    )
+    assert report.startswith("COMPLETE"), report
+    assert "MODEL_AUTHORED_SERVER_SIDE_READ_COMPLETION" in report, report
+    assert "source=consumer_tool_output" not in report, report
+    assert "Command blocked by PreToolUse" not in report, report
+    assert "README.md" in report and "bridge.py" in report, report
 
 
 def assert_declared_read_floor_completes_before_pending_adoption_recovery():
@@ -954,14 +1676,13 @@ def assert_declared_read_floor_completes_before_pending_adoption_recovery():
 
     def fake_finalizer(prompt, timeout):
         assert "Do not call tools" in prompt, prompt
+        assert "runtime owns status" in prompt.lower(), prompt
         assert "README contents" in prompt, prompt
         assert "contents for bridge.py" in prompt, prompt
         return (
-            "COMPLETE\n"
-            "Files inspected: README.md, bridge.py, tests/test_protocol_conformance.py\n"
             "Findings: All declared read-only sources were inspected by the bridge-owned evidence floor.\n"
             "Confidence: HIGH\n"
-            "Caveats: No writes were performed."
+            "Caveats: The narrative is limited to bridge-provided read evidence."
         )
 
     report = complete_declared_reads_from_bridge(
@@ -977,6 +1698,9 @@ def assert_declared_read_floor_completes_before_pending_adoption_recovery():
     assert report.startswith("COMPLETE"), report
     assert "MODEL_AUTHORED_SERVER_SIDE_READ_COMPLETION" in report, report
     assert "Reason: declared_read_floor_completed_by_bridge" in report, report
+    assert "Evidence authority: bridge_runtime" in report, report
+    assert "Narrative authority: model_finalizer" in report, report
+    assert "Files inspected: README.md, bridge.py, tests/test_protocol_conformance.py" in report, report
     assert "pending_tool_call_not_adopted_recovered_by_bridge" not in report, report
     assert executed == [
         ("bridge.py", ROOT),
@@ -1019,7 +1743,56 @@ def assert_server_side_read_completion_falls_back_when_model_report_invalid():
     assert "Running the first verification step" not in report, report
 
 
-def assert_declared_read_floor_deterministic_report_names_proactive_boundary():
+def assert_model_read_narrative_strips_authority_lines_before_merge():
+    raw = (
+        "COMPLETE\n"
+        "**Files inspected:** README.md, bridge.py\n"
+        "- **Synthesis status:** COMPLETE\n"
+        "No files were created, modified, or executed.\n"
+        "**No files were written, modified, or executed during this task.**\n"
+        "Findings: The required files describe the bridge and visible commentary.\n"
+        "Confidence: HIGH\n"
+        "Caveats: The summary is limited to the provided excerpts."
+    )
+    cleaned = sanitize_model_read_narrative(raw)
+    assert "COMPLETE" not in cleaned, cleaned
+    assert "Files inspected:" not in cleaned, cleaned
+    assert "Synthesis status" not in cleaned, cleaned
+    assert "No files were created" not in cleaned, cleaned
+    assert "written, modified" not in cleaned, cleaned
+    assert "Findings:" in cleaned, cleaned
+    valid, missing = validate_model_read_narrative(raw, ["findings", "confidence", "caveats"])
+    assert valid, missing
+
+
+def assert_model_read_narrative_accepts_natural_findings_without_magic_heading():
+    valid, missing = validate_model_read_narrative(
+        (
+            "The visible commentary module describes how runtime-backed agents show "
+            "safe progress updates while preserving runtime authority.\n\n"
+            "Confidence is high because the evidence excerpt is direct.\n\n"
+            "The summary is limited to the provided excerpt."
+        ),
+        ["findings", "confidence", "caveats"],
+    )
+    assert valid, missing
+
+
+def assert_model_read_narrative_rejects_runtime_evidence_negation():
+    valid, missing = validate_model_read_narrative(
+        (
+            "Findings: Cannot read files because the bridge runtime is unavailable "
+            "for local filesystem access.\n"
+            "Confidence: very low.\n"
+            "Caveats: declared sources cannot be read from this runtime context."
+        ),
+        ["findings", "confidence", "caveats"],
+    )
+    assert not valid, missing
+    assert "runtime_evidence_negated" in missing, missing
+
+
+def assert_declared_read_floor_prefers_model_narrative_but_falls_back_deterministically():
     handoff = (
         "READ-ONLY PATHS: docs/visible-commentary.md\n"
         "DELIVERABLE: files inspected, confidence, caveats"
@@ -1034,10 +1807,50 @@ def assert_declared_read_floor_deterministic_report_names_proactive_boundary():
         finalizer_timeout_seconds=3,
         reason="declared_read_floor_completed_by_bridge",
     )
+    assert report.startswith("COMPLETE"), report
     assert "DETERMINISTIC_SERVER_SIDE_READ_COMPLETION" in report, report
-    assert "Reason: declared_read_floor_completed_by_bridge" in report, report
-    assert "avoid client continuation replay" in report, report
-    assert "consumer did not adopt" not in report, report
+    assert "Narrative status: runtime_deterministic_fallback" in report, report
+    assert "No writes performed: true" in report, report
+
+    authority_claim = complete_declared_reads_from_bridge(
+        parent_response_id="resp_parent",
+        messages=[{"role": "user", "content": handoff}],
+        handoff_text=handoff,
+        project_root=ROOT,
+        executor=lambda path, workdir: (0, "visible commentary docs"),
+        finalizer_call=lambda prompt, timeout: (
+            "COMPLETE\n"
+            "Files inspected: docs/visible-commentary.md\n"
+            "Findings: visible commentary docs describe safe public progress narration for runtime-backed agents.\n"
+            "Confidence: HIGH\n"
+            "Caveats: the narrative is limited to the provided evidence excerpt."
+        ),
+        finalizer_timeout_seconds=3,
+        reason="declared_read_floor_completed_by_bridge",
+    )
+    assert authority_claim.startswith("COMPLETE"), authority_claim
+    assert "MODEL_AUTHORED_SERVER_SIDE_READ_COMPLETION" in authority_claim, authority_claim
+    assert "Files inspected: docs/visible-commentary.md" in authority_claim, authority_claim
+    assert "COMPLETE\nFiles inspected" not in authority_claim, authority_claim
+    assert "Model-authored narrative:" in authority_claim, authority_claim
+
+    negating_report = complete_declared_reads_from_bridge(
+        parent_response_id="resp_parent",
+        messages=[{"role": "user", "content": handoff}],
+        handoff_text=handoff,
+        project_root=ROOT,
+        executor=lambda path, workdir: (0, "visible commentary docs"),
+        finalizer_call=lambda prompt, timeout: (
+            "Findings: Cannot read files because the bridge runtime is unavailable.\n"
+            "Confidence: very low.\n"
+            "Caveats: declared sources cannot be read from this runtime context."
+        ),
+        finalizer_timeout_seconds=3,
+        reason="declared_read_floor_completed_by_bridge",
+    )
+    assert negating_report.startswith("COMPLETE"), negating_report
+    assert "DETERMINISTIC_SERVER_SIDE_READ_COMPLETION" in negating_report, negating_report
+    assert "Cannot read files" not in negating_report, negating_report
 
 
 def assert_declared_read_floor_uses_portable_local_reader_by_default():
@@ -1065,12 +1878,93 @@ def assert_declared_read_floor_uses_portable_local_reader_by_default():
             messages=[{"role": "user", "content": handoff}],
             handoff_text=handoff,
             project_root=str(root),
+            finalizer_call=lambda prompt, timeout: (
+                "Findings: The portable local reader inspected both declared files.\n"
+                "Confidence: HIGH\n"
+                "Caveats: The narrative is limited to bridge-provided read evidence."
+            ),
+            reason="declared_read_floor_completed_by_bridge",
+        )
+        assert report.startswith("COMPLETE"), report
+        assert "MODEL_AUTHORED_SERVER_SIDE_READ_COMPLETION" in report, report
+        assert "docs/one.md" in report and "two.txt" in report, report
+        assert "file not found" not in report, report
+
+
+def assert_declared_read_floor_allows_explicit_absolute_local_reads():
+    with tempfile.TemporaryDirectory() as outside:
+        secret = Path(outside) / "outside.txt"
+        secret.write_text("explicit absolute read-only source", encoding="utf-8")
+        handoff_obj = {
+            "schema_version": 1,
+            "role": "Scout",
+            "goal": "Read fixed files",
+            "task_type": "scout",
+            "owned_paths": [],
+            "read_only_paths": [str(secret)],
+            "forbidden_actions": ["do not write files"],
+            "verification_steps": ["read listed files"],
+            "deliverable_fields": ["files inspected", "confidence", "caveats"],
+            "completion_rule": "stop after deliverable",
+            "escalation_rule": "stop if blocked",
+        }
+        handoff = "OSS_HANDOFF_JSON:\n" + json.dumps(handoff_obj)
+        report = complete_declared_reads_from_bridge(
+            parent_response_id="resp_parent",
+            messages=[{"role": "user", "content": handoff}],
+            handoff_text=handoff,
+            project_root=ROOT,
             finalizer_call=lambda prompt, timeout: "",
             reason="declared_read_floor_completed_by_bridge",
         )
         assert report.startswith("COMPLETE"), report
-        assert "docs/one.md" in report and "two.txt" in report, report
-        assert "file not found" not in report, report
+        assert "DETERMINISTIC_SERVER_SIDE_READ_COMPLETION" in report, report
+        assert "path outside project root blocked" not in report, report
+        assert str(secret) in report, report
+        assert "explicit absolute read-only source" not in report, report
+
+
+def assert_declared_read_floor_ignores_outside_workdir_for_local_reads():
+    with tempfile.TemporaryDirectory() as outside:
+        secret = Path(outside) / "outside.txt"
+        secret.write_text("outside workdir secret should never enter evidence", encoding="utf-8")
+        handoff_obj = {
+            "schema_version": 1,
+            "role": "Scout",
+            "goal": "Read fixed files",
+            "task_type": "scout",
+            "owned_paths": [],
+            "read_only_paths": ["outside.txt"],
+            "forbidden_actions": ["do not write files"],
+            "verification_steps": ["read listed files"],
+            "deliverable_fields": ["files inspected", "confidence", "caveats"],
+            "completion_rule": "stop after deliverable",
+            "escalation_rule": "stop if blocked",
+        }
+        handoff = "OSS_HANDOFF_JSON:\n" + json.dumps(handoff_obj)
+        messages = [
+            {"role": "user", "content": handoff},
+            {"role": "assistant", "content": "", "tool_calls": [{
+                "id": "call_outside",
+                "type": "function",
+                "function": {
+                    "name": "exec_command",
+                    "arguments": json.dumps({"cmd": "rtk read outside.txt", "workdir": outside}),
+                },
+            }]},
+        ]
+        report = complete_declared_reads_from_bridge(
+            parent_response_id="resp_parent",
+            messages=messages,
+            handoff_text=handoff,
+            project_root=ROOT,
+            finalizer_call=lambda prompt, timeout: "",
+            reason="declared_read_floor_completed_by_bridge",
+        )
+        assert report.startswith("PARTIAL"), report
+        assert "RUNTIME_SERVER_SIDE_READ_INCOMPLETE" in report, report
+        assert "DETERMINISTIC_SERVER_SIDE_READ_COMPLETION" not in report, report
+        assert "outside workdir secret should never enter evidence" not in report, report
 
 
 def assert_placeholder_read_paths_are_ignored_and_inline_target_recovers():
@@ -1262,8 +2156,20 @@ def assert_doctor_rejects_embedded_mission_examples_in_agreements():
 def main():
     assert_malformed_handoff_fails_closed()
     assert_exact_write_requires_exact_content()
-    assert_legacy_write_handoffs_do_not_receive_raw_tools_by_default()
+    assert_bounded_write_handoffs_receive_tools_by_default()
+    assert_bounded_write_handoffs_can_be_disabled_explicitly()
+    assert_fresh_raw_write_handoff_demotes_when_disabled()
     assert_no_match_search_is_still_covered()
+    assert_declared_absolute_read_paths_are_supported()
+    assert_bounded_write_handoff_is_not_read_floor_only()
+    assert_pretool_blocks_get_repair_turn_before_bounded_patch_terminalization()
+    assert_pending_owned_append_can_complete_server_side()
+    assert_pending_owned_append_recovery_is_idempotent_for_ignored_paths()
+    assert_shell_append_parser_supports_common_native_forms()
+    assert_pending_owned_verification_can_complete_server_side()
+    assert_pending_owned_verification_can_complete_declared_marker_write()
+    assert_pending_owned_generic_shell_can_complete_multi_file_write_server_side()
+    assert_pending_owned_generic_shell_rejects_outside_workdir()
     assert_incomplete_evidence_blocks_confident_pass()
     assert_patch_acceptance_requires_scope_change_and_verification()
     assert_verification_claims_need_observed_results()
@@ -1285,10 +2191,17 @@ def main():
     assert_orphan_tool_output_can_bind_pending_child_lineage()
     assert_pending_child_adoption_failure_can_complete_reads_server_side()
     assert_server_side_read_completion_prefers_model_authored_report()
+    assert_obsolete_grouped_pending_read_does_not_downgrade_completed_floor()
+    assert_blocked_read_outputs_do_not_count_as_successful_inspections()
     assert_declared_read_floor_completes_before_pending_adoption_recovery()
     assert_server_side_read_completion_falls_back_when_model_report_invalid()
-    assert_declared_read_floor_deterministic_report_names_proactive_boundary()
+    assert_model_read_narrative_strips_authority_lines_before_merge()
+    assert_model_read_narrative_accepts_natural_findings_without_magic_heading()
+    assert_model_read_narrative_rejects_runtime_evidence_negation()
+    assert_declared_read_floor_prefers_model_narrative_but_falls_back_deterministically()
     assert_declared_read_floor_uses_portable_local_reader_by_default()
+    assert_declared_read_floor_allows_explicit_absolute_local_reads()
+    assert_declared_read_floor_ignores_outside_workdir_for_local_reads()
     assert_placeholder_read_paths_are_ignored_and_inline_target_recovers()
     assert_handoff_extraction_prefers_current_user_task_over_repo_memory()
     assert_inline_required_paths_ignore_negative_mentions()

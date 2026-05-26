@@ -27,10 +27,10 @@ You: "Add a test for parseHeader() in src/parser.ts"
          │  Scope: single file, tests exist → Bounded implementation
          │
          ▼
-   GPT-5.5 spawns oss_deepseek_pro with fork_turns: "none"
-         │  Handoff: task, risk tier, allowed/forbidden paths, output format
-         ▼
-   DeepSeek writes test, returns confidence: HIGH
+  GPT-5.5 spawns oss_deepseek_implementer with fork_turns: "none"
+        │  Handoff: MissionV1 A4/A5 task, risk tier, allowed/forbidden paths, verification policy
+        ▼
+  Runtime owns patch/apply/verify/status; DeepSeek provides patch intent and rationale
          │
          ▼
    GPT-5.5 validates result. Accepts. Done.
@@ -48,17 +48,14 @@ Task received by GPT-5.5
     ├─ Scoping: what kind of work?
     │
     ├─ Exploration? (find X, map Y, search Z, trace imports)
-    │       → oss_kimi_rapid (read-only, fork_turns: "none")
+    │       → oss_kimi_investigator (runtime-controlled read-only, fork_turns: "none")
     │
     ├─ Docs/mechanical? (changelog, summaries, formatting, test inventory)
-    │       → oss_flash_support (read-only, fork_turns: "none", cheapest)
+    │       → oss_flash_context (runtime-controlled read-only, fork_turns: "none", cheapest)
     │
     ├─ Bounded implementation? (single file/module, tests exist, clear spec)
-    │       → oss_deepseek_pro (workspace-write, fork_turns: "none")
-    │       → Check confidence:
-    │           HIGH → accept
-    │           MEDIUM → accept with GPT review flag
-    │           LOW → escalate to GPT-5.4
+    │       → oss_deepseek_implementer (MissionV1 A4/A5, fork_turns: "none")
+    │       → Accept only if runtime artifacts show patch/apply/verify/status and GPT review agrees
     │
     └─ Ambiguous? (unclear scope, unknown blast radius)
             → oss_kimi_investigator first (runtime-controlled scout, fork_turns: "none")
@@ -72,13 +69,14 @@ Task received by GPT-5.5
 | `oss_kimi_investigator` | mission-a3-kimi (runtime) | medium | read-only | Repo nav, review, scouting, first-pass analysis | Auth, cross-module, critical paths |
 | `oss_deepseek_investigator` | mission-a3-deepseek (runtime) | high | read-only | Deeper investigation, multi-file analysis | Auth, critical paths |
 | `oss_flash_context` | mission-a2-flash (runtime) | medium | read-only | Docs, changelog, summaries, formatting | Correctness-critical work |
-| `oss_deepseek_pro` | deepseek-v4-pro (raw) | high | workspace-write | Bounded impl, debugging baseline | Cross-module (>2 files), critical paths |
+| `oss_deepseek_implementer` | mission-a5-deepseek (runtime) | high | runtime-controlled | Bounded implementation via MissionV1 A4/A5; runtime owns patch/apply/verify/status | Critical paths without certification |
+| `oss_deepseek_pro` | deepseek-v4-pro (raw) | high | workspace-write | Bounded low-risk implementation, debugging, and patch drafting | Cross-module (>2 files), critical paths |
 | `oss_kimi_rapid` | kimi-k2.6 (raw) | medium | read-only | Manual repo nav baseline | Auth, critical paths |
 | `oss_flash_support` | deepseek-v4-flash (raw) | medium | read-only | Manual docs/support baseline | Correctness-critical work |
 
-**Runtime-controlled (first 3 rows)** use MissionV1 contracts with governed tool access, evidence tracking, and audit artifacts. This is the recommended path for all OSS work.
+**Runtime-controlled agents** use MissionV1 contracts with governed tool access, evidence tracking, patch validation, and audit artifacts. This is the recommended path for all OSS work, including implementation.
 
-**Raw experimental (last 3 rows)** use prompt-only discipline with broad Codex tools. Research/baseline only.
+**Raw experimental agents** use prompt-only discipline without the full runtime control plane. `oss_deepseek_pro` may do bounded low-risk edits inside explicit owned paths; other raw agents remain read-only support/scout lanes.
 
 All agents require `model_provider = "opencode_bridge"` and `fork_turns: "none"`.
 
@@ -139,7 +137,7 @@ If your project has simple or no auth/database/CI, remove those from the safety 
 ### Adding new agents
 Create a new `.toml` in `.codex/agents/` following the existing format. Ensure:
 - `model_provider = "opencode_bridge"`
-- `model = "ocg-<model-id>"`
+- `model = "mission-a<tier>-<model>"` for runtime agents, especially MissionV1 A4/A5 implementation agents
 - `model_reasoning_effort = "high" | "medium" | "low"`
 - Spawn with `fork_turns: "none"`
 
@@ -159,13 +157,14 @@ Risk tier: low. Keep the result ready for a bounded implementation handoff.
 
 → Scout result. If bounded:
 ```
-Spawn oss_deepseek_pro with fork_turns: "none".
+Spawn oss_deepseek_implementer with fork_turns: "none".
 
-OSS_HANDOFF_JSON:
-{"schema_version":1,"role":"Bounded implementation worker","goal":"Add EmailValidationError handling to auth-router.ts following the existing pattern found by scout","task_type":"bounded_write","owned_paths":["src/auth-router.ts","src/auth/__tests__/auth-router.test.ts"],"read_only_paths":["src/auth-router.ts","src/auth/__tests__/auth-router.test.ts"],"forbidden_actions":["touch src/auth/token.js","touch src/auth/session.js"],"verification_steps":["Run focused auth-router tests"],"deliverable_fields":["files changed","verification","confidence","GPT review recommendation"],"completion_rule":"stop after the bounded patch and verification summary","escalation_rule":"stop if token/session behavior or broader auth invariants are required","write_allowed":true}
+<OSS_HANDOFF_JSON>
+{ "...": "MissionV1 A4/A5 produced by codex-oss mission compile" }
+</OSS_HANDOFF_JSON>
 
 Human context:
-Risk tier: medium because this touches an auth-adjacent file; GPT review remains required before acceptance.
+Risk tier: medium because this touches an auth-adjacent file; runtime owns patch construction, apply, verification, rollback, and final status. The model owns narrative, patch intent, and rationale only. GPT review remains required before acceptance.
 ```
 
 ### Example 2: Ambiguous → Scout → Escalate

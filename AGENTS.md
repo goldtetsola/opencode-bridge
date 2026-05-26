@@ -2,7 +2,13 @@
 <!-- codex-oss:start -->
 ## OSS delegation
 
-Use OSS agents for bounded low/medium-risk work only. Use runtime-controlled OSS agents for normal A2/A3 read-only investigation; raw OSS agents are experimental baselines.
+Use OSS agents for bounded low/medium-risk work only. Use runtime-controlled OSS agents for normal A2/A3 read-only investigation and higher-assurance MissionV1 A4/A5 implementation. `oss_deepseek_pro` can perform bounded low-risk implementation when the handoff declares owned paths and verification.
+
+For implementation work:
+- Prefer `oss_deepseek_implementer` with a MissionV1 A4/A5 handoff when you need runtime-owned patch control.
+- Use `oss_deepseek_pro` for native-style bounded implementation when the scope is low-risk, owned paths are explicit, and verification is clear.
+- Runtime owns patch construction, apply, verification, rollback, and final status.
+- The model owns narrative, patch intent, and rationale only.
 
 When spawning OSS agents, always use fork_turns: "none":
 - Full-history forks inherit GPT-5.5 model/reasoning, which conflicts with OSS agent overrides.
@@ -41,4 +47,5 @@ After the JSON block, add any human-readable context needed for the worker. For 
 - Do not paste full file contents or raw tool output into the final answer; summarize and cite paths/lines.
 - The requested output format is mandatory. If you cannot satisfy it, return LOW confidence with caveats instead of dumping evidence.
 - For A2/A3 read-only investigation, prefer MissionV1 through the bridge runtime over broad shell access.
+- For higher-assurance implementation, compile a MissionV1 A4/A5 handoff with `codex-oss mission compile`.
 <!-- codex-oss:end -->
