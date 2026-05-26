@@ -2,8 +2,8 @@
 
 **Date:** 2026-05-26  
 **Repo:** `opencode-bridge`  
-**Commits:** 12 (all workstreams complete, nothing deferred)  
-**Final state:** 11 test suites passing, 44/44 doctor checks, 0 failures
+**Commits:** 14 (all workstreams complete, NativeExperienceContractV1 added)  
+**Final state:** 12 test suites passing, 44/44 doctor checks, 0 failures
 
 ---
 
@@ -411,9 +411,11 @@ python3 tests/test_v9_transport.py
 
 ---
 
-## 10. Status: Nothing Deferred
+## 10. Status: All Items Complete
 
-All items from the original plan and the self-audit gap list are implemented and tested:
+All items from the original plan, the self-audit gap list, AND the review feedback are implemented and tested.
+
+### Implementation complete
 
 | Category | Tests | Integration |
 |---|---|---|
@@ -426,4 +428,37 @@ All items from the original plan and the self-audit gap list are implemented and
 | Implementation narrative | Schema + forbidden-claim rejection | Validated in implementation pipeline |
 | A6 certification | Policy gates + rollback proof | Tested offline |
 | Complex multi-file | DesiredStateV1, PatchRecipeV1, cross-module | Tested offline |
-| Burn-in CLI | `codex-oss smoke native-like-burnin --live` | Subprocess runner |
+| Burn-in CLI | leveled: native-runtime-burnin, native-report-burnin, native-ux-burnin | Subprocess runner |
+
+### Review feedback implemented
+
+| Category | Implementation |
+|---|---|
+| NativeExperienceContractV1 | `codex_oss/native_experience.py` — bronze/silver/gold/platinum evaluation with evidence gates |
+| CommentaryDeliveryV1 | Delivery state machine: created → sanitized → emitted → observed → rendered → reconciled |
+| Spawned transcript harness | `codex_oss/spawned_transcript.py` — captures SSE stream, extracts commentary, reconciles artifacts |
+| Leveled burn-in naming | Split into native-runtime-burnin, native-report-burnin, native-ux-burnin |
+| Gold UX gate | Requires ≥3 pre-final commentary events across 3 required event classes, observed by consumer |
+| Durable learnings | `DURABLE_LEARNINGS.md` — 7 categorical lessons from the review |
+
+### Capability levels
+
+| Level | What it proves | Status |
+|---|---|---|
+| **Bronze** | Runtime-safe: truth-owned, bounded, no unsafe writes | ✅ Proven |
+| **Silver** | Natural report: model-authored narrative over runtime evidence | ✅ Proven |
+| **Gold** | User-visible UX: spawned subagent shows commentary before final | ⏳ Harness built, needs live bridge + model calls |
+| **Platinum** | Tool-loop parity: Codex adopts bridged multi-step calls ≥95% | ⏳ Probes built, needs live adoption burn-in |
+
+### Gold UX burn-in (requires live bridge)
+
+```bash
+./bin/codex-oss smoke native-ux-burnin --models=oss_deepseek_pro
+```
+
+The harness spawns actual OSS subagents, captures the SSE transcript, extracts commentary messages, reconciles with mission artifacts, and evaluates against NativeExperienceContractV1. Gold pass requires:
+- ≥3 commentary events before final answer
+- All 3 required event classes present (start, progress, closure)
+- Commentary observed in consumer transcript
+- Runtime owns terminal truth
+- No unsafe writes or secrets
