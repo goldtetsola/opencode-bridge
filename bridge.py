@@ -2435,6 +2435,7 @@ def complete_declared_reads_from_bridge(
     log_fn=None,
     mission_dir: str = "",
     model_alias: str = "",
+    emitter=None,
 ) -> str:
     """Complete a declared read-only evidence floor without waiting for client adoption."""
     envelope = parse_task_envelope(handoff_text)
@@ -2452,11 +2453,25 @@ def complete_declared_reads_from_bridge(
         project_root, ".codex-oss", "missions", mission_id
     )
 
-    # Create visible commentary sink for read floor
+    # Create visible commentary sink for read floor with optional SSE streaming
+    stream_cb = None
+    if emitter is not None:
+        def _stream_commentary(event):
+            try:
+                emitter.emit_text_message(
+                    f"[{event.get('phase', '')}] {event.get('title', '')}",
+                    status="in_progress",
+                    phase=event.get('phase', 'read_floor'),
+                )
+            except Exception:
+                pass
+        stream_cb = _stream_commentary
+
     commentary = VisibleCommentarySink(
         mission_id=mission_id,
         mission_dir=resolved_mission_dir,
         mode="summary",
+        stream_callback=stream_cb,
     )
     commentary.emit(
         "mission_started",
@@ -5288,6 +5303,7 @@ class Handler(BaseHTTPRequestHandler):
                 and declared_read_floor_only(envelope)
                 and not _has_evidence_ledger(body)
             ):
+                emitter = ResponseEmitter(self, new_id("resp"), model_alias, bool(body.get("stream")))
                 report_text = complete_declared_reads_from_bridge(
                     parent_response_id=new_id("resp"),
                     messages=base_messages,
@@ -5297,10 +5313,10 @@ class Handler(BaseHTTPRequestHandler):
                     finalizer_timeout_seconds=float(os.getenv("OSS_SERVER_SIDE_READ_FINALIZER_TIMEOUT_SECONDS", "30")),
                     reason="declared_read_floor_completed_by_bridge",
                     log_fn=APP.log,
-                )
+                    emitter=emitter,
+                    )
                 if report_text:
                     APP.log("fresh_server_side_read_floor_complete", mode=handoff_mode)
-                    emitter = ResponseEmitter(self, new_id("resp"), model_alias, bool(body.get("stream")))
                     emitter.emit_text_message(report_text)
                     emitter.complete()
                     return
@@ -5498,6 +5514,7 @@ class Handler(BaseHTTPRequestHandler):
             and not _has_evidence_ledger(body)
         ):
             repaired_messages = repair_chat_history(prev_state.messages, tool_outputs)
+            emitter = ResponseEmitter(self, new_id("resp"), model_alias, bool(body.get("stream")))
             report_text = complete_declared_reads_from_bridge(
                 parent_response_id=str(prev_id or prev_state.response_id),
                 messages=repaired_messages,
@@ -5507,10 +5524,10 @@ class Handler(BaseHTTPRequestHandler):
                 finalizer_timeout_seconds=float(os.getenv("OSS_SERVER_SIDE_READ_FINALIZER_TIMEOUT_SECONDS", "30")),
                 reason="declared_read_floor_completed_by_bridge",
                 log_fn=APP.log,
+                emitter=emitter,
             )
             if report_text:
                 APP.log("proactive_server_side_read_floor_complete", mode=mode)
-                emitter = ResponseEmitter(self, new_id("resp"), model_alias, bool(body.get("stream")))
                 emitter.emit_text_message(report_text)
                 emitter.complete()
                 return
@@ -6020,6 +6037,7 @@ class Handler(BaseHTTPRequestHandler):
             and declared_read_floor_only(envelope)
             and not _has_evidence_ledger(body)
         ):
+            emitter = ResponseEmitter(self, new_id("resp"), model_alias, bool(body.get("stream")))
             report_text = complete_declared_reads_from_bridge(
                 parent_response_id=new_id("resp"),
                 messages=base_messages,
@@ -6029,10 +6047,10 @@ class Handler(BaseHTTPRequestHandler):
                 finalizer_timeout_seconds=float(os.getenv("OSS_SERVER_SIDE_READ_FINALIZER_TIMEOUT_SECONDS", "30")),
                 reason="declared_read_floor_completed_by_bridge",
                 log_fn=APP.log,
+                emitter=emitter,
             )
             if report_text:
                 APP.log("fresh_server_side_read_floor_complete", mode=handoff_mode)
-                emitter = ResponseEmitter(self, new_id("resp"), model_alias, bool(body.get("stream")))
                 emitter.emit_text_message(report_text)
                 emitter.complete()
                 return

@@ -191,6 +191,17 @@ def main():
     native_polish.add_argument("--timeout", type=float, default=120, help="HTTP timeout per smoke request")
     native_polish.add_argument("--json", action="store_true", help="Machine-readable output")
 
+    native_burnin = smoke_sub.add_parser("native-like-burnin", help="Run bronze/silver/gold native-like burn-in matrix")
+    native_burnin.add_argument("--project", type=str, default=None, help="Project root path")
+    native_burnin.add_argument("--port", type=int, default=4000, help="Bridge port")
+    native_burnin.add_argument("--base-url", default=None, help="Bridge base URL, default http://127.0.0.1:<port>/v1")
+    native_burnin.add_argument("--auth", default=None, help="Bearer token")
+    native_burnin.add_argument("--level", choices=["bronze", "silver", "gold", "all"], default="all", help="Burn-in level")
+    native_burnin.add_argument("--live", action="store_true", help="Run live bridge tests (requires running bridge)")
+    native_burnin.add_argument("--models", default="oss_deepseek_pro", help="Comma-separated model aliases for live tests")
+    native_burnin.add_argument("--timeout", type=float, default=120, help="HTTP timeout per live request")
+    native_burnin.add_argument("--json", action="store_true", help="Machine-readable output")
+
     certify = sub.add_parser("certify", help="Run explicit certification gates and write certification artifacts")
     certify.add_argument("--project", type=str, default=None, help="Project root path")
     certify.add_argument("--target", choices=["runtime_backed", "open_investigation", "repo_hygiene", "raw_free_editing_smoke", "raw_free_editing", "all"], default="all")
@@ -660,8 +671,68 @@ def _smoke(args) -> int:
                         if details.get(key):
                             print(f"  {key}: {details[key]}")
         return 0 if report.get("ok") else 1
+
+    if args.smoke_command == "native-like-burnin":
+        return _run_native_like_burnin(args)
+
     print("Usage: codex-oss smoke native-polish")
     return 1
+
+
+def _run_native_like_burnin(args) -> int:
+    """Run the native-like burn-in matrix from CLI."""
+    import os as _os
+    project_root = args.project or _os.getcwd()
+    base_url = (args.base_url or f"http://127.0.0.1:{args.port}/v1").rstrip("/")
+    auth = args.auth or _os.getenv("PROXY_API_KEY") or _os.getenv("LITELLM_MASTER_KEY") or "sk-local-codex-bridge"
+
+    # Set env vars for the test suite
+    if args.live:
+        _os.environ["LIVE"] = "1"
+        _os.environ["OSS_BRIDGE_URL"] = base_url
+        _os.environ["PROXY_API_KEY"] = auth
+        _os.environ["LIVE_MODELS"] = args.models
+    else:
+        _os.environ["LIVE"] = "0"
+
+    level = args.level
+
+    # Run the test suite
+    import subprocess
+    import sys
+
+    test_file = _os.path.join(project_root, "tests", "test_native_like_live_matrix.py")
+    if not _os.path.exists(test_file):
+        print(f"Test file not found: {test_file}", file=sys.stderr)
+        return 1
+
+    env = _os.environ.copy()
+    env["PYTHONPATH"] = project_root
+
+    print(f"Running native-like burn-in (level={level}, live={args.live})")
+    if args.live:
+        print(f"  Bridge: {base_url}")
+        print(f"  Models: {args.models}")
+    print()
+
+    result = subprocess.run(
+        [sys.executable, test_file],
+        cwd=project_root,
+        env=env,
+        capture_output=not args.json,
+        text=True,
+        timeout=float(args.timeout) + 30,
+    )
+
+    if args.json:
+        # Machine-readable: just pass through exit code
+        pass
+    else:
+        print(result.stdout)
+        if result.stderr:
+            print(result.stderr, file=sys.stderr)
+
+    return result.returncode
 
 
 def _mission_template(args) -> int:
