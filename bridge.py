@@ -77,6 +77,17 @@ from codex_oss.handoff import (
     structured_handoff_to_envelope as _structured_handoff_to_envelope,
 )
 
+from codex_oss.read_evidence import (
+    build_bounded_finalizer_prompt,
+    log_finalizer_attempt,
+    parse_read_narrative_draft,
+    validate_read_narrative_draft,
+    build_model_authored_read_report,
+    build_canonical_read_evidence,
+    build_read_report_skeleton,
+    persist_read_artifacts,
+)
+
 JSON = Dict[str, Any]
 BRIDGE_VERSION = "12.0"
 
@@ -2233,39 +2244,102 @@ def try_model_authored_server_side_read_report(
     timeout_seconds: float,
     reason: str = "pending_tool_call_not_adopted_recovered_by_bridge",
     log_fn=None,
+    mission_dir: str = "",
+    model_alias: str = "",
 ) -> str:
     """Return natural model-authored read report when a bounded finalizer succeeds."""
     if not callable(finalizer_call):
         return ""
-    required_fields = _model_read_narrative_required_fields(handoff_text)
-    prompt = build_server_side_read_finalizer_prompt(
+
+    # Build bounded prompt using read_evidence module
+    prompt, prompt_stats = build_bounded_finalizer_prompt(
         handoff_text=handoff_text,
         required_paths=required_paths,
         evidence=evidence,
         failures=failures,
     )
+
+    started = time.time()
     try:
         text = str(finalizer_call(prompt, timeout_seconds) or "").strip()
+        elapsed = time.time() - started
     except Exception as exc:
+        elapsed = time.time() - started
         if log_fn:
             log_fn("server_side_read_model_finalizer_failed", error=str(exc))
+        if mission_dir:
+            log_finalizer_attempt(
+                mission_dir=mission_dir,
+                model_alias=model_alias,
+                prompt_chars=prompt_stats["prompt_chars"],
+                files_count=prompt_stats["files_included"],
+                excerpt_chars_total=prompt_stats["excerpt_chars_total"],
+                timeout_seconds=timeout_seconds,
+                elapsed_seconds=elapsed,
+                result="provider_error",
+                validation_errors=[str(exc)[:200]],
+            )
         return ""
-    valid, missing = validate_model_read_narrative(text, required_fields)
+
+    # Parse ReadNarrativeDraftV1 from model output
+    narrative_draft, parse_error = parse_read_narrative_draft(text)
+    if narrative_draft is None:
+        if log_fn:
+            log_fn("server_side_read_model_finalizer_invalid",
+                    error=parse_error, text_len=len(text))
+        if mission_dir:
+            log_finalizer_attempt(
+                mission_dir=mission_dir,
+                model_alias=model_alias,
+                prompt_chars=prompt_stats["prompt_chars"],
+                files_count=prompt_stats["files_included"],
+                excerpt_chars_total=prompt_stats["excerpt_chars_total"],
+                timeout_seconds=timeout_seconds,
+                elapsed_seconds=elapsed,
+                result="schema_invalid",
+                validation_errors=[parse_error or "no findings extracted"],
+            )
+        return ""
+
+    # Validate narrative against evidence
+    valid, validation_errors = validate_read_narrative_draft(narrative_draft, evidence)
+
+    if mission_dir:
+        log_finalizer_attempt(
+            mission_dir=mission_dir,
+            model_alias=model_alias,
+            prompt_chars=prompt_stats["prompt_chars"],
+            files_count=prompt_stats["files_included"],
+            excerpt_chars_total=prompt_stats["excerpt_chars_total"],
+            timeout_seconds=timeout_seconds,
+            elapsed_seconds=elapsed,
+            result="success" if valid else "semantic_invalid",
+            validation_errors=validation_errors if not valid else [],
+        )
+
     if not valid:
         if log_fn:
-            log_fn("server_side_read_model_finalizer_invalid", missing=missing, text_len=len(text))
+            log_fn("server_side_read_model_finalizer_semantic_invalid",
+                    errors=validation_errors, text_len=len(text))
         return ""
-    cleaned_text = sanitize_model_read_narrative(text)
+
     if log_fn:
-        log_fn("server_side_read_model_finalizer_ok", text_len=len(cleaned_text))
-    return build_model_authored_server_side_read_completion_report(
+        log_fn("server_side_read_model_finalizer_ok",
+                text_len=len(text),
+                findings_count=len(narrative_draft.get("findings", []) or []))
+
+    child_response_id = child_state.response_id if child_state else "none"
+    replay_count = child_state.pending_replay_count if child_state else 0
+
+    return build_model_authored_read_report(
         parent_response_id=parent_response_id,
-        child_state=child_state,
+        child_response_id=child_response_id,
+        replay_count=replay_count,
         required_paths=required_paths,
         evidence=evidence,
         failures=failures,
         reason=reason,
-        narrative=cleaned_text,
+        narrative_draft=narrative_draft,
     )
 
 
@@ -2305,6 +2379,8 @@ def complete_declared_reads_from_bridge(
     finalizer_timeout_seconds: float = 12,
     reason: str = "declared_read_floor_completed_by_bridge",
     log_fn=None,
+    mission_dir: str = "",
+    model_alias: str = "",
 ) -> str:
     """Complete a declared read-only evidence floor without waiting for client adoption."""
     envelope = parse_task_envelope(handoff_text)
@@ -2322,6 +2398,26 @@ def complete_declared_reads_from_bridge(
         read_executor=read_executor,
         workdir=workdir,
     )
+
+    # Persist canonical read evidence artifacts
+    mission_id = envelope.get("mission_id", "") or f"read_{_hash_text(handoff_text)[:12]}"
+    resolved_mission_dir = mission_dir or os.path.join(
+        project_root, ".codex-oss", "missions", mission_id
+    )
+
+    # Write canonical read evidence and skeleton immediately after evidence gathering
+    _persist_read_evidence_artifacts(
+        mission_dir=resolved_mission_dir,
+        mission_id=mission_id,
+        required_paths=required_paths,
+        evidence=evidence,
+        failures=failures,
+        status="COMPLETE" if not _remaining_required_paths(required_paths, set(evidence.keys())) and not failures else "PARTIAL",
+        synthesis_status="DETERMINISTIC_SERVER_SIDE_READ_COMPLETION",
+        parent_response_id=parent_response_id,
+        reason=reason,
+    )
+
     model_report = try_model_authored_server_side_read_report(
         parent_response_id=parent_response_id,
         child_state=None,
@@ -2333,8 +2429,22 @@ def complete_declared_reads_from_bridge(
         timeout_seconds=finalizer_timeout_seconds,
         reason=reason,
         log_fn=log_fn,
+        mission_dir=resolved_mission_dir,
+        model_alias=model_alias,
     )
     if model_report:
+        # Update artifacts with model-authored status
+        _persist_read_evidence_artifacts(
+            mission_dir=resolved_mission_dir,
+            mission_id=mission_id,
+            required_paths=required_paths,
+            evidence=evidence,
+            failures=failures,
+            status="COMPLETE" if not _remaining_required_paths(required_paths, set(evidence.keys())) and not failures else "PARTIAL",
+            synthesis_status="MODEL_AUTHORED_SERVER_SIDE_READ_COMPLETION",
+            parent_response_id=parent_response_id,
+            reason=reason,
+        )
         return model_report
     if reason == "declared_read_floor_completed_by_bridge":
         completed_paths = set(evidence.keys())
@@ -2372,6 +2482,41 @@ def complete_declared_reads_from_bridge(
         failures=failures,
         reason=reason,
     )
+
+
+def _persist_read_evidence_artifacts(
+    *,
+    mission_dir: str,
+    mission_id: str,
+    required_paths: list,
+    evidence: dict,
+    failures: list,
+    status: str,
+    synthesis_status: str,
+    parent_response_id: str = "none",
+    child_response_id: str = "none",
+    replay_count: int = 0,
+    reason: str = "",
+    narrative_draft=None,
+) -> None:
+    """Persist CanonicalReadEvidenceV1, ReadReportSkeletonV1, and related artifacts."""
+    try:
+        persist_read_artifacts(
+            mission_dir=mission_dir,
+            mission_id=mission_id,
+            required_paths=required_paths,
+            evidence=evidence,
+            failures=failures,
+            status=status,
+            synthesis_status=synthesis_status,
+            parent_response_id=parent_response_id,
+            child_response_id=child_response_id,
+            replay_count=replay_count,
+            reason=reason,
+            narrative_draft=narrative_draft,
+        )
+    except Exception:
+        pass  # Artifact persistence is best-effort
 
 
 def complete_pending_reads_from_bridge(
@@ -2457,6 +2602,23 @@ def complete_pending_reads_from_bridge(
             if "pending read path is outside required sources" not in str(failure)
         ]
 
+    # Persist canonical read evidence artifacts for pending recovery
+    mission_id = envelope.get("mission_id", "") or f"pending_read_{_hash_text(handoff_text)[:12]}"
+    mission_dir = os.path.join(project_root, ".codex-oss", "missions", mission_id)
+    _persist_read_evidence_artifacts(
+        mission_dir=mission_dir,
+        mission_id=mission_id,
+        required_paths=required_paths,
+        evidence=evidence,
+        failures=failures,
+        status="COMPLETE" if not _remaining_required_paths(required_paths, set(evidence.keys())) and not failures else "PARTIAL",
+        synthesis_status="DETERMINISTIC_SERVER_SIDE_READ_COMPLETION",
+        parent_response_id=parent_response_id,
+        child_response_id=child_state.response_id,
+        replay_count=child_state.pending_replay_count,
+        reason="pending_tool_call_not_adopted_recovered_by_bridge",
+    )
+
     model_report = try_model_authored_server_side_read_report(
         parent_response_id=parent_response_id,
         child_state=child_state,
@@ -2468,8 +2630,23 @@ def complete_pending_reads_from_bridge(
         timeout_seconds=finalizer_timeout_seconds,
         reason="pending_tool_call_not_adopted_recovered_by_bridge",
         log_fn=log_fn,
+        mission_dir=mission_dir,
+        model_alias="",
     )
     if model_report:
+        _persist_read_evidence_artifacts(
+            mission_dir=mission_dir,
+            mission_id=mission_id,
+            required_paths=required_paths,
+            evidence=evidence,
+            failures=failures,
+            status="COMPLETE" if not _remaining_required_paths(required_paths, set(evidence.keys())) and not failures else "PARTIAL",
+            synthesis_status="MODEL_AUTHORED_SERVER_SIDE_READ_COMPLETION",
+            parent_response_id=parent_response_id,
+            child_response_id=child_state.response_id,
+            replay_count=child_state.pending_replay_count,
+            reason="pending_tool_call_not_adopted_recovered_by_bridge",
+        )
         return model_report
 
     return build_server_side_read_completion_report(
