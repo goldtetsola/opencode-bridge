@@ -105,23 +105,51 @@ def build_response_object_from_chat(
             }
         )
 
-    state_put(
-        stored_response_factory(
-            response_id=response_id,
-            model_alias=model_alias,
-            model_upstream=model_upstream,
-            messages=all_messages,
-            pending_call_ids=pending_ids,
-            created_at=created_at,
-            output_items_json=json_dumps(output),
-            tool_exchange_count=int(body.get("_codex_oss_tool_exchange_count", 0) or 0),
-            task_max_exchanges=int(
-                body.get("_codex_oss_task_max_exchanges")
-                or extract_budget(base_messages)
-            ),
-            previous_response_id=str(body.get("previous_response_id") or ""),
-        )
+    stored = stored_response_factory(
+        response_id=response_id,
+        model_alias=model_alias,
+        model_upstream=model_upstream,
+        messages=all_messages,
+        pending_call_ids=pending_ids,
+        created_at=created_at,
+        output_items_json=json_dumps(output),
+        tool_exchange_count=int(body.get("_codex_oss_tool_exchange_count", 0) or 0),
+        task_max_exchanges=int(
+            body.get("_codex_oss_task_max_exchanges")
+            or extract_budget(base_messages)
+        ),
+        previous_response_id=str(body.get("previous_response_id") or ""),
     )
+
+    # ── v11: Initialize adoption probes for pending tool calls ──
+    if pending_ids and model_alias:
+        try:
+            from codex_oss.tool_call_adoption import ResponsesToolStateMachine
+            sm = ResponsesToolStateMachine(response_id)
+            sm.parent_response_id = str(body.get("previous_response_id") or "") or None
+            for x in tool_calls_out:
+                fc = x["codex"]
+                sm.register_tool_call(
+                    call_id=fc["call_id"],
+                    tool_name=fc["name"],
+                    arguments={"raw": fc["arguments"]},
+                    output_item_id=fc["id"],
+                )
+            # Serialize back onto stored response for persistence
+            stored.adoption_probes_json = json_dumps({
+                "calls": {
+                    call_id: {
+                        k: v for k, v in state.items()
+                        if k not in ("arguments_preview",)
+                    }
+                    for call_id, state in sm.calls.items()
+                },
+                "sequence": sm.sequence,
+            })
+        except Exception:
+            pass  # Adoption probes are best-effort
+
+    state_put(stored)
 
     usage = chat_resp.get("usage") or {}
     return {

@@ -325,6 +325,38 @@ class StoredResponse:
     command_ledger_json: str = ""  # v10: pipe-sep commands
     previous_response_id: str = ""
     pending_replay_count: int = 0
+    adoption_probes_json: str = ""  # v11: JSON-serialized ToolCallAdoptionProbeV1 list
+
+
+def adoption_state_machine_from_response(stored: StoredResponse) -> "ResponsesToolStateMachine":
+    """Deserialize adoption state machine from StoredResponse, or create new."""
+    from codex_oss.tool_call_adoption import ResponsesToolStateMachine
+    sm = ResponsesToolStateMachine(stored.response_id)
+    if stored.adoption_probes_json:
+        try:
+            data = json.loads(stored.adoption_probes_json)
+            if isinstance(data, dict) and data.get("calls"):
+                for call_id, call_state in data["calls"].items():
+                    sm.calls[call_id] = dict(call_state)
+                sm.sequence = data.get("sequence", 0)
+        except Exception:
+            pass
+    sm.parent_response_id = stored.previous_response_id or None
+    return sm
+
+
+def adoption_state_machine_to_response(sm: "ResponsesToolStateMachine", stored: StoredResponse) -> None:
+    """Serialize adoption state machine back to StoredResponse."""
+    stored.adoption_probes_json = json.dumps({
+        "calls": {
+            call_id: {
+                k: v for k, v in state.items()
+                if k not in ("arguments_preview",)
+            }
+            for call_id, state in sm.calls.items()
+        },
+        "sequence": sm.sequence,
+    }, sort_keys=True)
 
 
 # ── v10: Task-class budgets ──
@@ -2970,6 +3002,16 @@ def complete_pending_reads_from_bridge(
         source="runtime",
         artifact_refs=["canonical_read_evidence.json", "visible_commentary.jsonl", "summary.md"],
     )
+    # ── v11: Persist adoption probes from child state ──
+    if child_state.adoption_probes_json:
+        try:
+            from codex_oss.tool_call_adoption import persist_adoption_probes
+            sm = adoption_state_machine_from_response(child_state)
+            probes = sm.to_probes()
+            persist_adoption_probes(mission_dir, probes, sm)
+        except Exception:
+            pass
+
     commentary.close({"status": status, "mission_id": mission_id, "confidence": "HIGH" if status == "COMPLETE" else "MEDIUM", "closure_source": "deterministic_server_side_read_completion"})
 
     return build_server_side_read_completion_report(
@@ -3582,6 +3624,10 @@ class StateStore:
             self.db.execute("ALTER TABLE responses ADD COLUMN output_items_json TEXT DEFAULT '[]'")
         except sqlite3.OperationalError:
             pass
+        try:
+            self.db.execute("ALTER TABLE responses ADD COLUMN adoption_probes_json TEXT DEFAULT ''")
+        except sqlite3.OperationalError:
+            pass
         self.db.commit()
 
     def cleanup(self) -> None:
@@ -3623,8 +3669,8 @@ class StateStore:
             self.db.execute(
                 """
                 INSERT OR REPLACE INTO responses
-                (response_id, model_alias, model_upstream, messages_json, pending_call_ids_json, created_at, tool_exchange_count, task_max_exchanges, previous_response_id, pending_replay_count, output_items_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (response_id, model_alias, model_upstream, messages_json, pending_call_ids_json, created_at, tool_exchange_count, task_max_exchanges, previous_response_id, pending_replay_count, output_items_json, adoption_probes_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     state.response_id,
@@ -3638,6 +3684,7 @@ class StateStore:
                     state.previous_response_id,
                     state.pending_replay_count,
                     state.output_items_json or "[]",
+                    state.adoption_probes_json or "",
                 ),
             )
             for call_id in state.pending_call_ids:
@@ -3653,7 +3700,7 @@ class StateStore:
                 "SELECT response_id, model_alias, model_upstream, messages_json, pending_call_ids_json, created_at, "
                 "COALESCE(tool_exchange_count, 0), COALESCE(task_max_exchanges, 1), "
                 "COALESCE(previous_response_id, ''), COALESCE(pending_replay_count, 0), "
-                "COALESCE(output_items_json, '[]') "
+                "COALESCE(output_items_json, '[]'), COALESCE(adoption_probes_json, '') "
                 "FROM responses WHERE response_id = ?",
                 (response_id,),
             ).fetchone()
@@ -3671,6 +3718,7 @@ class StateStore:
             previous_response_id=row[8] if len(row) > 8 else "",
             pending_replay_count=row[9] if len(row) > 9 else 0,
             output_items_json=row[10] if len(row) > 10 else "[]",
+            adoption_probes_json=row[11] if len(row) > 11 else "",
         )
 
     def find_by_call_ids(self, call_ids: Iterable[str]) -> Optional[StoredResponse]:
@@ -5365,6 +5413,14 @@ class Handler(BaseHTTPRequestHandler):
 
         reverse_name_map = {}
         if prev_state:
+            # ── v11: Mark tool call as adopted by Codex consumer ──
+            if tool_call_id:
+                sm = adoption_state_machine_from_response(prev_state)
+                if tool_call_id in sm.calls:
+                    sm.mark_adopted(tool_call_id)
+                    sm.mark_completed(tool_call_id, tool_output_text)
+                    adoption_state_machine_to_response(sm, prev_state)
+                    APP.state.put(prev_state)
             # Try to find the tool name from the stored messages
             for msg in prev_state.messages:
                 tool_calls = msg.get("tool_calls") or []
