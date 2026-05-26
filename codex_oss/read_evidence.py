@@ -933,6 +933,13 @@ class RuntimeContractCompleter:
         return "zero_match" in kind or "grep_zero_match" in kind
 
 
+SECRET_PATTERNS: list = [
+    (r'(?:OPENCODE_GO|OPENCODE|OPENAI|ANTHROPIC|PROXY)_(?:API_)?KEY\s*=\s*(sk-[A-Za-z0-9\-_]+)', '[redacted key]'),
+    (r'Bearer\s+(sk-[A-Za-z0-9\-_]+)', 'Bearer [redacted]'),
+    (r'sk-[A-Za-z0-9\-_]{12,}', '[redacted key]'),
+]
+
+
 def _safe_evidence_excerpt(content: str, max_chars: int = 3000) -> tuple[str, bool]:
     """Extract a safe excerpt from evidence content."""
     text = str(content or "")
@@ -947,8 +954,90 @@ def _safe_evidence_excerpt(content: str, max_chars: int = 3000) -> tuple[str, bo
     return text, found_secret
 
 
-SECRET_PATTERNS: list = [
-    (r'(?:OPENCODE_GO|OPENCODE|OPENAI|ANTHROPIC|PROXY)_(?:API_)?KEY\s*=\s*(sk-[A-Za-z0-9\-_]+)', '[redacted key]'),
-    (r'Bearer\s+(sk-[A-Za-z0-9\-_]+)', 'Bearer [redacted]'),
-    (r'sk-[A-Za-z0-9\-_]{12,}', '[redacted key]'),
-]
+# ── CanonicalPatchEvidenceV1 ───────────────────────────────────────────────
+
+
+def build_canonical_patch_evidence(
+    *,
+    mission_id: str,
+    owned_paths: list[str],
+    changed_paths: list[str],
+    write_status: str = "applied",
+    readback_status: str = "verified",
+    before_hashes: dict[str, str] | None = None,
+    after_hashes: dict[str, str] | None = None,
+    writes_outside_owned_paths: bool = False,
+    verification_status: str = "passed",
+    verification_method: str = "readback_exact_match",
+    rollback_available: bool = True,
+) -> JSON:
+    """Build CanonicalPatchEvidenceV1 for implementation missions."""
+    before = before_hashes or {}
+    after = after_hashes or {}
+    return {
+        "schema_version": "canonical_patch_evidence.v1",
+        "mission_id": mission_id,
+        "owned_paths": list(owned_paths or []),
+        "changed_paths": list(changed_paths or []),
+        "write_status": write_status,
+        "readback_status": readback_status,
+        "before_hashes": before,
+        "after_hashes": after,
+        "writes_outside_owned_paths": writes_outside_owned_paths,
+        "verification": {
+            "status": verification_status,
+            "method": verification_method,
+        },
+        "rollback_available": rollback_available,
+    }
+
+
+# ── ImplementationNarrativeDraftV1 ─────────────────────────────────────────
+
+
+def build_implementation_narrative_draft(
+    *,
+    change_summary: str = "",
+    verification_summary: str = "",
+    risk_summary: str = "",
+    caveats: list[str] | None = None,
+) -> JSON:
+    return {
+        "schema_version": "implementation_narrative_draft.v1",
+        "change_summary": change_summary,
+        "verification_summary": verification_summary,
+        "risk_summary": risk_summary,
+        "caveats": caveats or [],
+    }
+
+
+def validate_implementation_narrative_draft(
+    draft: JSON,
+    changed_paths: list[str] | None = None,
+) -> tuple[bool, list[str]]:
+    """Validate ImplementationNarrativeDraftV1 against runtime-owned facts."""
+    reasons: list[str] = []
+    if not isinstance(draft, dict) or draft.get("schema_version") != "implementation_narrative_draft.v1":
+        reasons.append("not a valid ImplementationNarrativeDraftV1")
+        return False, reasons
+
+    text = json.dumps(draft)
+
+    # Model must not claim runtime authority
+    forbidden = [
+        r'\b(applied|modified|changed|verified|validated)\s+(?:the\s+)?(?:file|patch|code)\b',
+        r'\bmain\s+workspace\s+(?:was\s+)?mutated\b',
+        r'\bverification\s+(?:passed|failed)\b',
+        r'\bstatus\s*:\s*(?:applied|verified|validated)\b',
+        r'\bwrites?\s+(?:were\s+)?(?:applied|performed|executed)\b',
+    ]
+    for pattern in forbidden:
+        if re.search(pattern, text, re.IGNORECASE):
+            reasons.append(f"forbidden authority claim: {pattern}")
+            break
+
+    # Must have at least change_summary
+    if not str(draft.get("change_summary", "") or "").strip():
+        reasons.append("missing change_summary")
+
+    return not reasons, reasons

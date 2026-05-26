@@ -90,14 +90,7 @@ from codex_oss.read_evidence import (
 
 from codex_oss.visible_commentary import VisibleCommentarySink
 
-from codex_oss.tool_call_adoption import (
-    ResponsesToolStateMachine,
-    build_adoption_probe,
-    build_adopted_probe,
-    build_not_adopted_probe,
-    persist_adoption_probes,
-    check_adoption_promotion_gate,
-)
+# tool_call_adoption probes loaded on-demand via codex_oss.tool_call_adoption
 
 JSON = Dict[str, Any]
 BRIDGE_VERSION = "12.0"
@@ -1854,6 +1847,24 @@ def _workdir_from_history(messages: list, default: str) -> str:
     return default
 
 
+
+def _extract_pattern_from_args(args: Any, tool_name: str = "") -> str:
+    """Extract a search pattern from tool call arguments."""
+    if isinstance(args, str):
+        try:
+            parsed = json.loads(args)
+        except Exception:
+            # Try to extract pattern from raw string
+            import re as _re
+            m = _re.search(r'(?:pattern|query|search)[=:]\\s*["\'"]?([^\\s"\'"]+)', args)
+            return m.group(1) if m else ""
+    else:
+        parsed = args
+    if isinstance(parsed, dict):
+        return str(parsed.get("pattern", "") or parsed.get("query", "") or "")
+    return ""
+
+
 def _matching_required_path(path: str, required_paths: list) -> str:
     for required in required_paths or []:
         if _path_satisfies_required_path(path, required):
@@ -2423,6 +2434,14 @@ def complete_declared_reads_from_bridge(
         source="runtime",
         evidence_refs=sorted(required_paths)[:8],
     )
+    commentary.emit(
+        "read_floor_detected",
+        "Declared read floor identified",
+        f"The handoff declares {len(required_paths)} required read-only source(s). The runtime will complete this evidence floor server-side.",
+        phase="READ_FLOOR",
+        source="runtime",
+        metadata={"required_count": len(required_paths)},
+    )
 
     # Gather evidence from history
     history_evidence = _completed_read_evidence_from_history(messages)
@@ -2692,41 +2711,147 @@ def complete_pending_reads_from_bridge(
             if log_fn:
                 log_fn("server_side_read_fallback_skipped", reason="non_read_verification")
             return ""
+
+    # Derive mission identity and create commentary
+    mission_id = envelope.get("mission_id", "") or f"pending_read_{_hash_text(handoff_text)[:12]}"
+    mission_dir = os.path.join(project_root, ".codex-oss", "missions", mission_id)
+    commentary = VisibleCommentarySink(
+        mission_id=mission_id,
+        mission_dir=mission_dir,
+        mode="summary",
+    )
+    commentary.emit(
+        "mission_started",
+        "Pending read recovery started",
+        f"Recovering pending reads for {mission_id}. The consumer did not adopt pending tool calls.",
+        phase="READ_FLOOR",
+        source="runtime",
+    )
+
     read_executor = executor or _default_local_read_executor
     evidence = _completed_read_evidence_from_history(child_state.messages)
     failures = []
     workdir = _workdir_from_history(child_state.messages, project_root)
 
-    for item in _pending_tool_call_outputs_from_state(child_state):
+    # ── Execute pending tool calls (reads, greps, ls) ──
+    # Use RuntimeContractCompleter module functions for grep/ls support
+
+    pending_items = _pending_tool_call_outputs_from_state(child_state)
+    grep_count = 0
+    ls_count = 0
+    
+    commentary.emit(
+        "server_side_read_started",
+        "Recovering pending tool calls",
+        f"Found {len(pending_items)} pending tool call(s) to recover.",
+        phase="READ_FLOOR",
+        source="runtime",
+        metadata={"pending_count": len(pending_items)},
+    )
+
+    for item in pending_items:
         name = item.get("name", "")
         args = item.get("arguments", "{}")
         path, _ = normalize_tool_args(args, name)
         kind = effective_tool_kind(name, args, classify_tool_call_name(name))
         if path and _is_placeholder_path(path):
             continue
-        if kind != "read" or not path:
-            continue
-        required = _matching_required_path(path, required_paths)
-        if not required:
-            failures.append(f"pending read path is outside required sources: {path}")
-            continue
-        workdir = _command_workdir(args, workdir)
-        if any(_path_satisfies_required_path(done, required) for done in evidence):
-            continue
-        exit_code, output = read_executor(path, workdir)
-        if exit_code == 0:
+
+        if kind == "read" and path:
+            required = _matching_required_path(path, required_paths)
+            if not required:
+                failures.append(f"pending read path is outside required sources: {path}")
+                continue
+            workdir = _command_workdir(args, workdir)
+            if any(_path_satisfies_required_path(done, required) for done in evidence):
+                continue
+            exit_code, output = read_executor(path, workdir)
+            if exit_code == 0:
+                excerpt, redacted = _safe_evidence_excerpt(output)
+                evidence[required] = {
+                    "path": required,
+                    "source": "bridge_server_side_read",
+                    "exit_code": exit_code,
+                    "output_chars": len(output),
+                    "output_sha256": _hash_text(output),
+                    "output_excerpt": excerpt,
+                    "redactions_applied": redacted,
+                }
+            else:
+                failures.append(f"{required}: exit_code={exit_code} output={str(output)[:200]}")
+
+        elif kind in ("search", "grep", "grep_read") and path:
+            # Use RuntimeContractCompleter for grep actions
+            pattern = _extract_pattern_from_args(args, name)
+            if not pattern:
+                continue
+            grep_action = {
+                "kind": "required_grep",
+                "tool_name": "rtk_grep",
+                "arguments": {"path": path, "pattern": pattern},
+            }
+            from codex_oss.read_evidence import _execute_required_grep, _execute_required_ls
+            exit_code, output = _execute_required_grep(
+                grep_action["arguments"], project_root
+            )
+            grep_count += 1
+            key = f"grep:{path}:{pattern[:40]}"
             excerpt, redacted = _safe_evidence_excerpt(output)
-            evidence[required] = {
-                "path": required,
-                "source": "bridge_server_side_read",
+            evidence[key] = {
+                "path": key,
+                "source": "bridge_server_side_action",
                 "exit_code": exit_code,
                 "output_chars": len(output),
                 "output_sha256": _hash_text(output),
                 "output_excerpt": excerpt,
                 "redactions_applied": redacted,
+                "action_kind": "required_grep",
             }
-        else:
-            failures.append(f"{required}: exit_code={exit_code} output={str(output)[:200]}")
+            # grep exit_code 1 (no matches) is valid evidence
+            if exit_code != 0 and exit_code != 1:
+                failures.append(f"{name} on {path}: exit_code={exit_code}")
+
+        elif kind in ("ls", "list") and path:
+            ls_action = {
+                "kind": "required_ls",
+                "tool_name": "rtk_ls",
+                "arguments": {"path": path},
+            }
+            exit_code, output = _execute_required_ls(
+                ls_action["arguments"], project_root
+            )
+            ls_count += 1
+            key = f"ls:{path}"
+            excerpt, redacted = _safe_evidence_excerpt(output)
+            evidence[key] = {
+                "path": key,
+                "source": "bridge_server_side_action",
+                "exit_code": exit_code,
+                "output_chars": len(output),
+                "output_sha256": _hash_text(output),
+                "output_excerpt": excerpt,
+                "redactions_applied": redacted,
+                "action_kind": "required_ls",
+            }
+            if exit_code != 0:
+                failures.append(f"{name} on {path}: exit_code={exit_code}")
+
+    if grep_count:
+        commentary.emit(
+            "grep_actions_recovered",
+            "Grep actions recovered",
+            f"Executed {grep_count} grep/search action(s) server-side.",
+            phase="READ_FLOOR",
+            source="runtime",
+        )
+    if ls_count:
+        commentary.emit(
+            "ls_actions_recovered",
+            "List actions recovered",
+            f"Executed {ls_count} ls action(s) server-side.",
+            phase="READ_FLOOR",
+            source="runtime",
+        )
 
     _execute_missing_declared_reads(
         required_paths=required_paths,
@@ -2735,6 +2860,7 @@ def complete_pending_reads_from_bridge(
         read_executor=read_executor,
         workdir=workdir,
     )
+
     remaining_after_reads = _remaining_required_paths(required_paths, set(evidence.keys()))
     if not remaining_after_reads:
         failures = [
@@ -2742,22 +2868,34 @@ def complete_pending_reads_from_bridge(
             if "pending read path is outside required sources" not in str(failure)
         ]
 
-    # Persist canonical read evidence artifacts for pending recovery
-    mission_id = envelope.get("mission_id", "") or f"pending_read_{_hash_text(handoff_text)[:12]}"
-    mission_dir = os.path.join(project_root, ".codex-oss", "missions", mission_id)
+    completed = set(evidence.keys())
+    missing = _remaining_required_paths(required_paths, completed)
+    status = "COMPLETE" if not missing and not failures else "PARTIAL"
+
+    # Persist artifacts
     _persist_read_evidence_artifacts(
         mission_dir=mission_dir,
         mission_id=mission_id,
         required_paths=required_paths,
         evidence=evidence,
         failures=failures,
-        status="COMPLETE" if not _remaining_required_paths(required_paths, set(evidence.keys())) and not failures else "PARTIAL",
+        status=status,
         synthesis_status="DETERMINISTIC_SERVER_SIDE_READ_COMPLETION",
         parent_response_id=parent_response_id,
         child_response_id=child_state.response_id,
         replay_count=child_state.pending_replay_count,
         reason="pending_tool_call_not_adopted_recovered_by_bridge",
     )
+
+    # Attempt model-authored narration
+    if callable(finalizer_call) and not failures:
+        commentary.emit(
+            "model_finalizer_started",
+            "Requesting model-authored narrative",
+            "Attempting model-authored narrative over recovered evidence.",
+            phase="REPORT",
+            source="runtime",
+        )
 
     model_report = try_model_authored_server_side_read_report(
         parent_response_id=parent_response_id,
@@ -2773,21 +2911,66 @@ def complete_pending_reads_from_bridge(
         mission_dir=mission_dir,
         model_alias="",
     )
+
     if model_report:
+        commentary.emit(
+            "model_finalizer_succeeded",
+            "Model-authored narrative accepted",
+            "The model finalizer produced a valid narrative over recovered evidence.",
+            phase="REPORT",
+            source="runtime",
+        )
         _persist_read_evidence_artifacts(
             mission_dir=mission_dir,
             mission_id=mission_id,
             required_paths=required_paths,
             evidence=evidence,
             failures=failures,
-            status="COMPLETE" if not _remaining_required_paths(required_paths, set(evidence.keys())) and not failures else "PARTIAL",
+            status=status,
             synthesis_status="MODEL_AUTHORED_SERVER_SIDE_READ_COMPLETION",
             parent_response_id=parent_response_id,
             child_response_id=child_state.response_id,
             replay_count=child_state.pending_replay_count,
             reason="pending_tool_call_not_adopted_recovered_by_bridge",
         )
+        commentary.emit(
+            "mission_completed",
+            "Pending recovery completed (model-authored)",
+            "Recovered pending tool calls with model-authored narrative.",
+            phase="REPORT",
+            source="runtime",
+            artifact_refs=["canonical_read_evidence.json", "visible_commentary.jsonl", "summary.md"],
+        )
+        commentary.close({"status": status, "mission_id": mission_id, "confidence": "HIGH" if status == "COMPLETE" else "MEDIUM", "closure_source": "model_authored_server_side_read_completion"})
         return model_report
+
+    if callable(finalizer_call):
+        commentary.emit(
+            "model_finalizer_failed",
+            "Model finalizer unavailable",
+            "Using deterministic fallback for pending recovery report.",
+            phase="REPORT",
+            source="runtime",
+            severity="warning",
+        )
+
+    commentary.emit(
+        "deterministic_fallback_used",
+        "Deterministic recovery report",
+        "Pending tool calls recovered deterministically.",
+        phase="REPORT",
+        source="runtime",
+        artifact_refs=["canonical_read_evidence.json", "visible_commentary.jsonl", "summary.md"],
+    )
+    commentary.emit(
+        "mission_completed",
+        "Pending recovery completed (deterministic)",
+        "Recovered pending tool calls with deterministic report.",
+        phase="REPORT",
+        source="runtime",
+        artifact_refs=["canonical_read_evidence.json", "visible_commentary.jsonl", "summary.md"],
+    )
+    commentary.close({"status": status, "mission_id": mission_id, "confidence": "HIGH" if status == "COMPLETE" else "MEDIUM", "closure_source": "deterministic_server_side_read_completion"})
 
     return build_server_side_read_completion_report(
         parent_response_id=parent_response_id,
@@ -2797,6 +2980,7 @@ def complete_pending_reads_from_bridge(
         failures=failures,
         reason="pending_tool_call_not_adopted_recovered_by_bridge",
     )
+
 
 
 def execute_pending_owned_write_from_bridge(
@@ -6337,6 +6521,9 @@ class Handler(BaseHTTPRequestHandler):
                     args_chars=len(args),
                     arg_chunk_size=arg_chunk_size,
                 )
+                # TODO(adoption-probes): Create ResponsesToolStateMachine per response
+                # and track adoption via codex_oss.tool_call_adoption when
+                # function_call_output is received. See WS1 in the plan.
                 for start in range(0, len(args), arg_chunk_size):
                     delta = args[start : start + arg_chunk_size]
                     emit(
