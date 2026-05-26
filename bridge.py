@@ -88,6 +88,8 @@ from codex_oss.read_evidence import (
     persist_read_artifacts,
 )
 
+from codex_oss.visible_commentary import VisibleCommentarySink
+
 JSON = Dict[str, Any]
 BRIDGE_VERSION = "12.0"
 
@@ -2391,6 +2393,51 @@ def complete_declared_reads_from_bridge(
     evidence = _completed_read_evidence_from_history(messages)
     failures: list[str] = []
     workdir = _workdir_from_history(messages, project_root)
+
+    # Derive mission identity
+    mission_id = envelope.get("mission_id", "") or f"read_{_hash_text(handoff_text)[:12]}"
+    resolved_mission_dir = mission_dir or os.path.join(
+        project_root, ".codex-oss", "missions", mission_id
+    )
+
+    # Create visible commentary sink for read floor
+    commentary = VisibleCommentarySink(
+        mission_id=mission_id,
+        mission_dir=resolved_mission_dir,
+        mode="summary",
+    )
+    commentary.emit(
+        "mission_started",
+        "Read-only evidence floor accepted",
+        f"Detected a declared read-only evidence floor with {len(required_paths)} required files. Completing reads server-side to avoid replay loops.",
+        phase="READ_FLOOR",
+        source="runtime",
+        evidence_refs=sorted(required_paths)[:8],
+    )
+
+    # Gather evidence from history
+    history_evidence = _completed_read_evidence_from_history(messages)
+    if history_evidence:
+        commentary.emit(
+            "evidence_from_history",
+            "Evidence found in message history",
+            f"Found {len(history_evidence)} files already read in the message history.",
+            phase="READ_FLOOR",
+            source="runtime",
+            evidence_refs=sorted(history_evidence.keys())[:8],
+        )
+
+    remaining_before = _remaining_required_paths(required_paths, set(evidence.keys()))
+    if remaining_before:
+        commentary.emit(
+            "server_side_read_started",
+            "Completing declared read floor",
+            f"Reading {len(remaining_before)} remaining required files server-side.",
+            phase="READ_FLOOR",
+            source="runtime",
+            evidence_refs=remaining_before[:8],
+        )
+
     _execute_missing_declared_reads(
         required_paths=required_paths,
         evidence=evidence,
@@ -2399,24 +2446,56 @@ def complete_declared_reads_from_bridge(
         workdir=workdir,
     )
 
-    # Persist canonical read evidence artifacts
-    mission_id = envelope.get("mission_id", "") or f"read_{_hash_text(handoff_text)[:12]}"
-    resolved_mission_dir = mission_dir or os.path.join(
-        project_root, ".codex-oss", "missions", mission_id
-    )
+    # Merge history evidence into main evidence dict
+    for path, item in history_evidence.items():
+        if path not in evidence:
+            evidence[path] = item
 
-    # Write canonical read evidence and skeleton immediately after evidence gathering
+    if failures:
+        commentary.emit(
+            "read_failures",
+            "Some reads failed",
+            f"{len(failures)} required files could not be read.",
+            phase="READ_FLOOR",
+            source="runtime",
+            severity="warning",
+        )
+    else:
+        commentary.emit(
+            "server_side_read_completed",
+            "Read floor evidence gathered",
+            f"Successfully inspected {len(evidence)} files ({len(required_paths)} required).",
+            phase="READ_FLOOR",
+            source="runtime",
+            evidence_refs=sorted(evidence.keys())[:8],
+        )
+
+    completed = set(evidence.keys())
+    missing = _remaining_required_paths(required_paths, completed)
+    status = "COMPLETE" if not missing and not failures else "PARTIAL"
+
+    # Persist canonical read evidence
     _persist_read_evidence_artifacts(
         mission_dir=resolved_mission_dir,
         mission_id=mission_id,
         required_paths=required_paths,
         evidence=evidence,
         failures=failures,
-        status="COMPLETE" if not _remaining_required_paths(required_paths, set(evidence.keys())) and not failures else "PARTIAL",
+        status=status,
         synthesis_status="DETERMINISTIC_SERVER_SIDE_READ_COMPLETION",
         parent_response_id=parent_response_id,
         reason=reason,
     )
+
+    # Attempt model-authored narration
+    if callable(finalizer_call) and not failures:
+        commentary.emit(
+            "model_finalizer_started",
+            "Requesting model-authored narrative",
+            "Attempting model-authored narrative over canonical evidence.",
+            phase="REPORT",
+            source="runtime",
+        )
 
     model_report = try_model_authored_server_side_read_report(
         parent_response_id=parent_response_id,
@@ -2432,24 +2511,59 @@ def complete_declared_reads_from_bridge(
         mission_dir=resolved_mission_dir,
         model_alias=model_alias,
     )
+
     if model_report:
-        # Update artifacts with model-authored status
+        commentary.emit(
+            "model_finalizer_succeeded",
+            "Model-authored narrative accepted",
+            "The model finalizer produced a valid narrative over the runtime-owned evidence.",
+            phase="REPORT",
+            source="runtime",
+        )
         _persist_read_evidence_artifacts(
             mission_dir=resolved_mission_dir,
             mission_id=mission_id,
             required_paths=required_paths,
             evidence=evidence,
             failures=failures,
-            status="COMPLETE" if not _remaining_required_paths(required_paths, set(evidence.keys())) and not failures else "PARTIAL",
+            status=status,
             synthesis_status="MODEL_AUTHORED_SERVER_SIDE_READ_COMPLETION",
             parent_response_id=parent_response_id,
             reason=reason,
         )
+        commentary.emit(
+            "mission_completed",
+            "Mission completed (model-authored)",
+            "Read floor complete with model-authored narrative. Evidence and report artifacts persisted.",
+            phase="REPORT",
+            source="runtime",
+            artifact_refs=["canonical_read_evidence.json", "read_report_skeleton.json", "visible_commentary.jsonl", "summary.md"],
+        )
+        commentary.close({"status": status, "mission_id": mission_id, "confidence": "HIGH" if status == "COMPLETE" else "MEDIUM", "closure_source": "model_authored_server_side_read_completion"})
         return model_report
+
+    if callable(finalizer_call) and not failures:
+        commentary.emit(
+            "model_finalizer_failed",
+            "Model finalizer unavailable",
+            "The model finalizer did not produce a valid narrative. Using deterministic fallback.",
+            phase="REPORT",
+            source="runtime",
+            severity="warning",
+        )
+
     if reason == "declared_read_floor_completed_by_bridge":
-        completed_paths = set(evidence.keys())
-        missing = _remaining_required_paths(required_paths, completed_paths)
         if missing or failures:
+            commentary.emit(
+                "mission_partial",
+                "Read floor incomplete",
+                f"Some required sources could not be inspected.",
+                phase="REPORT",
+                source="runtime",
+                severity="warning",
+                artifact_refs=["canonical_read_evidence.json", "visible_commentary.jsonl", "summary.md"],
+            )
+            commentary.close({"status": "PARTIAL", "mission_id": mission_id, "confidence": "MEDIUM", "closure_source": "deterministic_server_side_read_incomplete"})
             return build_server_side_read_completion_report(
                 parent_response_id=parent_response_id,
                 child_state=None,
@@ -2465,6 +2579,23 @@ def complete_declared_reads_from_bridge(
                 evidence_count=len(evidence),
                 failure_count=len(failures),
             )
+        commentary.emit(
+            "deterministic_fallback_used",
+            "Deterministic read completion",
+            "Using deterministic read floor report. Evidence was gathered but no model narrative is available.",
+            phase="REPORT",
+            source="runtime",
+            artifact_refs=["canonical_read_evidence.json", "visible_commentary.jsonl", "summary.md"],
+        )
+        commentary.emit(
+            "mission_completed",
+            "Mission completed (deterministic)",
+            "Read floor complete with deterministic report. Evidence and commentary artifacts persisted.",
+            phase="REPORT",
+            source="runtime",
+            artifact_refs=["canonical_read_evidence.json", "read_report_skeleton.json", "visible_commentary.jsonl", "summary.md"],
+        )
+        commentary.close({"status": status, "mission_id": mission_id, "confidence": "HIGH" if status == "COMPLETE" else "MEDIUM", "closure_source": "deterministic_server_side_read_completion"})
         return build_server_side_read_completion_report(
             parent_response_id=parent_response_id,
             child_state=None,
@@ -2474,6 +2605,7 @@ def complete_declared_reads_from_bridge(
             reason=reason,
             synthesis_status="DETERMINISTIC_SERVER_SIDE_READ_COMPLETION",
         )
+    commentary.close({"status": status, "mission_id": mission_id, "confidence": "HIGH" if status == "COMPLETE" else "MEDIUM"})
     return build_server_side_read_completion_report(
         parent_response_id=parent_response_id,
         child_state=None,
@@ -2482,7 +2614,6 @@ def complete_declared_reads_from_bridge(
         failures=failures,
         reason=reason,
     )
-
 
 def _persist_read_evidence_artifacts(
     *,
