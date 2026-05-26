@@ -663,3 +663,292 @@ def _hash_json(data: Any) -> str:
 
 def _hash_text(text: str) -> str:
     return hashlib.sha256(text.encode()).hexdigest()
+
+
+# ── RuntimeContractCompleterV1 ─────────────────────────────────────────────
+
+
+def execute_runtime_contract_action(
+    *,
+    action: JSON,
+    project_root: str,
+) -> tuple[int, str]:
+    """Execute a single RequiredActionV1 deterministically.
+
+    Returns (exit_code, output_text).
+    """
+    kind = str(action.get("kind", "") or action.get("action_type", ""))
+    tool_name = str(action.get("tool_name", "") or "")
+    args = action.get("arguments", {}) if isinstance(action.get("arguments"), dict) else {}
+
+    if kind in ("required_read", "required_file_read") or tool_name in ("rtk_read", "read"):
+        return _execute_required_read(args, project_root)
+    if kind in ("required_grep", "required_search") or tool_name in ("rtk_grep", "grep"):
+        return _execute_required_grep(args, project_root)
+    if kind in ("required_ls", "required_list") or tool_name in ("rtk_ls", "ls"):
+        return _execute_required_ls(args, project_root)
+    if kind in ("required_grep_zero_match", "required_search_zero_match"):
+        return _execute_required_grep(args, project_root)
+    if kind in ("required_git_status") or tool_name in ("rtk_git_status", "git_status"):
+        return _execute_required_git_status(args, project_root)
+
+    return 1, f"unsupported required action kind: {kind or tool_name}"
+
+
+def _execute_required_read(args: JSON, project_root: str) -> tuple[int, str]:
+    path = str(args.get("path", "") or args.get("file", "") or "")
+    if not path:
+        return 1, "read requires a path argument"
+    target = _resolve_safe_path(path, project_root)
+    if not target:
+        return 1, f"path not found or unsafe: {path}"
+    try:
+        with open(target, "r", encoding="utf-8") as f:
+            content = f.read()
+        max_bytes = int(os.getenv("OSS_SERVER_SIDE_READ_MAX_BYTES", "1048576"))
+        if len(content) > max_bytes:
+            content = content[:max_bytes] + f"\n[server-side read truncated at {max_bytes} bytes]"
+        return 0, content
+    except Exception as exc:
+        return 1, str(exc)
+
+
+def _execute_required_grep(args: JSON, project_root: str) -> tuple[int, str]:
+    pattern = str(args.get("pattern", "") or "")
+    path = str(args.get("path", "") or args.get("file", "") or ".")
+    if not pattern:
+        return 1, "grep requires a pattern argument"
+
+    target = _resolve_safe_path(path, project_root)
+    if not target:
+        return 1, f"path not found or unsafe: {path}"
+
+    import subprocess
+    try:
+        proc = subprocess.run(
+            ["grep", "-n", "-I", "--", pattern, target] if os.path.isfile(target)
+            else ["grep", "-r", "-n", "-I", "--", pattern, target],
+            capture_output=True, text=True, timeout=30,
+        )
+        if proc.returncode == 1:
+            # grep returns 1 for no matches - this is valid
+            return 0, f"[rtk_grep RESULT]\npath: {path}\npattern: {pattern}\nexit_code: 1\nmatches: 0\nstdout_bytes: 0"
+        if proc.returncode != 0:
+            return proc.returncode, proc.stderr or f"grep failed with exit code {proc.returncode}"
+        return 0, proc.stdout
+    except FileNotFoundError:
+        return 1, "grep command not found"
+    except subprocess.TimeoutExpired:
+        return 1, "grep timed out after 30s"
+
+
+def _execute_required_ls(args: JSON, project_root: str) -> tuple[int, str]:
+    path = str(args.get("path", "") or args.get("dir", "") or ".")
+    target = _resolve_safe_path(path, project_root)
+    if not target:
+        return 1, f"path not found or unsafe: {path}"
+
+    import subprocess
+    try:
+        proc = subprocess.run(
+            ["ls", "-la", target],
+            capture_output=True, text=True, timeout=10,
+        )
+        return proc.returncode, proc.stdout or proc.stderr
+    except FileNotFoundError:
+        return 1, "ls command not found"
+    except subprocess.TimeoutExpired:
+        return 1, "ls timed out after 10s"
+
+
+def _execute_required_git_status(args: JSON, project_root: str) -> tuple[int, str]:
+    import subprocess
+    try:
+        proc = subprocess.run(
+            ["git", "status", "--short"],
+            cwd=project_root,
+            capture_output=True, text=True, timeout=10,
+        )
+        return proc.returncode, proc.stdout or proc.stderr
+    except FileNotFoundError:
+        return 1, "git command not found"
+    except subprocess.TimeoutExpired:
+        return 1, "git status timed out after 10s"
+
+
+def _resolve_safe_path(path: str, project_root: str) -> str | None:
+    """Resolve a path within project_root, rejecting escapes."""
+    if not path:
+        return None
+    root = os.path.realpath(project_root)
+    if os.path.isabs(path):
+        full = os.path.realpath(path)
+    else:
+        full = os.path.realpath(os.path.join(root, path))
+    if not (full == root or full.startswith(root + os.sep)):
+        return None
+    if ".." in path.replace("\\", "/").split("/"):
+        return None
+    if os.path.isdir(full):
+        return full  # Directories are valid for ls/grep
+    if os.path.isfile(full):
+        return full
+    return None
+
+
+class RuntimeContractCompleter:
+    """Completes required evidence actions deterministically when model has stopped.
+
+    Supports reads, greps, ls, and git status. No writes allowed.
+    """
+
+    ALLOWED_TOOLS = {"rtk_read", "rtk_grep", "rtk_ls", "rtk_git_status"}
+
+    def __init__(self, project_root: str):
+        self.project_root = project_root
+
+    def complete_actions(
+        self,
+        *,
+        required_actions: list[JSON],
+        existing_evidence: dict[str, JSON] | None = None,
+    ) -> dict[str, JSON]:
+        """Execute all required actions and return evidence results."""
+        evidence = dict(existing_evidence or {})
+        for action in required_actions:
+            if not isinstance(action, dict):
+                continue
+            tool_name = str(action.get("tool_name", "") or "")
+            if tool_name not in self.ALLOWED_TOOLS:
+                continue
+            exit_code, output = execute_runtime_contract_action(
+                action=action,
+                project_root=self.project_root,
+            )
+            key = self._evidence_key(action)
+            excerpt, redacted = _safe_evidence_excerpt(output)
+            evidence[key] = {
+                "path": key,
+                "source": "bridge_server_side_action",
+                "exit_code": exit_code,
+                "output_chars": len(output),
+                "output_sha256": _hash_text(output),
+                "output_excerpt": excerpt,
+                "redactions_applied": redacted,
+                "action_kind": str(action.get("kind", "") or "required_action"),
+            }
+        return evidence
+
+    def complete_required_evidence(
+        self,
+        *,
+        required_actions: list[JSON],
+        required_paths: list[str],
+        existing_evidence: dict[str, JSON] | None = None,
+    ) -> tuple[dict[str, JSON], list[str]]:
+        """Complete required actions + any remaining required paths. Returns (evidence, failures)."""
+        evidence = dict(existing_evidence or {})
+        failures: list[str] = []
+
+        # Execute explicit required actions
+        for action in required_actions:
+            if not isinstance(action, dict):
+                continue
+            tool_name = str(action.get("tool_name", "") or "")
+            if tool_name not in self.ALLOWED_TOOLS:
+                continue
+            exit_code, output = execute_runtime_contract_action(
+                action=action,
+                project_root=self.project_root,
+            )
+            key = self._evidence_key(action)
+            excerpt, redacted = _safe_evidence_excerpt(output)
+            if exit_code != 0 and self._action_allows_zero_match(action):
+                # grep zero-match is valid evidence
+                evidence[key] = {
+                    "path": key,
+                    "source": "bridge_server_side_action",
+                    "exit_code": exit_code,
+                    "output_chars": len(output),
+                    "output_sha256": _hash_text(output),
+                    "output_excerpt": excerpt,
+                    "redactions_applied": redacted,
+                    "action_kind": "required_grep_zero_match",
+                    "zero_match": True,
+                }
+            elif exit_code == 0:
+                evidence[key] = {
+                    "path": key,
+                    "source": "bridge_server_side_action",
+                    "exit_code": exit_code,
+                    "output_chars": len(output),
+                    "output_sha256": _hash_text(output),
+                    "output_excerpt": excerpt,
+                    "redactions_applied": redacted,
+                    "action_kind": str(action.get("kind", "") or "required_action"),
+                }
+            else:
+                failures.append(f"{key}: exit_code={exit_code} output={str(output)[:200]}")
+
+        # Complete any remaining required reads
+        for path in required_paths:
+            if any(_path_satisfies_required_path(completed, path) for completed in evidence):
+                continue
+            exit_code, output = _execute_required_read(
+                {"path": path, "file": path}, self.project_root
+            )
+            if exit_code == 0:
+                excerpt, redacted = _safe_evidence_excerpt(output)
+                evidence[path] = {
+                    "path": path,
+                    "source": "bridge_server_side_read",
+                    "exit_code": exit_code,
+                    "output_chars": len(output),
+                    "output_sha256": _hash_text(output),
+                    "output_excerpt": excerpt,
+                    "redactions_applied": redacted,
+                }
+            else:
+                failures.append(f"{path}: exit_code={exit_code} output={str(output)[:200]}")
+
+        return evidence, failures
+
+    @staticmethod
+    def _evidence_key(action: JSON) -> str:
+        tool_name = str(action.get("tool_name", "") or "")
+        args = action.get("arguments", {}) if isinstance(action.get("arguments"), dict) else {}
+        path = str(args.get("path", "") or args.get("file", "") or "")
+        pattern = str(args.get("pattern", "") or "")
+        if tool_name in ("rtk_grep", "grep") and path and pattern:
+            return f"grep:{path}:{pattern[:40]}"
+        if tool_name in ("rtk_ls", "ls") and path:
+            return f"ls:{path}"
+        if path:
+            return path
+        return f"action:{tool_name}"
+
+    @staticmethod
+    def _action_allows_zero_match(action: JSON) -> bool:
+        kind = str(action.get("kind", "") or "")
+        return "zero_match" in kind or "grep_zero_match" in kind
+
+
+def _safe_evidence_excerpt(content: str, max_chars: int = 3000) -> tuple[str, bool]:
+    """Extract a safe excerpt from evidence content."""
+    text = str(content or "")
+    found_secret = False
+    for pattern, replacement, *flags in SECRET_PATTERNS:
+        fl = flags[0] if flags else 0
+        if re.search(pattern, text, fl):
+            text = re.sub(pattern, replacement, text, flags=fl)
+            found_secret = True
+    if len(text) > max_chars:
+        text = text[:max_chars].rsplit("\n", 1)[0].rstrip() + "\n[truncated]"
+    return text, found_secret
+
+
+SECRET_PATTERNS: list = [
+    (r'(?:OPENCODE_GO|OPENCODE|OPENAI|ANTHROPIC|PROXY)_(?:API_)?KEY\s*=\s*(sk-[A-Za-z0-9\-_]+)', '[redacted key]'),
+    (r'Bearer\s+(sk-[A-Za-z0-9\-_]+)', 'Bearer [redacted]'),
+    (r'sk-[A-Za-z0-9\-_]{12,}', '[redacted key]'),
+]
