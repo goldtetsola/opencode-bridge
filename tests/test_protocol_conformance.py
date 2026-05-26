@@ -48,6 +48,8 @@ from bridge import direct_loop_terminal_decision
 from bridge import direct_loop_required_sources_satisfied
 from bridge import declared_read_floor_only
 from bridge import _append_redirection_from_shell_command
+from bridge import DEFAULT_MODEL_MAP
+from bridge import map_model
 from bridge import tool_output_indicates_failure
 from bridge import validate_report_output
 from bridge import validate_model_read_narrative
@@ -120,6 +122,12 @@ def assert_bounded_write_handoffs_receive_tools_by_default():
             os.environ.pop("OSS_LEGACY_DIRECT_WRITES", None)
         else:
             os.environ["OSS_LEGACY_DIRECT_WRITES"] = old
+
+
+def assert_installed_oss_agent_names_map_to_provider_models():
+    assert map_model("oss_flash_support", DEFAULT_MODEL_MAP) == "deepseek-v4-flash"
+    assert map_model("oss_deepseek_pro", DEFAULT_MODEL_MAP) == "deepseek-v4-pro"
+    assert map_model("oss_kimi_rapid", DEFAULT_MODEL_MAP) == "kimi-k2.6"
 
 
 def assert_bounded_write_handoffs_can_be_disabled_explicitly():
@@ -2157,6 +2165,7 @@ def main():
     assert_malformed_handoff_fails_closed()
     assert_exact_write_requires_exact_content()
     assert_bounded_write_handoffs_receive_tools_by_default()
+    assert_installed_oss_agent_names_map_to_provider_models()
     assert_bounded_write_handoffs_can_be_disabled_explicitly()
     assert_fresh_raw_write_handoff_demotes_when_disabled()
     assert_no_match_search_is_still_covered()

@@ -202,6 +202,19 @@ def main():
     native_burnin.add_argument("--timeout", type=float, default=120, help="HTTP timeout per live request")
     native_burnin.add_argument("--json", action="store_true", help="Machine-readable output")
 
+    ux_burnin = smoke_sub.add_parser("native-ux-burnin", help="Gold UX: prove spawned subagent user-visible commentary")
+    ux_burnin.add_argument("--project", type=str, default=None, help="Project root path")
+    ux_burnin.add_argument("--port", type=int, default=4000, help="Bridge port")
+    ux_burnin.add_argument("--base-url", default=None, help="Bridge base URL")
+    ux_burnin.add_argument("--auth", default=None, help="Bearer token")
+    ux_burnin.add_argument("--models", default="oss_deepseek_pro", help="Comma-separated model aliases")
+    ux_burnin.add_argument("--timeout", type=float, default=120, help="HTTP timeout per live request")
+    ux_burnin.add_argument("--json", action="store_true", help="Machine-readable output")
+
+    report_burnin = smoke_sub.add_parser("native-report-burnin", help="Silver: prove model-authored narrative over runtime evidence")
+    report_burnin.add_argument("--project", type=str, default=None, help="Project root path")
+    report_burnin.add_argument("--json", action="store_true", help="Machine-readable output")
+
     certify = sub.add_parser("certify", help="Run explicit certification gates and write certification artifacts")
     certify.add_argument("--project", type=str, default=None, help="Project root path")
     certify.add_argument("--target", choices=["runtime_backed", "open_investigation", "repo_hygiene", "raw_free_editing_smoke", "raw_free_editing", "all"], default="all")
@@ -675,6 +688,12 @@ def _smoke(args) -> int:
     if args.smoke_command == "native-like-burnin":
         return _run_native_like_burnin(args)
 
+    if args.smoke_command == "native-ux-burnin":
+        return _run_native_ux_burnin(args)
+
+    if args.smoke_command == "native-report-burnin":
+        return _run_native_report_burnin(args)
+
     print("Usage: codex-oss smoke native-polish")
     return 1
 
@@ -733,6 +752,90 @@ def _run_native_like_burnin(args) -> int:
             print(result.stderr, file=sys.stderr)
 
     return result.returncode
+
+
+def _run_native_ux_burnin(args) -> int:
+    """Run Gold UX burn-in: prove spawned subagent user-visible commentary."""
+    import os as _os
+    project_root = args.project or _os.getcwd()
+    base_url = (args.base_url or f"http://127.0.0.1:{args.port}/v1").rstrip("/")
+    auth = args.auth or _os.getenv("PROXY_API_KEY") or _os.getenv("LITELLM_MASTER_KEY") or "sk-local-codex-bridge"
+    models = [m.strip() for m in args.models.split(",") if m.strip()]
+
+    from codex_oss.spawned_transcript import run_gold_ux_burnin
+
+    print(f"Gold UX Burn-In — spawned subagent commentary proof")
+    print(f"  Bridge: {base_url}")
+    print(f"  Models: {models}")
+    print()
+
+    report = run_gold_ux_burnin(
+        models=models,
+        base_url=base_url,
+        auth=auth,
+        timeout=float(args.timeout),
+    )
+
+    if args.json:
+        print(json_dumps_safe(report))
+    else:
+        passed = report.get("gold_passed", 0)
+        total = report.get("total_tests", 0)
+        print(f"Gold UX: {passed}/{total} passed")
+        for result in report.get("results", []):
+            name = result.get("test_name", "unknown")
+            level = result.get("level", "none")
+            gold = result.get("gold_pass", False)
+            marker = "✓" if gold else "✗"
+            print(f"  {marker} {name} — level={level}")
+            if not gold:
+                for dim in result.get("failed_dimensions", []):
+                    print(f"      missing: {dim}")
+                for ev in result.get("missing_evidence", []):
+                    print(f"      evidence: {ev}")
+                meta = result.get("transcript_metadata", {})
+                if meta:
+                    print(f"      commentary_detected: {meta.get('commentary_detected', 0)}")
+                    print(f"      commentary_before_final: {meta.get('commentary_before_final', 0)}")
+                    print(f"      event_classes: {meta.get('event_classes_found', [])}")
+
+    return 0 if report.get("gold_passed", 0) == report.get("total_tests", 0) else 1
+
+
+def _run_native_report_burnin(args) -> int:
+    """Run Silver burn-in: prove model-authored narrative over runtime evidence."""
+    import subprocess
+    import sys
+    import os as _os
+
+    project_root = args.project or _os.getcwd()
+    test_file = _os.path.join(project_root, "tests", "test_native_like_live_matrix.py")
+
+    if not _os.path.exists(test_file):
+        print(f"Test file not found: {test_file}", file=sys.stderr)
+        return 1
+
+    env = _os.environ.copy()
+    env["PYTHONPATH"] = project_root
+    env["LIVE"] = "0"
+
+    print("Silver Report Burn-In — model-authored narrative proof")
+    print()
+
+    result = subprocess.run(
+        [sys.executable, test_file],
+        cwd=project_root,
+        env=env,
+        capture_output=not args.json,
+        text=True,
+        timeout=60,
+    )
+
+    if not args.json:
+        print(result.stdout)
+    return result.returncode
+
+
 
 
 def _mission_template(args) -> int:

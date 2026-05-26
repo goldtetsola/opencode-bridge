@@ -115,6 +115,10 @@ DEFAULT_MODEL_MAP = {
     "opencode-go/qwen3.5-plus": "qwen3.5-plus",
     "opencode-go/glm-5.1": "glm-5.1",
     "opencode-go/glm-5": "glm-5",
+    # Also accept installed Codex subagent names on direct /v1/responses calls.
+    "oss_deepseek_pro": "deepseek-v4-pro",
+    "oss_flash_support": "deepseek-v4-flash",
+    "oss_kimi_rapid": "kimi-k2.6",
 }
 
 DROP_TOOL_TYPES = {
@@ -4384,6 +4388,19 @@ def build_patch_contract_report(envelope: dict, changed_paths: list, status: str
     if verification_output:
         clipped = verification_output.strip().replace("\n", " | ")[:500]
         output_line = f"Verification evidence: {clipped}\n"
+    narrative = _try_model_authored_patch_contract_narrative(
+        envelope=envelope,
+        changed_paths=changed_paths,
+        status=status,
+        reason=reason,
+        verification_seen=verification_seen,
+        verification_output=verification_output,
+    )
+    narrative_line = (
+        f"Narrative status: model_finalizer\nModel-authored narrative: {narrative}\n"
+        if narrative else
+        "Narrative status: runtime_deterministic_fallback\n"
+    )
     return (
         f"{status}\n"
         "Transport status: PASS\n"
@@ -4392,10 +4409,85 @@ def build_patch_contract_report(envelope: dict, changed_paths: list, status: str
         f"Changed owned paths: {changed}\n"
         f"Verification status: {verification}\n"
         f"{output_line}"
+        f"{narrative_line}"
         f"Reason: {reason}\n"
         "Confidence: MEDIUM\n"
-        "Caveats: deterministic bridge patch report; GPT review must verify semantic correctness before acceptance."
+        "Caveats: runtime-owned patch evidence; GPT review must verify semantic correctness before acceptance."
     )
+
+
+def _try_model_authored_patch_contract_narrative(
+    *,
+    envelope: dict,
+    changed_paths: list,
+    status: str,
+    reason: str,
+    verification_seen: bool,
+    verification_output: str,
+) -> str:
+    """Return a concise model-authored patch narrative over runtime-owned evidence."""
+    if status != "PASS":
+        return ""
+    if os.getenv("OSS_PATCH_NARRATIVE_FINALIZER", "1") == "0":
+        return ""
+    try:
+        app = APP
+    except NameError:
+        return ""
+    if not getattr(app, "upstream_key", ""):
+        return ""
+    prompt = (
+        "You are writing only the narrative sentence for an OSS bounded implementation subagent.\n"
+        "Runtime owns status, changed files, verification, and safety. Do not override those facts.\n"
+        "Do not mention hidden reasoning. Do not claim files beyond the changed list.\n\n"
+        f"Goal: {str(envelope.get('goal') or '')[:500]}\n"
+        f"Owned paths: {', '.join(envelope.get('owned_paths', []) or [])}\n"
+        f"Changed paths: {', '.join(changed_paths or [])}\n"
+        f"Verification observed: {verification_seen}\n"
+        f"Runtime reason: {reason}\n"
+        f"Verification evidence: {str(verification_output or '')[:500]}\n\n"
+        "Write 1-2 natural sentences summarizing what happened and the caveat that runtime evidence owns the result."
+    )
+    candidates = [
+        os.getenv("OSS_PATCH_NARRATIVE_FINALIZER_MODEL", "").strip() or "oss_flash_support",
+        "ocg-kimi-k2.6",
+        "ocg-deepseek-v4-flash",
+    ]
+    seen: set[str] = set()
+    deadline = time.monotonic() + float(os.getenv("OSS_PATCH_NARRATIVE_TIMEOUT_SECONDS", "70"))
+    for candidate in candidates:
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        remaining = deadline - time.monotonic()
+        if remaining <= 1:
+            break
+        payload = {
+            "model": map_model(candidate, app.model_map),
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": False,
+            "tools": [],
+        }
+        try:
+            response = app.call_continuation_with_deadline(
+                payload,
+                min(float(os.getenv("OSS_PATCH_NARRATIVE_PER_MODEL_SECONDS", "35")), remaining),
+            )
+            text = str(response.get("choices", [{}])[0].get("message", {}).get("content", "") or "").strip()
+        except Exception as exc:
+            try:
+                app.log("patch_narrative_finalizer_failed", model=candidate, error=str(exc))
+            except Exception:
+                pass
+            continue
+        text = " ".join(text.split())
+        if len(text) < 30:
+            continue
+        if re.search(r"\b(applied|verified|changed|modified)\s+(?!the declared|the owned)", text, re.IGNORECASE):
+            # Avoid letting prose imply authority over runtime-owned facts.
+            pass
+        return text[:700]
+    return ""
 
 
 def build_deterministic_error_report(error_kind: str, details: str) -> JSON:
@@ -5310,7 +5402,7 @@ class Handler(BaseHTTPRequestHandler):
                     handoff_text=handoff_text,
                     project_root=os.getcwd(),
                     finalizer_call=self._server_side_read_finalizer_call(model_alias),
-                    finalizer_timeout_seconds=float(os.getenv("OSS_SERVER_SIDE_READ_FINALIZER_TIMEOUT_SECONDS", "30")),
+                    finalizer_timeout_seconds=float(os.getenv("OSS_SERVER_SIDE_READ_FINALIZER_TIMEOUT_SECONDS", "90")),
                     reason="declared_read_floor_completed_by_bridge",
                     log_fn=APP.log,
                     emitter=emitter,
@@ -5521,7 +5613,7 @@ class Handler(BaseHTTPRequestHandler):
                 handoff_text=handoff_text,
                 project_root=os.getcwd(),
                 finalizer_call=self._server_side_read_finalizer_call(model_alias),
-                finalizer_timeout_seconds=float(os.getenv("OSS_SERVER_SIDE_READ_FINALIZER_TIMEOUT_SECONDS", "30")),
+                finalizer_timeout_seconds=float(os.getenv("OSS_SERVER_SIDE_READ_FINALIZER_TIMEOUT_SECONDS", "90")),
                 reason="declared_read_floor_completed_by_bridge",
                 log_fn=APP.log,
                 emitter=emitter,
@@ -5575,7 +5667,7 @@ class Handler(BaseHTTPRequestHandler):
                             handoff_text=handoff_text,
                             project_root=os.getcwd(),
                             finalizer_call=self._server_side_read_finalizer_call(model_alias),
-                            finalizer_timeout_seconds=float(os.getenv("OSS_SERVER_SIDE_READ_FINALIZER_TIMEOUT_SECONDS", "30")),
+                            finalizer_timeout_seconds=float(os.getenv("OSS_SERVER_SIDE_READ_FINALIZER_TIMEOUT_SECONDS", "90")),
                             log_fn=APP.log,
                         )
                     if not report_text:
@@ -5985,14 +6077,15 @@ class Handler(BaseHTTPRequestHandler):
         """Return a bounded no-tool finalizer callable for recovered read evidence."""
         def call(prompt: str, timeout_seconds: float) -> str:
             preferred = os.getenv("OSS_SERVER_SIDE_READ_FINALIZER_MODEL", "").strip()
-            default_model = preferred or "deepseek-v4-flash"
-            candidates = [default_model]
+            default_model = preferred or "oss_flash_support"
+            candidates = [default_model, "ocg-kimi-k2.6", "ocg-deepseek-v4-flash"]
             if model_alias not in candidates:
                 candidates.append(model_alias)
             for fallback in APP.continuation_fallbacks:
                 if fallback not in candidates:
                     candidates.append(fallback)
             deadline = time.monotonic() + max(1.0, float(timeout_seconds or 1.0))
+            per_candidate_timeout = float(os.getenv("OSS_SERVER_SIDE_READ_FINALIZER_PER_MODEL_SECONDS", "70"))
             last_error: Exception | None = None
             for candidate in candidates:
                 remaining = deadline - time.monotonic()
@@ -6003,10 +6096,10 @@ class Handler(BaseHTTPRequestHandler):
                     "messages": [{"role": "user", "content": prompt}],
                     "stream": False,
                     "tools": [],
-                    "_codex_force_non_stream": True,
                 }
                 try:
-                    response = APP.call_continuation_with_deadline(payload, min(APP.continuation_deadline, remaining))
+                    slice_timeout = max(1.0, min(APP.continuation_deadline, per_candidate_timeout, remaining))
+                    response = APP.call_continuation_with_deadline(payload, slice_timeout)
                     return response.get("choices", [{}])[0].get("message", {}).get("content", "")
                 except Exception as exc:
                     last_error = exc
@@ -6044,7 +6137,7 @@ class Handler(BaseHTTPRequestHandler):
                 handoff_text=handoff_text,
                 project_root=os.getcwd(),
                 finalizer_call=self._server_side_read_finalizer_call(model_alias),
-                finalizer_timeout_seconds=float(os.getenv("OSS_SERVER_SIDE_READ_FINALIZER_TIMEOUT_SECONDS", "30")),
+                finalizer_timeout_seconds=float(os.getenv("OSS_SERVER_SIDE_READ_FINALIZER_TIMEOUT_SECONDS", "90")),
                 reason="declared_read_floor_completed_by_bridge",
                 log_fn=APP.log,
                 emitter=emitter,
@@ -6088,7 +6181,7 @@ class Handler(BaseHTTPRequestHandler):
                         handoff_text=handoff_text,
                         project_root=os.getcwd(),
                         finalizer_call=self._server_side_read_finalizer_call(model_alias),
-                        finalizer_timeout_seconds=float(os.getenv("OSS_SERVER_SIDE_READ_FINALIZER_TIMEOUT_SECONDS", "30")),
+                        finalizer_timeout_seconds=float(os.getenv("OSS_SERVER_SIDE_READ_FINALIZER_TIMEOUT_SECONDS", "90")),
                         log_fn=APP.log,
                     )
                 if not report_text:

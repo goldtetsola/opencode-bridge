@@ -18,8 +18,8 @@ JSON = dict[str, Any]
 
 # ── Prompt limits for bounded finalizer calls ──────────────────────────────
 
-MAX_TOTAL_FINALIZER_PROMPT_CHARS = int(os.getenv("OSS_READ_FINALIZER_MAX_PROMPT_CHARS", "12000"))
-MAX_EXCERPT_CHARS_PER_FILE = int(os.getenv("OSS_READ_FINALIZER_MAX_EXCERPT_CHARS", "1500"))
+MAX_TOTAL_FINALIZER_PROMPT_CHARS = int(os.getenv("OSS_READ_FINALIZER_MAX_PROMPT_CHARS", "4000"))
+MAX_EXCERPT_CHARS_PER_FILE = int(os.getenv("OSS_READ_FINALIZER_MAX_EXCERPT_CHARS", "350"))
 MAX_FINALIZER_FILES = int(os.getenv("OSS_READ_FINALIZER_MAX_FILES", "20"))
 
 
@@ -446,7 +446,7 @@ def build_bounded_finalizer_prompt(
         )
 
     failure_text = "\n".join(f"- {f}" for f in failures[:10]) if failures else "none"
-    handoff_snippet = (handoff_text or "")[:2000]
+    handoff_snippet = (handoff_text or "")[:1000]
 
     header = (
         "You are writing only the narrative section for a read-only OSS subagent task.\n"
