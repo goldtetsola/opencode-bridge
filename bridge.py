@@ -90,6 +90,15 @@ from codex_oss.read_evidence import (
 
 from codex_oss.visible_commentary import VisibleCommentarySink
 
+from codex_oss.tool_call_adoption import (
+    ResponsesToolStateMachine,
+    build_adoption_probe,
+    build_adopted_probe,
+    build_not_adopted_probe,
+    persist_adoption_probes,
+    check_adoption_promotion_gate,
+)
+
 JSON = Dict[str, Any]
 BRIDGE_VERSION = "12.0"
 
