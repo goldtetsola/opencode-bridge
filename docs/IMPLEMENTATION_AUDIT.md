@@ -811,6 +811,75 @@ PYTHONPATH=. python3 tests/test_final_claim_gate.py
 ./bin/codex-oss desktop-pre-final-text-probe config --port 43211 --json
 ```
 
+### 2026-06-03 Codex app-server progress surface probe
+
+The Desktop spawned-child renderer remains unclassified because this active
+multi-agent session did not refresh the newly installed
+`desktop_pre_final_text_probe` role. That is still `setup_failed`, not renderer
+`fail`.
+
+The backup door is Codex app-server. Local schema generation shows an explicit
+`AgentMessageDeltaNotification` with:
+
+```text
+item/agentMessage/delta
+delta
+itemId
+threadId
+turnId
+```
+
+Implementation update:
+
+- Added `codex_oss/app_server_probe.py`.
+- Added `bin/codex-oss app-server-pre-final-text-probe`.
+- The probe launches a fake Responses provider and a local `codex app-server`
+  stdio session, then starts a thread/turn against the fake provider.
+- The probe records whether app-server emits `item/agentMessage/delta` before
+  the final marker.
+
+Empirical result:
+
+```text
+surface: codex_app_server
+probe_status: pass
+observed_agent_message_delta: true
+observed_progress_before_final: true
+delta_text: PROGRESS_ONE / PROGRESS_TWO / PROGRESS_THREE / FINAL_DONE
+```
+
+Artifact:
+
+```text
+.codex-oss/app_server_pre_final_text_probe_result.json
+```
+
+Architectural conclusion:
+
+```text
+Codex app-server can carry the native-feeling live progress stream.
+This solves the event-surface problem for an app-server-backed client or
+integration. It does not prove the existing Codex Desktop spawned-child view
+renders pre-final text. Keep those claims separate.
+```
+
+Implication for the ultimate goal:
+
+```text
+MissionV1 runtime remains the authority layer.
+App-server can become the owned UX/event layer.
+Desktop spawned-child renderer proof is optional if product UX moves through
+app-server; required only for claims about that specific Desktop child view.
+```
+
+Fresh verification:
+
+```bash
+bin/codex-oss app-server-pre-final-text-probe --json
+PYTHONPATH=. python3 tests/test_app_server_probe.py
+python3 -m py_compile codex_oss/app_server_probe.py codex_oss/desktop_pre_final_text_probe.py codex_oss/cli.py
+```
+
 ### 2026-06-03 TaskEnvelopeV1 / ReportContractValidatorV1 hardening
 
 Follow-up RCA found a separate native-like gap: OSS workers could still return

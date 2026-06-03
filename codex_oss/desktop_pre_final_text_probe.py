@@ -193,6 +193,72 @@ def parse_sse_events(sse_text: str) -> list[JSON]:
 
 def _handler_factory(delay_seconds: float):
     class DesktopPreFinalTextProbeHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802 - stdlib handler name
+            if self.path.split("?", 1)[0] != "/v1/models":
+                self.send_response(404)
+                self.end_headers()
+                return
+            body = json.dumps(
+                {
+                    "object": "list",
+                    "data": [
+                        {
+                            "id": PROBE_MODEL_ALIAS,
+                            "object": "model",
+                            "owned_by": "opencode-bridge-probe",
+                        }
+                    ],
+                    "models": [
+                        {
+                            "id": PROBE_MODEL_ALIAS,
+                            "slug": PROBE_MODEL_ALIAS,
+                            "name": PROBE_MODEL_ALIAS,
+                            "display_name": PROBE_MODEL_ALIAS,
+                            "description": "Synthetic no-tool probe model for Desktop/app-server rendering checks.",
+                            "base_instructions": "Emit the fixed probe progress strings only.",
+                            "default_reasoning_level": "low",
+                            "supported_reasoning_levels": [
+                                {
+                                    "effort": "low",
+                                    "description": "Synthetic probe; reasoning is not used.",
+                                }
+                            ],
+                            "supports_reasoning_summaries": False,
+                            "default_reasoning_summary": "auto",
+                            "default_verbosity": "medium",
+                            "support_verbosity": False,
+                            "shell_type": "shell_command",
+                            "visibility": "list",
+                            "supported_in_api": True,
+                            "priority": 999,
+                            "additional_speed_tiers": [],
+                            "upgrade": None,
+                            "availability_nux": None,
+                            "context_window": 128000,
+                            "max_context_window": 128000,
+                            "effective_context_window_percent": 100,
+                            "input_modalities": ["text"],
+                            "service_tiers": [],
+                            "model_messages": {
+                                "instructions_template": "Emit the fixed probe progress strings only."
+                            },
+                            "truncation_policy": {"mode": "tokens", "limit": 10000},
+                            "supports_image_detail_original": False,
+                            "supports_parallel_tool_calls": False,
+                            "supports_search_tool": False,
+                            "experimental_supported_tools": [],
+                            "apply_patch_tool_type": "freeform",
+                            "web_search_tool_type": "text_and_image",
+                        }
+                    ],
+                }
+            ).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
         def do_POST(self) -> None:  # noqa: N802 - stdlib handler name
             if self.path != "/v1/responses":
                 self.send_response(404)

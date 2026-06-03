@@ -359,6 +359,17 @@ def main():
     render_probe_record.add_argument("--notes", default="", help="Human note about the observed Desktop behavior")
     render_probe_record.add_argument("--json", action="store_true", help="Machine-readable output")
 
+    app_server_probe = sub.add_parser(
+        "app-server-pre-final-text-probe",
+        help="Probe Codex app-server item/agentMessage/delta with the fake provider",
+    )
+    app_server_probe.add_argument("--cwd", default=".", help="Working directory for the app-server thread")
+    app_server_probe.add_argument("--port", type=int, default=0, help="Fake provider port; 0 chooses a free port")
+    app_server_probe.add_argument("--delay", type=float, default=0.25, help="Seconds between fake provider text deltas")
+    app_server_probe.add_argument("--timeout", type=float, default=8.0, help="Seconds to wait for app-server deltas")
+    app_server_probe.add_argument("--output", default=".codex-oss/app_server_pre_final_text_probe_result.json")
+    app_server_probe.add_argument("--json", action="store_true", help="Machine-readable output")
+
     # up — foreground supervisor
     up = sub.add_parser("up", help="Start bridge with foreground supervisor (keep terminal open)")
     up.add_argument("--port", type=int, default=4000)
@@ -742,6 +753,9 @@ def main():
     elif args.command == "desktop-pre-final-text-probe":
         sys.exit(_desktop_pre_final_text_probe(args))
 
+    elif args.command == "app-server-pre-final-text-probe":
+        sys.exit(_app_server_pre_final_text_probe(args))
+
     elif args.command == "up":
         sys.exit(_supervise(args.port, daemon=args.daemon, foreground=args.foreground, allow_missing_upstream=bool(args.allow_missing_upstream)))
 
@@ -963,6 +977,32 @@ def _desktop_pre_final_text_probe(args) -> int:
 
     print("Usage: codex-oss desktop-pre-final-text-probe <server|self-test|config|record>", file=sys.stderr)
     return 1
+
+
+def _app_server_pre_final_text_probe(args) -> int:
+    from pathlib import Path
+
+    from codex_oss.app_server_probe import (
+        run_app_server_pre_final_text_probe,
+        write_app_server_probe_result,
+    )
+
+    result = run_app_server_pre_final_text_probe(
+        cwd=Path(args.cwd).resolve(),
+        port=args.port,
+        delay_seconds=args.delay,
+        timeout_seconds=args.timeout,
+    )
+    output = write_app_server_probe_result(result, args.output)
+    result["path"] = str(output)
+    if args.json:
+        print(json_dumps_safe(result))
+    else:
+        print(f"App-server pre-final text probe: {result.get('probe_status')}")
+        print(f"  output: {output}")
+        print(f"  item/agentMessage/delta: {str(bool(result.get('observed_agent_message_delta'))).lower()}")
+        print(f"  progress before final: {str(bool(result.get('observed_progress_before_final'))).lower()}")
+    return 0 if result.get("probe_status") == "pass" else 1
 
 
 def _validate_handoff(path: str) -> int:

@@ -607,6 +607,19 @@ Interpretation:
 - `flaky`: treat as best-effort only.
 - `setup_failed`: rerun the probe; do not classify Desktop rendering.
 
+There is also a second progress surface: Codex app-server. It exposes
+structured notifications such as `item/agentMessage/delta`, which can carry
+pre-final assistant text without depending on the spawned-child renderer:
+
+```bash
+bin/codex-oss app-server-pre-final-text-probe --json
+```
+
+If this returns `probe_status: pass`, app-server can be used as an owned
+native-feeling progress surface. That does not by itself prove the existing
+Desktop spawned-child view renders pre-final text; it proves a separate Codex
+event channel can.
+
 Codex Desktop or the multi-agent consumer should feed the child Responses SSE
 through the Desktop consumer adapter:
 
