@@ -586,8 +586,10 @@ bin/codex-oss desktop-pre-final-text-probe config --port 43211
 bin/codex-oss desktop-pre-final-text-probe server --port 43211
 ```
 
-Then spawn a child/subagent through Codex Desktop using the printed provider
-config and prompt. Record the observed result:
+Then start a fresh Codex Desktop session if the agent list was already loaded,
+and spawn the dedicated `desktop_pre_final_text_probe` child/subagent. It uses
+the printed provider config and should not use tools. Record the observed
+result:
 
 ```bash
 bin/codex-oss desktop-pre-final-text-probe record \

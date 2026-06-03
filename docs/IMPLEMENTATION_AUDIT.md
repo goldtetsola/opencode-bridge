@@ -773,6 +773,9 @@ Implementation update:
 - Added `desktop_render_surface` to `NativeExperienceContractV1`.
 - Desktop Gold now requires `desktop_render_surface.probe_status == "pass"`.
   Unknown/fail/flaky probe status blocks Desktop live-commentary claims.
+- Added a dedicated `desktop_pre_final_text_probe` agent TOML and installer
+  template so future Desktop sessions can spawn the fake-provider child instead
+  of depending on a generic role list.
 
 Probe behavior:
 
@@ -793,6 +796,10 @@ only final shows: fail, Desktop live-commentary claims disallowed
 progress then final shows: pass, Desktop Gold observation gate can be used
 inconsistent: flaky, best-effort only
 ```
+
+If the current Desktop session does not list `desktop_pre_final_text_probe`,
+restart/reload the Desktop session after installation. That is still
+`setup_failed`, not evidence that the renderer cannot display pre-final text.
 
 Fresh verification:
 
