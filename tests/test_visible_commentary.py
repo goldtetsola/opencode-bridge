@@ -97,11 +97,71 @@ def assert_sanitize_visible_payload_caps_and_limits_nested_metadata():
     assert redacted is True, payload
 
 
+def assert_visible_commentary_tracks_delivery_states_for_streamed_events():
+    root = tempfile.mkdtemp(dir=ROOT)
+    try:
+        streamed = []
+        sink = VisibleCommentarySink("mission_delivery_success", root, stream_callback=streamed.append)
+        event = sink.emit(
+            "mission_started",
+            "Mission accepted",
+            "I'm checking the declared evidence floor before finalizing.",
+            phase="PLAN",
+            source="runtime",
+        )
+        sink.close({"status": "COMPLETE", "mission_id": "mission_delivery_success"})
+
+        delivery_path = os.path.join(root, "commentary_delivery.json")
+        assert os.path.exists(delivery_path), delivery_path
+        with open(delivery_path, "r", encoding="utf-8") as handle:
+            delivery = json.load(handle)
+        tracked = delivery["events"][event["event_id"]]
+        states = tracked["states"]
+        assert states["created"] is True, states
+        assert states["sanitized"] is True, states
+        assert states["stream_enqueued"] is True, states
+        assert states["sse_emitted"] is True, states
+        assert states["reconciled_with_summary"] is True, states
+        assert states["rendered_before_final"] is False, states
+        assert streamed and streamed[0]["event_id"] == event["event_id"], streamed
+    finally:
+        shutil.rmtree(root)
+
+
+def assert_visible_commentary_records_stream_delivery_failure():
+    root = tempfile.mkdtemp(dir=ROOT)
+    try:
+        def fail_stream(_event):
+            raise RuntimeError("consumer unavailable")
+
+        sink = VisibleCommentarySink("mission_delivery_failure", root, stream_callback=fail_stream)
+        event = sink.emit(
+            "mission_started",
+            "Mission accepted",
+            "I'm checking the declared evidence floor before finalizing.",
+            phase="PLAN",
+            source="runtime",
+        )
+        sink.close({"status": "FAILED", "mission_id": "mission_delivery_failure"})
+
+        with open(os.path.join(root, "commentary_delivery.json"), "r", encoding="utf-8") as handle:
+            delivery = json.load(handle)
+        tracked = delivery["events"][event["event_id"]]
+        states = tracked["states"]
+        assert states["failed"] is True, states
+        assert states["sse_emitted"] is False, states
+        assert "consumer unavailable" in tracked["failure_reason"], tracked
+    finally:
+        shutil.rmtree(root)
+
+
 def main():
     assert_visible_commentary_recursively_sanitizes_public_event_payloads()
     assert_model_action_public_message_is_categorical_not_raw_rationale()
     assert_safe_tool_target_text_hides_patterns_and_sensitive_paths()
     assert_sanitize_visible_payload_caps_and_limits_nested_metadata()
+    assert_visible_commentary_tracks_delivery_states_for_streamed_events()
+    assert_visible_commentary_records_stream_delivery_failure()
     print("PASS: visible commentary safety suite")
 
 

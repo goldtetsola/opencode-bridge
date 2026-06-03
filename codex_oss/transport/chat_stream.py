@@ -221,7 +221,7 @@ class ChatStreamAssembler:
         except Exception:
             idx = 0
         st = self._get_tool_state(idx)
-        if tc.get("id") and st.call_id.startswith("call_") and not st.added:
+        if tc.get("id") and st.call_id.startswith("call") and not st.added:
             st.call_id = str(tc["id"])
         fn = tc.get("function") or {}
         name_part = fn.get("name") or tc.get("name")
@@ -385,23 +385,23 @@ class ChatStreamAssembler:
             assistant_msg["tool_calls"] = replay_tool_calls
 
         all_messages = self.repair_chat_history(self.base_messages, None) + [assistant_msg]
-        self.state_put(
-            self.stored_response_factory(
-                response_id=self.response_id,
-                model_alias=self.model_alias,
-                model_upstream=self.model_upstream,
-                messages=all_messages,
-                pending_call_ids=[tc["id"] for tc in replay_tool_calls],
-                created_at=self.created_at,
-                output_items_json=self.json_dumps(output),
-                tool_exchange_count=int(self.body.get("_codex_oss_tool_exchange_count", 0) or 0),
-                task_max_exchanges=int(
-                    self.body.get("_codex_oss_task_max_exchanges")
-                    or self.extract_budget(self.base_messages)
-                ),
-                previous_response_id=str(self.body.get("previous_response_id") or ""),
-            )
+        stored = self.stored_response_factory(
+            response_id=self.response_id,
+            model_alias=self.model_alias,
+            model_upstream=self.model_upstream,
+            messages=all_messages,
+            pending_call_ids=[tc["id"] for tc in replay_tool_calls],
+            created_at=self.created_at,
+            output_items_json=self.json_dumps(output),
+            tool_exchange_count=int(self.body.get("_codex_oss_tool_exchange_count", 0) or 0),
+            task_max_exchanges=int(
+                self.body.get("_codex_oss_task_max_exchanges")
+                or self.extract_budget(self.base_messages)
+            ),
+            previous_response_id=str(self.body.get("previous_response_id") or ""),
         )
+        self._initialize_adoption_state(stored, replay_tool_calls)
+        self.state_put(stored)
 
         usage = self.usage or {}
         resp_obj = self.build_response_shell(
@@ -418,3 +418,48 @@ class ChatStreamAssembler:
             "total_tokens": usage.get("total_tokens", 0),
         }
         return resp_obj
+
+    def _initialize_adoption_state(self, stored: Any, replay_tool_calls: List[JSON]) -> None:
+        if not replay_tool_calls:
+            return
+        try:
+            from codex_oss.tool_call_adoption import ResponsesToolStateMachine
+            sm = ResponsesToolStateMachine(self.response_id)
+            sm.parent_response_id = str(self.body.get("previous_response_id") or "") or None
+            sm.previous_response_id = sm.parent_response_id
+            output_by_call_id = {
+                item.get("call_id"): item
+                for item in self._final_output_items_for_adoption()
+                if isinstance(item, dict) and item.get("type") == "function_call"
+            }
+            for tc in replay_tool_calls:
+                call_id = str(tc.get("id") or "")
+                fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+                raw_name = str(fn.get("name") or "tool")
+                args = fn.get("arguments", "{}")
+                if not isinstance(args, str):
+                    args = self.json_dumps(args)
+                rendered = output_by_call_id.get(call_id, {})
+                sm.register_tool_call(
+                    call_id=call_id,
+                    tool_name=self.restore_tool_name(raw_name, self.reverse_name_map),
+                    arguments={"raw": args},
+                    output_item_id=str(rendered.get("id") or f"fc_{call_id}"),
+                )
+            stored.adoption_probes_json = self.json_dumps({
+                "calls": {
+                    call_id: {k: v for k, v in state.items() if k not in ("arguments_preview",)}
+                    for call_id, state in sm.calls.items()
+                },
+                "sequence": sm.sequence,
+            })
+        except Exception:
+            return
+
+    def _final_output_items_for_adoption(self) -> List[JSON]:
+        items: List[JSON] = []
+        for kind, key in self.output_order:
+            if kind == "function_call":
+                st = self.tool_states[int(key)]
+                items.append(self._final_function_item(st))
+        return items

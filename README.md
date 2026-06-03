@@ -571,6 +571,59 @@ OSS_VISIBLE_TRACE=summary
 OSS_VISIBLE_TRACE_STREAM=1
 ```
 
+If `commentary_delivery.json` shows `sse_emitted > 0` but `consumer_observed=0`,
+the bridge produced progress but the spawned-agent consumer did not render it.
+Current final reports also include a `Delivery status:` line so this is visible
+even when the parent UI only receives the terminal report.
+
+Before treating Desktop live commentary as a product claim, run the stripped-down
+renderer probe. It removes MissionV1, tools, upstream models, and bridge
+fallbacks from the question:
+
+```bash
+bin/codex-oss desktop-pre-final-text-probe self-test
+bin/codex-oss desktop-pre-final-text-probe config --port 43211
+bin/codex-oss desktop-pre-final-text-probe server --port 43211
+```
+
+Then spawn a child/subagent through Codex Desktop using the printed provider
+config and prompt. Record the observed result:
+
+```bash
+bin/codex-oss desktop-pre-final-text-probe record \
+  --status pass \
+  --observed-progress-before-final true \
+  --observed-final true \
+  --notes "PROGRESS_ONE/TWO/THREE appeared before FINAL_DONE"
+```
+
+Interpretation:
+
+- `pass`: Desktop rendered ordinary child assistant text before final; Desktop
+  Gold can use the observation gate.
+- `fail`: only final appeared; Desktop live-commentary claims are disallowed.
+- `flaky`: treat as best-effort only.
+- `setup_failed`: rerun the probe; do not classify Desktop rendering.
+
+Codex Desktop or the multi-agent consumer should feed the child Responses SSE
+through the Desktop consumer adapter:
+
+```bash
+bin/codex-oss desktop-observation from-sse \
+  --mission-id MISSION_ID \
+  --sse child-response.sse \
+  --agent-id AGENT_ID \
+  --agent-name AGENT_NAME \
+  --output .codex-oss/missions/MISSION_ID/desktop_transcript.json
+
+bin/codex-oss desktop-observation reconcile \
+  --mission-dir .codex-oss/missions/MISSION_ID \
+  --transcript .codex-oss/missions/MISSION_ID/desktop_transcript.json
+```
+
+Only raw Desktop-spawned transcripts can mark progress as observed. Bridge
+harness transcripts and artifact-reconstructed traces still fail Desktop Gold.
+
 ### Provider auth fails
 
 Check the key file:

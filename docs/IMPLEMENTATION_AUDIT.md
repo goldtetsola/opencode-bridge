@@ -428,7 +428,7 @@ All items from the original plan, the self-audit gap list, AND the review feedba
 | Implementation narrative | Schema + forbidden-claim rejection | Validated in implementation pipeline |
 | A6 certification | Policy gates + rollback proof | Tested offline |
 | Complex multi-file | DesiredStateV1, PatchRecipeV1, cross-module | Tested offline |
-| Burn-in CLI | leveled: native-runtime-burnin, native-report-burnin, native-ux-burnin | Subprocess runner |
+| Burn-in CLI | leveled: native-runtime-burnin, native-report-burnin, bridge-native-ux-burnin, desktop-native-ux-burnin | Subprocess runner + transcript verifier |
 
 ### Review feedback implemented
 
@@ -437,8 +437,13 @@ All items from the original plan, the self-audit gap list, AND the review feedba
 | NativeExperienceContractV1 | `codex_oss/native_experience.py` — bronze/silver/gold/platinum evaluation with evidence gates |
 | CommentaryDeliveryV1 | Delivery state machine: created → sanitized → emitted → observed → rendered → reconciled |
 | Spawned transcript harness | `codex_oss/spawned_transcript.py` — captures SSE stream, extracts commentary, reconciles artifacts |
-| Leveled burn-in naming | Split into native-runtime-burnin, native-report-burnin, native-ux-burnin |
-| Gold UX gate | Requires ≥3 pre-final commentary events across 3 required event classes, observed by consumer |
+| RouteAuthorityV1 | `codex_oss/route_authority.py` — separates raw direct vs managed MissionV1 routes and bridge harness vs Codex Desktop consumer provenance |
+| DesktopObservationV1 | `codex_oss/desktop_observation.py` — classifies raw Desktop transcript provenance and prevents reconstructed artifact traces from counting as Desktop-observed UX |
+| DesktopNativeVerifierV1 | `codex_oss/desktop_native_verifier.py` — fail-closed verifier for captured Codex Desktop spawned-agent transcript evidence |
+| ImplementationWitnessV1 | `codex_oss/implementation.py` — successful implementation status requires runtime-owned changed-file, owned-path, canonical patch, target, and verification witnesses |
+| OSSFinalClaimGateV1 | `codex_oss/final_claim_gate.py` — terminal claim gate for route authority, unresolved pending calls, implementation witness, Desktop transcript hash, and artifact hashes |
+| Leveled burn-in naming | Split into native-runtime-burnin, native-report-burnin, bridge-native-ux-burnin, desktop-native-ux-burnin; native-ux-burnin remains a deprecated bridge-only alias |
+| Gold UX gate | Bridge Gold requires ≥3 pre-final commentary events across 3 required event classes, observed by the bridge harness; Desktop Gold additionally requires `consumer_kind=codex_desktop_spawned`, raw Desktop transcript provenance, pre-final progress, artifact reconciliation, and final-claim-gate evidence |
 | Durable learnings | `DURABLE_LEARNINGS.md` — 7 categorical lessons from the review |
 
 ### Capability levels
@@ -447,18 +452,410 @@ All items from the original plan, the self-audit gap list, AND the review feedba
 |---|---|---|
 | **Bronze** | Runtime-safe: truth-owned, bounded, no unsafe writes | ✅ Proven |
 | **Silver** | Natural report: model-authored narrative over runtime evidence | ✅ Proven |
-| **Gold** | User-visible UX: spawned subagent shows commentary before final | ⏳ Harness built, needs live bridge + model calls |
+| **Bridge Gold** | Direct bridge-harness UX: streamed OSS progress before final with artifacts reconciled | ✅ Proven by bridge harness |
+| **Desktop Gold** | Codex Desktop spawned-agent UX: captured Desktop transcript shows progress before final and reconciles with runtime MissionV1 artifacts | ⏳ Requires captured Codex Desktop spawned-agent transcript |
 | **Platinum** | Tool-loop parity: Codex adopts bridged multi-step calls ≥95% | ⏳ Probes built, needs live adoption burn-in |
 
-### Gold UX burn-in (requires live bridge)
+### Bridge Gold UX burn-in (requires live bridge)
 
 ```bash
-./bin/codex-oss smoke native-ux-burnin --models=oss_deepseek_pro
+./bin/codex-oss smoke bridge-native-ux-burnin --models=oss_deepseek_pro
 ```
 
-The harness spawns actual OSS subagents, captures the SSE transcript, extracts commentary messages, reconciles with mission artifacts, and evaluates against NativeExperienceContractV1. Gold pass requires:
+`native-ux-burnin` remains as a deprecated alias for `bridge-native-ux-burnin`. This harness calls the local bridge `/v1` Responses/SSE surface, captures the SSE transcript, extracts commentary messages, reconciles with mission artifacts, and evaluates against NativeExperienceContractV1. It proves bridge-local UX, not Codex Desktop spawned-agent rendering or tool adoption. Bridge Gold pass requires:
 - ≥3 commentary events before final answer
 - All 3 required event classes present (start, progress, closure)
 - Commentary observed in consumer transcript
 - Runtime owns terminal truth
 - No unsafe writes or secrets
+
+### Desktop Gold UX verifier
+
+```bash
+./bin/codex-oss smoke desktop-native-ux-burnin \
+  --mission-id <mission_id> \
+  --transcript <captured-codex-desktop-spawned-transcript.json-or-txt> \
+  --route-authority <route_authority_v1.json>
+```
+
+Desktop Gold fails closed unless the captured transcript and RouteAuthorityV1 prove `consumer_kind=codex_desktop_spawned`, `route_kind=managed_mission`, `handoff_schema=mission_v1`, and `desktop_native_claim_allowed=true`.
+
+Build the RouteAuthorityV1 record from the exact spawned-agent handoff:
+
+```bash
+./bin/codex-oss route-authority \
+  --agent-name oss_deepseek_investigator \
+  --model-alias mission-a3-deepseek \
+  --consumer-kind codex_desktop_spawned \
+  --handoff /path/to/handoff.md \
+  --output route_authority.json
+```
+
+### 2026-06-02 Bridge Gold UX live update
+
+Bridge Gold UX is now live-proven for three OSS model aliases and five task routes through the direct bridge harness:
+
+```bash
+./bin/codex-oss smoke bridge-native-ux-burnin \
+  --models=oss_deepseek_pro,oss_flash_support,oss_kimi_rapid \
+  --timeout 180
+```
+
+Result:
+
+```text
+Bridge Gold UX: 15/15 passed
+```
+
+Covered routes:
+
+| Route | Status |
+|---|---|
+| fresh read floor with three files | Gold pass |
+| bounded implementation | Gold pass |
+| pending read recovery | Gold pass |
+| grep/search recovery | Gold pass |
+| ls/list recovery | Gold pass |
+
+Current product claim: the direct bridge harness is Bridge Gold/native-feeling for declared read floors, bounded implementation, and read/search/list recovery paths on `oss_deepseek_pro`, `oss_flash_support`, and `oss_kimi_rapid`. Codex Desktop Gold remains unproven until `desktop-native-ux-burnin` passes with captured Codex Desktop spawned-agent transcript evidence. Platinum tool-loop parity remains a separate certification track.
+
+### 2026-06-02 terminal claim gate hardening
+
+Follow-up after a real spawned-agent run failed:
+
+- Added `OSSFinalClaimGateV1` so terminal claims can carry route authority, pending-call state, implementation witness state, transcript hash, and artifact hashes.
+- Fixed continuation adoption ordering: `tool_output_text` is assigned before an adopted call is marked completed.
+- Initialized adoption state for streaming tool-call responses, matching the non-streaming path.
+- Hardened raw pending owned verification: read-only verification can no longer imply owned mutation or return `PASS` when changed owned paths are empty.
+- Raw direct patch-contract reports now include `Claim type: raw_research_only` and a final-claim-gate line.
+
+Current verdict remains: Bridge Gold yes; Codex Desktop-native no until captured Desktop transcript proof passes the Desktop verifier.
+
+### 2026-06-02 Desktop observation provenance hardening
+
+Follow-up after spawning a fresh runtime-controlled Desktop OSS smoke:
+
+```text
+Agent: oss_flash_context / mission-a2-flash
+Mission: desktop_observation_smoke_20260602
+Observed Desktop surface: one terminal notification only
+Runtime visible commentary: 3 events
+Commentary delivery: emitted=3, rendered=0
+```
+
+The mission completed through the runtime and produced `visible_commentary.jsonl`, `summary.md`, and `commentary_delivery.json`, but the actual spawned-agent notification still contained only the final report. That proves the remaining gap is not mission execution; it is the Desktop consumer observation/rendering boundary.
+
+New hardening:
+
+- Added `DesktopObservationV1` in `codex_oss/desktop_observation.py`.
+- Added `codex-oss desktop-observation classify|wrap`.
+- `desktop-native-ux-burnin` now requires raw Desktop transcript provenance; `desktop_terminal_notification_only` and `artifact_reconciled_candidate_not_raw_desktop_export` fail Desktop Gold.
+- Added tests for raw observed transcripts, artifact-reconciled candidates, and terminal-only notifications.
+
+Fresh verification:
+
+```bash
+PYTHONPATH=. python3 tests/test_desktop_observation.py
+PYTHONPATH=. python3 tests/test_desktop_native_verifier.py
+./bin/codex-oss desktop-observation classify \
+  --transcript .codex-oss/missions/desktop_observation_smoke_20260602/desktop_terminal_transcript.json
+./bin/codex-oss smoke desktop-native-ux-burnin \
+  --mission-id desktop_observation_smoke_20260602 \
+  --transcript .codex-oss/missions/desktop_observation_smoke_20260602/desktop_terminal_transcript.json \
+  --route-authority .codex-oss/missions/desktop_observation_smoke_20260602/route_authority.desktop.json
+```
+
+Result:
+
+```text
+Desktop transcript provenance: FAIL
+missing: transcript_is_not_raw_desktop_export
+
+Desktop Gold UX: FAIL
+missing: desktop_transcript_provenance_missing
+missing: desktop_progress_before_final_missing
+```
+
+Current product claim remains:
+
+```text
+Bridge/runtime behavior is proven for the covered routes.
+Codex Desktop-native behavior is not proven until the real Desktop spawned-agent transcript contains raw observed progress before final.
+```
+
+### 2026-06-02 four-lane claim architecture hardening
+
+The remaining Desktop-native failures are categorized as consumer-witness failures, not bridge-harness failures. The system now separates four public truths:
+
+1. **Runtime Truth Lane** — MissionV1/runtime owns evidence, patches, verification, rollback, implementation witnesses, and final status.
+2. **Bridge Projection Lane** — the bridge owns Responses/SSE shape, pending call identity, recovery, and visible commentary. This lane can certify Bridge Gold only.
+3. **Desktop Consumer Witness Lane** — Desktop-native proof requires a captured Codex Desktop spawned-agent transcript plus route authority, mission identity, artifact hashes, and adoption-or-recovery probes.
+4. **Public Claim Lane** — reports render the canonical tuple `claim_type`, `route_kind`, `consumer_kind`, `effective_status`, `effective_scope`, and `reasons`.
+
+Follow-up changes:
+
+- Raw direct agents are now documented as `raw_research_only` public-claim lanes, not Desktop-native candidates.
+- Raw patch-contract output now says `Claim gate: allowed_to_report_failure; implementation_success_denied` for failed implementation claims instead of ambiguous `Final claim gate: PASS` wording.
+- Desktop verifier now requires mission identity reconciliation, adoption-or-explicit-recovery probes, and non-empty artifact hashes in addition to transcript progress and route authority.
+- MissionV1 read-only artifact writing reconciles runtime entitlement: a `PARTIAL` status is promoted to `COMPLETE` when answer-graph coverage can complete and no runtime insufficiency reason exists; otherwise PARTIAL carries runtime-owned insufficiency reasons.
+- PatchIntentV1 prompts now state the path invariant explicitly: every edit must include `path`, or one top-level `path`/`file_path`/`target_file` must apply to all edits, including `create_file`.
+
+### 2026-06-02 Managed A3 source-state authority hardening
+
+Follow-up after managed A3 falsely projected read-but-shape-insufficient evidence as missing inspections:
+
+- Added `EvidenceShapeV1` registry in `codex_oss/evidence_shapes.py`, including generic shapes and Desktop-claim-specific shapes such as `desktop_gold_requires_transcript`, `claim_tuple`, and `consumer_kind`.
+- MissionV1 admission now fails early for unknown `required_shapes` unless the mission provides an explicit `shape_patterns` entry for the custom shape.
+- Added `SourceStateV1` projection in answer graphs with states: `missing`, `read_satisfied`, `read_insufficient_shape`, `blocked`, and `contradicted`.
+- Only `missing` source states become `inspect:<path>` fields. Read-but-insufficient evidence now renders typed `insufficient_shape:<path>:<shape>` fields.
+- Added `source_state_hash` and preserve it through answer graph, runtime report, answer graph summary, and completion envelope.
+- Fixed read-state authority so a path is not considered read-satisfied merely because it appears in `files_inspected`; it must have successful file evidence.
+- Fixed runtime entitlement reconciliation to use answer-graph `sufficiency.can_close` instead of relying on a non-authoritative `can_complete` field.
+
+### 2026-06-02 Desktop consumer-witness hardening
+
+Follow-up after Desktop spawned-agent proof still produced terminal-only notification:
+
+- Added `ConsumerObservationWitnessV1` in `codex_oss/desktop_observation.py` for the actual Desktop Consumer Witness Lane.
+- Desktop Gold now depends on raw Desktop transcript provenance plus observed progress before final; producer-side runtime artifacts, bridge harness transcripts, artifact-reconciled candidates, terminal-only notifications, and transcript hashes alone cannot pass.
+- `OSSFinalClaimGateV1` now rejects Desktop claims unless `consumer_observation_witness.ok=true`; route authority plus transcript path is no longer enough.
+- `NativeExperienceContractV1` no longer treats `desktop_transcript_hash` as Desktop provenance. It requires a passing consumer observation witness.
+- `desktop-native-ux-burnin` now carries the consumer observation witness into both verifier output and final claim gate evaluation.
+
+Current verdict remains: Bridge/runtime native-like behavior is proven for covered routes; Desktop-native remains unproven until Codex Desktop is in the observation loop and exports a raw spawned-agent transcript with progress rendered before final.
+
+### 2026-06-02 Desktop consumer adapter seam
+
+Follow-up after the fresh live tryout:
+
+```text
+Mission: desktop_live_tryout_20260602_a
+Runtime visible commentary: 16 events
+Commentary delivery: stream_enqueued=16, sse_emitted=16, consumer_observed=0, rendered_before_final=0
+Observed Desktop surface: terminal report only
+```
+
+Root cause held: the bridge/runtime produced and streamed safe commentary, but
+the Desktop spawned-agent consumer did not expose child commentary events in the
+parent-visible transcript.
+
+New implementation:
+
+- Added `codex_oss/desktop_consumer_adapter.py`.
+- Added `codex-oss desktop-observation from-sse` to convert consumer-observed child Responses SSE into a `DesktopObservationV1` transcript.
+- Added `codex-oss desktop-observation reconcile` to mark `commentary_delivery.json` events as `consumer_observed` and `rendered_before_final`.
+- Preserved the fail-closed rule: only raw `codex_desktop_spawned` transcript provenance can mark events as observed. Bridge harness and artifact-reconstructed transcripts are still rejected.
+- Added `tests/test_desktop_consumer_adapter.py`.
+
+Desktop integration contract:
+
+```bash
+./bin/codex-oss desktop-observation from-sse \
+  --mission-id <mission_id> \
+  --sse <child-response.sse> \
+  --agent-id <desktop-agent-id> \
+  --agent-name <desktop-agent-name> \
+  --output .codex-oss/missions/<mission_id>/desktop_transcript.json
+
+./bin/codex-oss desktop-observation reconcile \
+  --mission-dir .codex-oss/missions/<mission_id> \
+  --transcript .codex-oss/missions/<mission_id>/desktop_transcript.json
+
+./bin/codex-oss smoke desktop-native-ux-burnin \
+  --mission-id <mission_id> \
+  --transcript .codex-oss/missions/<mission_id>/desktop_transcript.json \
+  --route-authority .codex-oss/missions/<mission_id>/route_authority.desktop.json
+```
+
+Fresh verification:
+
+```bash
+PYTHONPATH=. python3 tests/test_desktop_consumer_adapter.py
+PYTHONPATH=. python3 tests/test_desktop_observation.py
+PYTHONPATH=. python3 tests/test_desktop_native_verifier.py
+PYTHONPATH=. python3 tests/test_response_emitter.py
+python3 -m py_compile codex_oss/desktop_consumer_adapter.py codex_oss/cli.py
+```
+
+Current verdict:
+
+```text
+Bridge/runtime commentary: proven.
+Desktop consumer adapter seam: implemented and tested.
+Desktop-native live commentary: still requires Codex Desktop / multi-agent consumer to call the adapter with real child SSE.
+```
+
+### 2026-06-03 terminal delivery witness
+
+Follow-up live spawned-agent smoke:
+
+```text
+Mission: desktop_adapter_delivery_report_20260603_a
+Runtime visible commentary: 18 events
+Terminal report delivery line: emitted=18, consumer_observed=0, rendered_before_final=0, failed=0
+Observed Desktop surface: terminal report only
+```
+
+Implementation update:
+
+- Final reports now include `commentary_delivery_path`.
+- Final reports now include `commentary_delivery_summary`.
+- Rendered terminal reports now show `Delivery status: emitted=..., consumer_observed=..., rendered_before_final=..., failed=...`.
+- MissionV1 parsing now accepts the documented `OSS_HANDOFF_JSON:` labeled JSON form as well as the XML wrapper.
+- Managed MissionV1 extraction now treats user content as the active handoff authority before falling back to system/developer text.
+
+This does not make terminal-only output Desktop-native, but it prevents a silent
+false positive: when Desktop does not render live progress, the final report now
+says so directly.
+
+### 2026-06-03 Desktop consumer hook
+
+Follow-up after the adapter seam was still too easy to use partially:
+
+- Added `codex_oss/desktop_consumer_hook.py`.
+- Added `codex-oss desktop-observation consume-sse`.
+- The hook now performs the full consumer-boundary sequence in one call:
+  raw child Responses SSE -> raw Desktop transcript -> `commentary_delivery.json`
+  reconciliation -> Desktop Gold verifier -> `desktop_consumer_observation.json`.
+- Reconciliation now reports both `marked_count` and
+  `rendered_before_final_count`, so Desktop-native UX proof cannot accidentally
+  collapse into "event appeared somewhere."
+- The hook requires at least three canonical event IDs observed and rendered
+  before final. Generic progress text and bridge-harness transcripts still fail
+  closed.
+
+Desktop integration contract:
+
+```bash
+./bin/codex-oss desktop-observation consume-sse \
+  --mission-id <mission_id> \
+  --mission-dir .codex-oss/missions/<mission_id> \
+  --project <project-root> \
+  --sse <raw-child-response.sse> \
+  --route-authority .codex-oss/missions/<mission_id>/route_authority.desktop.json
+```
+
+Fresh verification:
+
+```bash
+PYTHONPATH=. python3 tests/test_desktop_consumer_hook.py
+PYTHONPATH=. python3 tests/test_desktop_consumer_adapter.py
+PYTHONPATH=. python3 tests/test_desktop_native_verifier.py
+./bin/codex-oss desktop-observation consume-sse --help
+python3 -m py_compile codex_oss/desktop_consumer_hook.py codex_oss/desktop_consumer_adapter.py codex_oss/cli.py
+git diff --check
+```
+
+Current verdict:
+
+```text
+Bridge/runtime commentary: proven.
+Desktop consumer hook: implemented and fail-closed in local tests.
+Desktop-native live commentary: still requires the Codex Desktop / multi-agent
+consumer to pass the actual child SSE or rendered message stream into this hook.
+```
+
+### 2026-06-03 Desktop pre-final text renderer probe
+
+Claude/GPT convergence identified a missing falsifier: before building more
+Desktop Gold machinery, prove whether the real Codex Desktop spawned-child
+surface renders ordinary assistant text before final.
+
+Implementation update:
+
+- Added `codex_oss/desktop_pre_final_text_probe.py`.
+- Added `bin/codex-oss desktop-pre-final-text-probe`.
+- Added subcommands:
+  - `self-test`: starts the fake provider locally and verifies valid SSE order.
+  - `config`: prints Codex provider config for the fake probe server.
+  - `server`: runs the no-tool fake Responses provider.
+  - `record`: writes `desktop_pre_final_text_probe_result.json`.
+- Added `desktop_render_surface` to `NativeExperienceContractV1`.
+- Desktop Gold now requires `desktop_render_surface.probe_status == "pass"`.
+  Unknown/fail/flaky probe status blocks Desktop live-commentary claims.
+
+Probe behavior:
+
+```text
+POST /v1/responses
+no tools
+no MissionV1
+no OpenCode Go
+no upstream model
+streams: PROGRESS_ONE, PROGRESS_TWO, PROGRESS_THREE, FINAL_DONE
+```
+
+Result interpretation:
+
+```text
+nothing shows: setup_failed, fix setup and rerun
+only final shows: fail, Desktop live-commentary claims disallowed
+progress then final shows: pass, Desktop Gold observation gate can be used
+inconsistent: flaky, best-effort only
+```
+
+Fresh verification:
+
+```bash
+PYTHONPATH=. python3 tests/test_desktop_pre_final_text_probe.py
+PYTHONPATH=. python3 tests/test_native_experience.py
+PYTHONPATH=. python3 tests/test_final_claim_gate.py
+./bin/codex-oss desktop-pre-final-text-probe self-test --json
+./bin/codex-oss desktop-pre-final-text-probe config --port 43211 --json
+```
+
+### 2026-06-03 TaskEnvelopeV1 / ReportContractValidatorV1 hardening
+
+Follow-up RCA found a separate native-like gap: OSS workers could still return
+progress or intent text as a terminal answer for some task classes. That is not
+a Desktop rendering problem; it is a runtime authority problem.
+
+Implementation update:
+
+- Added `codex_oss/task_contract.py`.
+- Added `TaskEnvelopeV1` normalization for raw and structured OSS handoffs.
+- Added execution-mode selection from the normalized envelope:
+  - `context_pack_report` for explicit read-only source floors.
+  - `managed_autonomy` for discovery when no explicit source floor exists.
+  - `bounded_write_exact` / `bounded_write_patch` for owned write scopes.
+  - `escalate` for proof-critical work.
+  - `invalid_handoff` for write requests without owned paths.
+- Added `ReportContractValidatorV1` classification:
+  - `VALID_FINAL_REPORT`
+  - `STATUS_OR_INTENT`
+  - `ACTION_REQUEST`
+  - `POLICY_REFUSAL`
+  - `INVALID`
+  - `STALL`
+- Wired `bridge.py` terminal validation through the new contract.
+- Preserved legacy missing-field names where existing gates already depend on
+  them.
+
+New invariant:
+
+```text
+Every OSS subagent request must compile into TaskEnvelopeV1 before terminal
+authority is granted. Model-authored text is never accepted as terminal success
+unless it satisfies the report contract for the selected execution mode.
+```
+
+Context-pack hardening:
+
+```text
+explicit read request -> bounded read/excerpt
+explicit grep request -> grep result only
+large doc -> bounded synthesis pack
+source code file -> relevant grep/snippets unless full read is required
+```
+
+Fresh verification:
+
+```bash
+PYTHONPATH=. python3 tests/test_task_contract.py
+PYTHONPATH=. python3 tests/test_protocol_conformance.py
+PYTHONPATH=. python3 tests/test_legacy_modes.py
+PYTHONPATH=. python3 tests/test_runtime_contracts.py
+PYTHONPATH=. python3 tests/test_patch_pipeline.py
+PYTHONPATH=. python3 tests/test_implementation_witness.py
+python3 -m py_compile bridge.py codex_oss/task_contract.py
+```

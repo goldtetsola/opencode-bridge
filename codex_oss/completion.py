@@ -193,6 +193,12 @@ def build_completion_envelope(
         "verification_status": verification_status,
         "closure_status": closure_status,
         "quality_status": quality_status,
+        "source_state_hash": str(
+            answer_graph.get("source_state_hash")
+            or (report.get("answer_graph_summary", {}) or {}).get("source_state_hash")
+            or report.get("source_state_hash")
+            or ""
+        ),
     }
     contract = getattr(mission, "completion_contract", {}) or default_completion_contract(mission)
     derived_status = derive_final_status(envelope, contract)

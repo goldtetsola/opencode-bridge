@@ -89,6 +89,12 @@ from codex_oss.read_evidence import (
 )
 
 from codex_oss.visible_commentary import VisibleCommentarySink
+from codex_oss.task_contract import (
+    compile_task_envelope_v1,
+    is_intent_or_status as _contract_is_intent_or_status,
+    select_execution_mode_v1,
+    validate_report_contract,
+)
 
 # tool_call_adoption probes loaded on-demand via codex_oss.tool_call_adoption
 
@@ -193,6 +199,59 @@ def as_text(value: Any) -> str:
             return as_text(value["content"])
         return json_dumps(value)
     return str(value)
+
+
+def _visible_event_stream_identity(event: JSON) -> JSON:
+    """Projection-preserving identity for user-visible commentary events."""
+    identity: JSON = {
+        "schema_version": str(event.get("schema_version") or "visible_commentary_event.v1"),
+        "mission_id": str(event.get("mission_id") or ""),
+        "event_id": str(event.get("event_id") or ""),
+        "event_type": str(event.get("event_type") or ""),
+        "phase": str(event.get("phase") or ""),
+        "source": str(event.get("source") or ""),
+        "safe_for_user": event.get("safe_for_user") is True,
+    }
+    seq = event.get("seq")
+    if isinstance(seq, int):
+        identity["seq"] = seq
+    elif seq not in (None, ""):
+        try:
+            identity["seq"] = int(seq)
+        except (TypeError, ValueError):
+            identity["seq"] = str(seq)
+    return {"oss_visible_event": identity}
+
+
+def _visible_event_stream_text(event: JSON) -> str:
+    """Render a durable Desktop-visible marker without relying on metadata support."""
+    mission_id = str(event.get("mission_id") or "").strip()
+    event_id = str(event.get("event_id") or "").strip()
+    event_type = str(event.get("event_type") or "progress").strip() or "progress"
+    seq = event.get("seq")
+    seq_text = str(seq).strip() if seq not in (None, "") else "?"
+    title = str(event.get("title") or "").strip()
+    message = str(event.get("message") or "").strip()
+    body = f"{title}: {message}" if title and message else (message or title)
+    if not body:
+        body = event_type.replace("_", " ")
+    if mission_id and event_id:
+        marker = f"[OSS progress mission={mission_id} event={event_id} seq={seq_text} type={event_type}]"
+    elif mission_id:
+        marker = f"[OSS progress {mission_id}#{seq_text} {event_type}]"
+    else:
+        marker = f"[OSS progress #{seq_text} {event_type}]"
+    return f"{marker} {body}".strip()
+
+
+def _emit_visible_commentary_event(emitter: Any, event: JSON) -> None:
+    if not isinstance(event, dict) or event.get("safe_for_user") is not True or emitter is None:
+        return
+    text = _visible_event_stream_text(event)
+    if not text:
+        return
+    metadata = _visible_event_stream_identity(event)
+    emitter.emit_text_message(text, status="in_progress", phase="commentary", metadata=metadata)
 
 
 def normalize_message_for_chat(msg: JSON) -> Optional[JSON]:
@@ -734,6 +793,13 @@ def effective_tool_kind(tool_name: str, tool_args: str, current_kind: ToolKind) 
     _, command = normalize_tool_args(tool_args, tool_name)
     if command and _append_redirection_from_shell_command(command):
         return "write"
+    if command:
+        parts = _strip_shell_redirection_parts(_shell_parts(command))
+        if parts:
+            if (len(parts) >= 2 and parts[0] == "rtk" and parts[1] == "grep") or parts[0] in ("rg", "grep"):
+                return "grep"
+            if (len(parts) >= 2 and parts[0] == "rtk" and parts[1] in ("ls", "find")) or parts[0] in ("ls", "find"):
+                return "ls"
     if command and _shell_command_is_read_like(command):
         return "read"
     return current_kind
@@ -1438,7 +1504,7 @@ def parse_task_envelope(handoff_text: str) -> dict:
     """Parse structured task fields from OSS handoff text."""
     structured = _structured_handoff_to_envelope(handoff_text)
     if structured is not None:
-        return structured
+        return compile_task_envelope_v1(structured, handoff_text=handoff_text)
     envelope = _empty_task_envelope()
     current_field = None
 
@@ -1503,7 +1569,7 @@ def parse_task_envelope(handoff_text: str) -> dict:
     if "proof-critical" in task_type_lower or "proof_critical" in task_type_lower:
         envelope["proof_critical"] = True
 
-    return envelope
+    return compile_task_envelope_v1(envelope, handoff_text=handoff_text)
 
 
 def _extract_exact_content(text: str) -> str:
@@ -1620,23 +1686,7 @@ def _parse_path_list(line: str) -> list:
 
 
 def select_mode(envelope: dict) -> str:
-    if envelope.get("schema_error"):
-        return "invalid_handoff"
-    if envelope.get("proof_critical"):
-        return "escalate"
-    if envelope.get("write_allowed") and envelope.get("owned_paths") and envelope.get("exact_content"):
-        return "bounded_write_exact"
-    if envelope.get("write_allowed") and envelope.get("owned_paths"):
-        return "bounded_write_patch"
-    if envelope.get("write_allowed"):
-        return "invalid_handoff"
-    if envelope.get("read_only_paths") and envelope.get("deliverable_fields"):
-        return "context_pack_report"
-    if envelope.get("read_only_paths"):
-        return "context_pack_report"
-    if envelope.get("no_tools_required"):
-        return "no_tool_exact"
-    return "managed_autonomy"
+    return select_execution_mode_v1(envelope)
 
 
 def legacy_direct_write_modes_enabled() -> bool:
@@ -1897,7 +1947,13 @@ def _extract_pattern_from_args(args: Any, tool_name: str = "") -> str:
     else:
         parsed = args
     if isinstance(parsed, dict):
-        return str(parsed.get("pattern", "") or parsed.get("query", "") or "")
+        direct = str(parsed.get("pattern", "") or parsed.get("query", "") or "")
+        if direct:
+            return direct
+        for key in ("cmd", "command", "args", "arguments"):
+            val = parsed.get(key)
+            if val:
+                return _search_pattern_from_shell_command(str(val) if isinstance(val, str) else json.dumps(val))
     return ""
 
 
@@ -2461,14 +2517,7 @@ def complete_declared_reads_from_bridge(
     stream_cb = None
     if emitter is not None:
         def _stream_commentary(event):
-            try:
-                emitter.emit_text_message(
-                    f"[{event.get('phase', '')}] {event.get('title', '')}",
-                    status="in_progress",
-                    phase=event.get('phase', 'read_floor'),
-                )
-            except Exception:
-                pass
+            _emit_visible_commentary_event(emitter, event)
         stream_cb = _stream_commentary
 
     commentary = VisibleCommentarySink(
@@ -2725,6 +2774,10 @@ def _persist_read_evidence_artifacts(
             reason=reason,
             narrative_draft=narrative_draft,
         )
+        probes_path = os.path.join(mission_dir, "tool_call_adoption_probes.json")
+        if not os.path.exists(probes_path):
+            from codex_oss.tool_call_adoption import persist_adoption_probes
+            persist_adoption_probes(mission_dir, [], None)
     except Exception:
         pass  # Artifact persistence is best-effort
 
@@ -2739,6 +2792,7 @@ def complete_pending_reads_from_bridge(
     finalizer_call=None,
     finalizer_timeout_seconds: float = 8,
     log_fn=None,
+    emitter=None,
 ) -> str:
     envelope = parse_task_envelope(handoff_text)
     required_paths = required_paths_from_envelope(envelope, handoff_text)
@@ -2766,10 +2820,16 @@ def complete_pending_reads_from_bridge(
     # Derive mission identity and create commentary
     mission_id = envelope.get("mission_id", "") or f"pending_read_{_hash_text(handoff_text)[:12]}"
     mission_dir = os.path.join(project_root, ".codex-oss", "missions", mission_id)
+    stream_cb = None
+    if emitter is not None:
+        def _stream_commentary(event):
+            _emit_visible_commentary_event(emitter, event)
+        stream_cb = _stream_commentary
     commentary = VisibleCommentarySink(
         mission_id=mission_id,
         mission_dir=mission_dir,
         mode="summary",
+        stream_callback=stream_cb,
     )
     commentary.emit(
         "mission_started",
@@ -3207,9 +3267,20 @@ def execute_pending_owned_verification_from_bridge(
             verified = any(marker in content for marker in markers) if markers else bool(content)
     changed_paths = collect_owned_path_changes(envelope.get("owned_paths", []), project_root)
     rel = _repo_relative_path(path, project_root)
-    if verified and any(_path_satisfies_required_path(path, owned) for owned in envelope.get("owned_paths", [])):
+    owned_target = any(_path_satisfies_required_path(path, owned) for owned in envelope.get("owned_paths", []))
+    if verified and completed_marker and owned_target:
         if rel not in changed_paths:
             changed_paths.append(rel)
+    terminal_status = "PASS" if verified and changed_paths else "FAIL"
+    terminal_reason = (
+        "owned path verification completed server-side after pending tool adoption failure"
+        if terminal_status == "PASS" and not completed_marker else
+        "declared owned marker write completed server-side after model skipped the write"
+        if terminal_status == "PASS" and completed_marker else
+        "read-only verification cannot certify owned-path mutation"
+        if verified and not changed_paths else
+        "owned path verification failed server-side after pending tool adoption failure"
+    )
     if log_fn:
         log_fn(
             "server_side_owned_verification_complete",
@@ -3222,12 +3293,8 @@ def execute_pending_owned_verification_from_bridge(
     return build_patch_contract_report(
         envelope,
         changed_paths,
-        "PASS" if verified else "FAIL",
-        "owned path verification completed server-side after pending tool adoption failure"
-        if verified and not completed_marker else
-        "declared owned marker write completed server-side after model skipped the write"
-        if verified and completed_marker else
-        "owned path verification failed server-side after pending tool adoption failure",
+        terminal_status,
+        terminal_reason,
         verification_seen=True,
         verification_output=(
             f"server-side verification {'found' if verified else 'did not find'} "
@@ -3339,8 +3406,8 @@ def execute_pending_owned_shell_from_bridge(
         status = "PASS"
         reason = "owned path changes completed server-side after pending tool adoption failure"
     elif marker_already_present and marker_present:
-        status = "PASS"
-        reason = "owned path verification marker was already present during idempotent server-side recovery"
+        status = "PARTIAL"
+        reason = "owned path verification marker was already present, but no owned-path mutation was observed"
     elif changed_paths:
         status = "PARTIAL"
         reason = "owned path changes were observed, but verification was not observed server-side"
@@ -3398,22 +3465,7 @@ def build_pending_child_not_fulfilled_report(
 
 
 def is_intent_or_status(text: str) -> bool:
-    if len(text) < MIN_REPORT_LENGTH:
-        return True
-    import re
-    intent_match = re.search(INTENT_PATTERNS, text, re.IGNORECASE)
-    if intent_match:
-        # Evidence markers must be report-structure indicators, not just common words
-        report_markers = (
-            "oss_report_begin", "pass\n", "fail\n", "partial\n", "status:", "task status:",
-            "summary:", "evidence:", "evidence snippets:", "evidence table:", "confidence:",
-            "caveat:", "caveats:", "files inspected:", "files gathered:",
-            "commands run:", "commands used:", "command used:",
-        )
-        has_report_structure = any(marker in text.lower() for marker in report_markers)
-        if not has_report_structure:
-            return True
-    return False
+    return _contract_is_intent_or_status(text, min_report_length=MIN_REPORT_LENGTH)
 
 
 def verification_contract_requested(envelope: dict) -> bool:
@@ -3518,52 +3570,13 @@ def should_retry_pretool_block(output_text: str, exit_code: int, turn: int, max_
 def validate_report_output(text: str, mode: str, envelope: dict,
                            verification_observed: bool = False,
                            evidence_coverage_complete: bool = True) -> tuple:
-    is_valid = True
-    missing = []
-    t = text.lower()
-
-    if is_intent_or_status(text):
-        return False, ["intent_or_status_detected"]
-
-    required_by_mode = {
-        "context_pack_report": ["confidence", "caveat"],
-        "managed_autonomy": ["confidence", "caveat"],
-        "bounded_write_exact": ["file", "confidence"],
-        "bounded_write_patch": ["file", "confidence", "caveat"],
-        "no_tool_exact": [],
-        "escalate": [],
-    }
-
-    if mode in ("context_pack", "context_pack_report", "managed_autonomy", "bounded_write_exact", "bounded_write_patch"):
-        if not re.search(r"\b(pass|fail|partial)\b", t):
-            is_valid = False
-            missing.append("status")
-
-    for field in required_by_mode.get(mode, []):
-        if field not in t:
-            is_valid = False
-            missing.append(field)
-
-    exact_deliverables = [
-        _field_label(field)
-        for field in envelope.get("deliverable_fields", [])
-        if _is_exact_deliverable_field(field)
-    ]
-    for field in exact_deliverables:
-        if field.lower() not in t:
-            is_valid = False
-            missing.append(field)
-
-    if verification_contract_requested(envelope) and output_claims_verification(text) and not verification_observed:
-        is_valid = False
-        missing.append("verification_observed")
-
-    if mode in ("context_pack", "context_pack_report", "managed_autonomy"):
-        if not evidence_coverage_complete and re.search(r"\bpass\b", t) and not re.search(r"\bpartial\b", t):
-            is_valid = False
-            missing.append("evidence_coverage")
-
-    return is_valid, missing
+    return validate_report_contract(
+        text,
+        mode,
+        envelope,
+        verification_observed=verification_observed,
+        evidence_coverage_complete=evidence_coverage_complete,
+    )
 
 
 def build_deterministic_write_report(path: str, success: bool, observed: str, mode: str) -> str:
@@ -4101,7 +4114,11 @@ def classify_request_kind(body: JSON) -> RequestKind:
 def classify_tool_call_name(name: str) -> ToolKind:
     """Classify a tool call by its name."""
     n = (name or "").lower()
-    if any(kw in n for kw in ("read", "cat", "head", "tail", "grep", "find", "ls", "nl", "sed")):
+    if any(kw in n for kw in ("grep", "rg", "search")):
+        return "grep"
+    if any(kw in n for kw in ("find", "ls", "list")):
+        return "ls"
+    if any(kw in n for kw in ("read", "cat", "head", "tail", "nl", "sed")):
         return "read"
     if any(kw in n for kw in ("write", "edit", "patch", "apply_patch", "create", "mkdir")):
         return "write"
@@ -4381,6 +4398,27 @@ def _find_tool_call_details(prev_state: Optional[StoredResponse], tool_call_id: 
 def build_patch_contract_report(envelope: dict, changed_paths: list, status: str,
                                 reason: str, verification_seen: bool = False,
                                 verification_output: str = "") -> str:
+    from codex_oss.final_claim_gate import evaluate_final_claim_gate
+    from codex_oss.route_authority import build_route_authority
+
+    gate = evaluate_final_claim_gate(
+        claim_type="raw_implementation",
+        requested_status=status,
+        route_authority=build_route_authority(
+            model_alias="ocg-raw-direct",
+            handoff_obj={"schema_version": 1},
+            consumer_kind="direct_bridge_harness",
+        ),
+        changed_owned_paths=list(changed_paths or []),
+        implementation_witness={
+            "ok": bool(changed_paths) or status.upper() not in {"PASS", "VERIFIED"},
+            "explicit_noop": False,
+        },
+        recovery_used=True,
+    )
+    if status.upper() in {"PASS", "VERIFIED"} and not gate.get("ok"):
+        status = str(gate.get("effective_status") or "PARTIAL")
+        reason = f"{reason}; final claim gate downgraded success: {', '.join(gate.get('reasons', []) or [])}"
     owned = ", ".join(envelope.get("owned_paths", [])) or "unknown"
     changed = ", ".join(changed_paths) if changed_paths else "none"
     verification = "observed" if verification_seen else "not_observed"
@@ -4408,6 +4446,11 @@ def build_patch_contract_report(envelope: dict, changed_paths: list, status: str
         f"Owned paths: {owned}\n"
         f"Changed owned paths: {changed}\n"
         f"Verification status: {verification}\n"
+        f"Claim type: raw_research_only\n"
+        f"Claim tuple: claim_type={gate.get('claim_type')}; route_kind={gate.get('route_kind')}; "
+        f"consumer_kind={gate.get('consumer_kind')}; effective_status={gate.get('effective_status')}; "
+        f"effective_scope={gate.get('effective_scope')}; reasons={', '.join(gate.get('reasons', []) or ['none'])}\n"
+        f"Claim gate: {gate.get('publication_decision')}; {gate.get('implementation_decision')}\n"
         f"{output_line}"
         f"{narrative_line}"
         f"Reason: {reason}\n"
@@ -5338,12 +5381,7 @@ class Handler(BaseHTTPRequestHandler):
                 managed_emitter.start()
 
                 def commentary_callback(event):
-                    if not isinstance(event, dict) or event.get("safe_for_user") is not True:
-                        return
-                    text = str(event.get("message") or "").strip()
-                    if not text:
-                        return
-                    managed_emitter.emit_commentary_message(text)
+                    _emit_visible_commentary_event(managed_emitter, event)
 
             managed = run_managed_mission_from_body(
                 body=body,
@@ -5409,7 +5447,7 @@ class Handler(BaseHTTPRequestHandler):
                     )
                 if report_text:
                     APP.log("fresh_server_side_read_floor_complete", mode=handoff_mode)
-                    emitter.emit_text_message(report_text)
+                    emitter.emit_text_message(report_text, phase="final_answer")
                     emitter.complete()
                     return
 
@@ -5501,6 +5539,8 @@ class Handler(BaseHTTPRequestHandler):
         first_tool = tool_outputs[0]
         tool_call_id = str(first_tool.get("call_id", ""))
         tool_name_raw = first_tool.get("name", "")
+        tool_output_raw = first_tool.get("output", "")
+        tool_output_text = str(tool_output_raw)
 
         # Look up stored state to find the previous tool call's original name
         prev_id = body.get("previous_response_id")
@@ -5540,9 +5580,6 @@ class Handler(BaseHTTPRequestHandler):
                         reverse_name_map[tc_func["name"]] = tc_func["name"]
 
         tool_kind = classify_tool_call_name(tool_name_raw)
-        tool_output_raw = first_tool.get("output", "")
-        tool_output_text = str(tool_output_raw)
-
         completed_read_paths_before = _extract_completed_read_paths_from_history(prev_state.messages) if prev_state else set()
 
         # Count turn and determine budget. Use completed read evidence as a backstop so
@@ -5620,7 +5657,7 @@ class Handler(BaseHTTPRequestHandler):
             )
             if report_text:
                 APP.log("proactive_server_side_read_floor_complete", mode=mode)
-                emitter.emit_text_message(report_text)
+                emitter.emit_text_message(report_text, phase="final_answer")
                 emitter.complete()
                 return
 
@@ -5638,6 +5675,7 @@ class Handler(BaseHTTPRequestHandler):
                     replay_limit=replay_limit,
                 )
                 if replay_count > replay_limit:
+                    emitter = ResponseEmitter(self, new_id("resp"), model_alias, bool(body.get("stream")))
                     report_text = ""
                     report_text = execute_pending_owned_write_from_bridge(
                         parent_response_id=str(prev_id),
@@ -5669,6 +5707,7 @@ class Handler(BaseHTTPRequestHandler):
                             finalizer_call=self._server_side_read_finalizer_call(model_alias),
                             finalizer_timeout_seconds=float(os.getenv("OSS_SERVER_SIDE_READ_FINALIZER_TIMEOUT_SECONDS", "90")),
                             log_fn=APP.log,
+                            emitter=emitter,
                         )
                     if not report_text:
                         report_text = build_pending_child_not_fulfilled_report(
@@ -5676,8 +5715,7 @@ class Handler(BaseHTTPRequestHandler):
                             child_state=pending_child,
                             handoff_text=handoff_text,
                         )
-                    emitter = ResponseEmitter(self, new_id("resp"), model_alias, bool(body.get("stream")))
-                    emitter.emit_text_message(report_text)
+                    emitter.emit_text_message(report_text, phase="final_answer")
                     emitter.complete()
                     return
                 resp_obj = build_response_from_pending_child(body, pending_child)
@@ -6144,7 +6182,7 @@ class Handler(BaseHTTPRequestHandler):
             )
             if report_text:
                 APP.log("fresh_server_side_read_floor_complete", mode=handoff_mode)
-                emitter.emit_text_message(report_text)
+                emitter.emit_text_message(report_text, phase="final_answer")
                 emitter.complete()
                 return
         if prev_id:
@@ -6152,6 +6190,7 @@ class Handler(BaseHTTPRequestHandler):
             terminal_child = APP.state.find_terminal_pending_child(prev_id, replay_limit)
             if terminal_child:
                 handoff_text = _extract_handoff_text(base_messages)
+                emitter = ResponseEmitter(self, new_id("resp"), model_alias, bool(body.get("stream")))
                 report_text = ""
                 report_text = execute_pending_owned_write_from_bridge(
                     parent_response_id=prev_id,
@@ -6183,6 +6222,7 @@ class Handler(BaseHTTPRequestHandler):
                         finalizer_call=self._server_side_read_finalizer_call(model_alias),
                         finalizer_timeout_seconds=float(os.getenv("OSS_SERVER_SIDE_READ_FINALIZER_TIMEOUT_SECONDS", "90")),
                         log_fn=APP.log,
+                        emitter=emitter,
                     )
                 if not report_text:
                     report_text = build_pending_child_not_fulfilled_report(
@@ -6196,8 +6236,7 @@ class Handler(BaseHTTPRequestHandler):
                     pending_response_id=terminal_child.response_id,
                     replay_count=terminal_child.pending_replay_count,
                 )
-                emitter = ResponseEmitter(self, new_id("resp"), model_alias, bool(body.get("stream")))
-                emitter.emit_text_message(report_text)
+                emitter.emit_text_message(report_text, phase="final_answer")
                 emitter.complete()
                 return
         if body.get("stream"):

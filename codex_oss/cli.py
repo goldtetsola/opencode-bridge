@@ -202,7 +202,16 @@ def main():
     native_burnin.add_argument("--timeout", type=float, default=120, help="HTTP timeout per live request")
     native_burnin.add_argument("--json", action="store_true", help="Machine-readable output")
 
-    ux_burnin = smoke_sub.add_parser("native-ux-burnin", help="Gold UX: prove spawned subagent user-visible commentary")
+    bridge_ux_burnin = smoke_sub.add_parser("bridge-native-ux-burnin", help="Bridge Gold UX: prove direct bridge-harness visible commentary")
+    bridge_ux_burnin.add_argument("--project", type=str, default=None, help="Project root path")
+    bridge_ux_burnin.add_argument("--port", type=int, default=4000, help="Bridge port")
+    bridge_ux_burnin.add_argument("--base-url", default=None, help="Bridge base URL")
+    bridge_ux_burnin.add_argument("--auth", default=None, help="Bearer token")
+    bridge_ux_burnin.add_argument("--models", default="oss_deepseek_pro", help="Comma-separated model aliases")
+    bridge_ux_burnin.add_argument("--timeout", type=float, default=120, help="HTTP timeout per live request")
+    bridge_ux_burnin.add_argument("--json", action="store_true", help="Machine-readable output")
+
+    ux_burnin = smoke_sub.add_parser("native-ux-burnin", help="Deprecated alias for bridge-native-ux-burnin; does not prove Codex Desktop Gold")
     ux_burnin.add_argument("--project", type=str, default=None, help="Project root path")
     ux_burnin.add_argument("--port", type=int, default=4000, help="Bridge port")
     ux_burnin.add_argument("--base-url", default=None, help="Bridge base URL")
@@ -211,9 +220,35 @@ def main():
     ux_burnin.add_argument("--timeout", type=float, default=120, help="HTTP timeout per live request")
     ux_burnin.add_argument("--json", action="store_true", help="Machine-readable output")
 
+    desktop_ux_burnin = smoke_sub.add_parser("desktop-native-ux-burnin", help="Desktop Gold UX: verify captured Codex Desktop spawned-agent transcript")
+    desktop_ux_burnin.add_argument("--project", type=str, default=None, help="Project root path")
+    desktop_ux_burnin.add_argument("--transcript", required=True, help="Captured Codex Desktop spawned-agent transcript file")
+    desktop_ux_burnin.add_argument("--mission-id", required=True, help="Mission ID whose artifacts must reconcile with transcript")
+    desktop_ux_burnin.add_argument("--route-authority", default=None, help="RouteAuthorityV1 JSON file proving desktop provenance")
+    desktop_ux_burnin.add_argument("--json", action="store_true", help="Machine-readable output")
+
+    runtime_burnin = smoke_sub.add_parser("native-runtime-burnin", help="Bronze: prove runtime safety and canonical evidence")
+    runtime_burnin.add_argument("--project", type=str, default=None, help="Project root path")
+    runtime_burnin.add_argument("--port", type=int, default=4000, help="Bridge port")
+    runtime_burnin.add_argument("--base-url", default=None, help="Bridge base URL")
+    runtime_burnin.add_argument("--auth", default=None, help="Bearer token")
+    runtime_burnin.add_argument("--live", action="store_true", help="Run live bridge tests")
+    runtime_burnin.add_argument("--models", default="oss_deepseek_pro", help="Comma-separated model aliases")
+    runtime_burnin.add_argument("--timeout", type=float, default=120, help="HTTP timeout per live request")
+    runtime_burnin.add_argument("--json", action="store_true", help="Machine-readable output")
+
     report_burnin = smoke_sub.add_parser("native-report-burnin", help="Silver: prove model-authored narrative over runtime evidence")
     report_burnin.add_argument("--project", type=str, default=None, help="Project root path")
     report_burnin.add_argument("--json", action="store_true", help="Machine-readable output")
+
+    tool_loop_burnin = smoke_sub.add_parser("native-tool-loop-burnin", help="Platinum: prove bridged tool-loop adoption without recovery")
+    tool_loop_burnin.add_argument("--project", type=str, default=None, help="Project root path")
+    tool_loop_burnin.add_argument("--port", type=int, default=4000, help="Bridge port")
+    tool_loop_burnin.add_argument("--base-url", default=None, help="Bridge base URL")
+    tool_loop_burnin.add_argument("--auth", default=None, help="Bearer token")
+    tool_loop_burnin.add_argument("--models", default="oss_deepseek_pro", help="Comma-separated model aliases")
+    tool_loop_burnin.add_argument("--timeout", type=float, default=120, help="HTTP timeout per live request")
+    tool_loop_burnin.add_argument("--json", action="store_true", help="Machine-readable output")
 
     certify = sub.add_parser("certify", help="Run explicit certification gates and write certification artifacts")
     certify.add_argument("--project", type=str, default=None, help="Project root path")
@@ -246,6 +281,83 @@ def main():
     raw_probe.add_argument("--rollback-artifact", action="append", default=[], help="Artifact path that must exist to prove rollback recording")
     raw_probe.add_argument("--json", action="store_true", help="Machine-readable output")
     raw_probe.add_argument("cmd", nargs=argparse.REMAINDER, help="Command to run for the raw probe")
+
+    route_authority = sub.add_parser("route-authority", help="Build a RouteAuthorityV1 JSON record for claim/provenance gates")
+    route_authority.add_argument("--agent-name", default="", help="Codex agent name, e.g. oss_deepseek_investigator")
+    route_authority.add_argument("--model-alias", required=True, help="Bridge model alias, e.g. mission-a3-deepseek")
+    route_authority.add_argument("--handoff", default=None, help="Handoff file used for the spawned agent")
+    route_authority.add_argument("--consumer-kind", choices=["direct_bridge_harness", "codex_desktop_spawned"], default="direct_bridge_harness")
+    route_authority.add_argument("--output", default=None, help="Optional file path to write JSON")
+
+    desktop_observation = sub.add_parser("desktop-observation", help="Build or classify DesktopObservationV1 transcript evidence")
+    desktop_observation_sub = desktop_observation.add_subparsers(dest="desktop_observation_command", help="Desktop observation commands")
+
+    desktop_observation_classify = desktop_observation_sub.add_parser("classify", help="Classify transcript provenance for Desktop Gold")
+    desktop_observation_classify.add_argument("--transcript", required=True, help="Transcript JSON file")
+    desktop_observation_classify.add_argument("--json", action="store_true", help="Machine-readable output")
+
+    desktop_observation_wrap = desktop_observation_sub.add_parser("wrap", help="Wrap already-observed Desktop messages as a raw Desktop transcript")
+    desktop_observation_wrap.add_argument("--mission-id", required=True, help="Mission ID")
+    desktop_observation_wrap.add_argument("--messages", required=True, help="JSON file containing a messages array or {messages:[...]}")
+    desktop_observation_wrap.add_argument("--agent-id", default="", help="Desktop spawned-agent ID")
+    desktop_observation_wrap.add_argument("--agent-name", default="", help="Desktop spawned-agent name")
+    desktop_observation_wrap.add_argument("--output", required=True, help="Output transcript JSON path")
+
+    desktop_observation_from_sse = desktop_observation_sub.add_parser("from-sse", help="Build a Desktop transcript from consumer-observed child Responses SSE")
+    desktop_observation_from_sse.add_argument("--mission-id", required=True, help="Mission ID")
+    desktop_observation_from_sse.add_argument("--sse", required=True, help="File containing child Responses SSE captured by Desktop consumer")
+    desktop_observation_from_sse.add_argument("--agent-id", default="", help="Desktop spawned-agent ID")
+    desktop_observation_from_sse.add_argument("--agent-name", default="", help="Desktop spawned-agent name")
+    desktop_observation_from_sse.add_argument("--transcript-kind", default="codex_desktop_raw_export", help="Transcript provenance kind")
+    desktop_observation_from_sse.add_argument("--output", required=True, help="Output transcript JSON path")
+
+    desktop_observation_reconcile = desktop_observation_sub.add_parser("reconcile", help="Mark commentary delivery observed/rendered from a raw Desktop transcript")
+    desktop_observation_reconcile.add_argument("--mission-dir", required=True, help="Mission artifact directory")
+    desktop_observation_reconcile.add_argument("--transcript", required=True, help="Desktop transcript JSON file")
+    desktop_observation_reconcile.add_argument("--json", action="store_true", help="Machine-readable output")
+
+    desktop_observation_consume_sse = desktop_observation_sub.add_parser(
+        "consume-sse",
+        help="Desktop consumer hook: capture child SSE, reconcile commentary, and run Desktop UX verification",
+    )
+    desktop_observation_consume_sse.add_argument("--mission-id", required=True, help="Mission ID")
+    desktop_observation_consume_sse.add_argument("--mission-dir", required=True, help="Mission artifact directory")
+    desktop_observation_consume_sse.add_argument("--project", required=True, help="Project root containing .codex-oss/missions")
+    desktop_observation_consume_sse.add_argument("--sse", required=True, help="File containing child Responses SSE captured by Desktop consumer")
+    desktop_observation_consume_sse.add_argument("--route-authority", required=True, help="RouteAuthorityV1 JSON file")
+    desktop_observation_consume_sse.add_argument("--agent-id", default="", help="Desktop spawned-agent ID")
+    desktop_observation_consume_sse.add_argument("--agent-name", default="", help="Desktop spawned-agent name")
+    desktop_observation_consume_sse.add_argument("--transcript-kind", default="codex_desktop_raw_export", help="Transcript provenance kind")
+    desktop_observation_consume_sse.add_argument("--output", default=None, help="Optional output transcript JSON path")
+    desktop_observation_consume_sse.add_argument("--json", action="store_true", help="Machine-readable output")
+
+    render_probe = sub.add_parser("desktop-pre-final-text-probe", help="Tranche 0: test whether Desktop renders child assistant text before final")
+    render_probe_sub = render_probe.add_subparsers(dest="render_probe_command", help="Desktop render probe commands")
+
+    render_probe_server = render_probe_sub.add_parser("server", help="Run the no-tool fake Responses provider")
+    render_probe_server.add_argument("--host", default="127.0.0.1", help="Bind host")
+    render_probe_server.add_argument("--port", type=int, default=43211, help="Bind port")
+    render_probe_server.add_argument("--delay", type=float, default=1.0, help="Seconds between streamed text deltas")
+
+    render_probe_self_test = render_probe_sub.add_parser("self-test", help="Run a local provider self-test without Desktop")
+    render_probe_self_test.add_argument("--host", default="127.0.0.1", help="Bind host")
+    render_probe_self_test.add_argument("--port", type=int, default=0, help="Bind port; 0 chooses a free port")
+    render_probe_self_test.add_argument("--delay", type=float, default=0.01, help="Seconds between streamed text deltas")
+    render_probe_self_test.add_argument("--json", action="store_true", help="Machine-readable output")
+
+    render_probe_config = render_probe_sub.add_parser("config", help="Print Codex provider config for the fake probe server")
+    render_probe_config.add_argument("--host", default="127.0.0.1", help="Provider host")
+    render_probe_config.add_argument("--port", type=int, default=43211, help="Provider port")
+    render_probe_config.add_argument("--output", default=None, help="Optional path to write provider config")
+    render_probe_config.add_argument("--json", action="store_true", help="Machine-readable output")
+
+    render_probe_record = render_probe_sub.add_parser("record", help="Record the real Desktop observation result")
+    render_probe_record.add_argument("--status", choices=["pass", "fail", "flaky", "setup_failed", "unknown"], required=True, help="Observed Desktop probe status")
+    render_probe_record.add_argument("--output", default=".codex-oss/desktop_pre_final_text_probe_result.json", help="Output result JSON path")
+    render_probe_record.add_argument("--observed-progress-before-final", choices=["true", "false", "unknown"], default="unknown")
+    render_probe_record.add_argument("--observed-final", choices=["true", "false", "unknown"], default="unknown")
+    render_probe_record.add_argument("--notes", default="", help="Human note about the observed Desktop behavior")
+    render_probe_record.add_argument("--json", action="store_true", help="Machine-readable output")
 
     # up — foreground supervisor
     up = sub.add_parser("up", help="Start bridge with foreground supervisor (keep terminal open)")
@@ -601,6 +713,35 @@ def main():
             print(f"Derived rollback recorded: {str(report['derived_rollback_recorded']).lower()}")
         sys.exit(0 if report.get("exit_code") == 0 else 1)
 
+    elif args.command == "route-authority":
+        from pathlib import Path
+        from codex_oss.route_authority import build_route_authority
+
+        handoff_text = None
+        if args.handoff:
+            try:
+                handoff_text = Path(args.handoff).read_text(encoding="utf-8")
+            except OSError as exc:
+                print(f"handoff not readable: {exc}", file=sys.stderr)
+                sys.exit(1)
+        record = build_route_authority(
+            agent_name=args.agent_name,
+            model_alias=args.model_alias,
+            handoff_text=handoff_text,
+            consumer_kind=args.consumer_kind,
+        )
+        payload = json_dumps_safe(record)
+        if args.output:
+            Path(args.output).write_text(payload + "\n", encoding="utf-8")
+        print(payload)
+        sys.exit(0 if record.get("native_claim_allowed") else 1)
+
+    elif args.command == "desktop-observation":
+        sys.exit(_desktop_observation(args))
+
+    elif args.command == "desktop-pre-final-text-probe":
+        sys.exit(_desktop_pre_final_text_probe(args))
+
     elif args.command == "up":
         sys.exit(_supervise(args.port, daemon=args.daemon, foreground=args.foreground, allow_missing_upstream=bool(args.allow_missing_upstream)))
 
@@ -613,6 +754,215 @@ def main():
     else:
         parser.print_help()
         sys.exit(1)
+
+
+def _desktop_observation(args) -> int:
+    import json
+    from pathlib import Path
+
+    from codex_oss.desktop_observation import (
+        build_raw_desktop_transcript,
+        classify_transcript_provenance,
+    )
+    from codex_oss.desktop_consumer_adapter import (
+        reconcile_delivery_with_transcript,
+        transcript_from_responses_sse,
+    )
+    from codex_oss.desktop_consumer_hook import consume_desktop_sse
+
+    if args.desktop_observation_command == "classify":
+        try:
+            payload = json.loads(Path(args.transcript).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"transcript not readable: {exc}", file=sys.stderr)
+            return 1
+        provenance = classify_transcript_provenance(payload if isinstance(payload, dict) else {})
+        if args.json:
+            print(json_dumps_safe(provenance))
+        else:
+            print(f"Desktop transcript provenance: {'PASS' if provenance.get('ok') else 'FAIL'}")
+            print(f"  consumer_kind: {provenance.get('consumer_kind', '')}")
+            print(f"  transcript_kind: {provenance.get('transcript_kind', '')}")
+            for reason in provenance.get("reasons", []):
+                print(f"  missing: {reason}")
+        return 0 if provenance.get("ok") else 1
+
+    if args.desktop_observation_command == "wrap":
+        try:
+            payload = json.loads(Path(args.messages).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"messages not readable: {exc}", file=sys.stderr)
+            return 1
+        if isinstance(payload, dict):
+            messages = payload.get("messages", [])
+        else:
+            messages = payload
+        if not isinstance(messages, list):
+            print("messages must be a JSON array or an object with a messages array", file=sys.stderr)
+            return 1
+        transcript = build_raw_desktop_transcript(
+            mission_id=args.mission_id,
+            messages=[message for message in messages if isinstance(message, dict)],
+            agent_id=args.agent_id,
+            agent_name=args.agent_name,
+        )
+        output = Path(args.output)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(json_dumps_safe(transcript) + "\n", encoding="utf-8")
+        print(str(output))
+        return 0
+
+    if args.desktop_observation_command == "from-sse":
+        try:
+            sse_text = Path(args.sse).read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            print(f"SSE file not readable: {exc}", file=sys.stderr)
+            return 1
+        transcript = transcript_from_responses_sse(
+            mission_id=args.mission_id,
+            sse_text=sse_text,
+            agent_id=args.agent_id,
+            agent_name=args.agent_name,
+            transcript_kind=args.transcript_kind,
+        )
+        output = Path(args.output)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(json_dumps_safe(transcript) + "\n", encoding="utf-8")
+        print(str(output))
+        return 0
+
+    if args.desktop_observation_command == "reconcile":
+        try:
+            transcript = json.loads(Path(args.transcript).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"transcript not readable: {exc}", file=sys.stderr)
+            return 1
+        report = reconcile_delivery_with_transcript(
+            mission_dir=args.mission_dir,
+            transcript=transcript if isinstance(transcript, dict) else {},
+            persist=True,
+        )
+        if args.json:
+            print(json_dumps_safe(report))
+        else:
+            print(f"Desktop delivery reconciliation: {'PASS' if report.get('ok') else 'FAIL'}")
+            print(f"  marked: {report.get('marked_count', 0)}")
+            for reason in report.get("reasons", []):
+                print(f"  missing: {reason}")
+        return 0 if report.get("ok") else 1
+
+    if args.desktop_observation_command == "consume-sse":
+        try:
+            sse_text = Path(args.sse).read_text(encoding="utf-8", errors="replace")
+            route_authority = json.loads(Path(args.route_authority).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"Desktop consumer input not readable: {exc}", file=sys.stderr)
+            return 1
+        report = consume_desktop_sse(
+            mission_id=args.mission_id,
+            mission_dir=args.mission_dir,
+            project_root=args.project,
+            sse_text=sse_text,
+            route_authority=route_authority if isinstance(route_authority, dict) else {},
+            agent_id=args.agent_id,
+            agent_name=args.agent_name,
+            transcript_kind=args.transcript_kind,
+            output_path=args.output,
+            persist=True,
+            verify=True,
+        )
+        if args.json:
+            print(json_dumps_safe(report))
+        else:
+            print(f"Desktop consumer observation: {'PASS' if report.get('ok') else 'FAIL'}")
+            print(f"  transcript: {report.get('transcript_path', '')}")
+            print(f"  result: {report.get('result_path', '')}")
+            print(f"  marked: {(report.get('reconciliation') or {}).get('marked_count', 0)}")
+            print(f"  rendered_before_final: {(report.get('reconciliation') or {}).get('rendered_before_final_count', 0)}")
+            for reason in report.get("missing_evidence", []):
+                print(f"  missing: {reason}")
+        return 0 if report.get("ok") else 1
+
+    print("Usage: codex-oss desktop-observation <classify|wrap|from-sse|reconcile|consume-sse>", file=sys.stderr)
+    return 1
+
+
+def _desktop_pre_final_text_probe(args) -> int:
+    from pathlib import Path
+
+    from codex_oss.desktop_pre_final_text_probe import (
+        agent_prompt,
+        provider_config,
+        run_self_test,
+        serve_forever,
+        write_probe_result,
+    )
+
+    if args.render_probe_command == "server":
+        serve_forever(host=args.host, port=args.port, delay_seconds=args.delay)
+        return 0
+
+    if args.render_probe_command == "self-test":
+        report = run_self_test(host=args.host, port=args.port, delay_seconds=args.delay)
+        if args.json:
+            print(json_dumps_safe(report))
+        else:
+            print(f"Desktop pre-final text provider self-test: {'PASS' if report.get('ok') else 'FAIL'}")
+            print(f"  port: {report.get('port')}")
+            print(f"  order_ok: {str(bool(report.get('order_ok'))).lower()}")
+            print(f"  response_completed: {str(bool(report.get('response_completed'))).lower()}")
+            print(f"  done_seen: {str(bool(report.get('done_seen'))).lower()}")
+            print("  delta_text:")
+            for line in str(report.get("delta_text", "")).splitlines():
+                print(f"    {line}")
+        return 0 if report.get("ok") else 1
+
+    if args.render_probe_command == "config":
+        config = provider_config(host=args.host, port=args.port)
+        if args.output:
+            Path(args.output).parent.mkdir(parents=True, exist_ok=True)
+            Path(args.output).write_text(config, encoding="utf-8")
+        if args.json:
+            print(json_dumps_safe({
+                "schema_version": "desktop_pre_final_text_probe_config.v1",
+                "provider": "desktop_pre_final_text_probe",
+                "model": "desktop-pre-final-text-probe",
+                "config": config,
+                "agent_prompt": agent_prompt(),
+                "output": args.output or "",
+            }))
+        else:
+            print(config, end="" if config.endswith("\n") else "\n")
+            print("# Spawn prompt:")
+            print(agent_prompt())
+        return 0
+
+    if args.render_probe_command == "record":
+        def tri(value: str):
+            if value == "true":
+                return True
+            if value == "false":
+                return False
+            return None
+
+        report = write_probe_result(
+            output_path=args.output,
+            probe_status=args.status,
+            observed_progress_before_final=tri(args.observed_progress_before_final),
+            observed_final=tri(args.observed_final),
+            notes=args.notes,
+        )
+        if args.json:
+            print(json_dumps_safe(report))
+        else:
+            print(f"Desktop pre-final text probe result: {report['probe_status']}")
+            print(f"  output: {report['path']}")
+            print(f"  Desktop live-commentary claims allowed: {str(bool(report['desktop_render_surface']['claim_policy']['desktop_live_commentary_claim_allowed'])).lower()}")
+            print(f"  reason: {report['desktop_render_surface']['claim_policy']['reason']}")
+        return 0 if report["probe_status"] == "pass" else 1
+
+    print("Usage: codex-oss desktop-pre-final-text-probe <server|self-test|config|record>", file=sys.stderr)
+    return 1
 
 
 def _validate_handoff(path: str) -> int:
@@ -688,11 +1038,23 @@ def _smoke(args) -> int:
     if args.smoke_command == "native-like-burnin":
         return _run_native_like_burnin(args)
 
-    if args.smoke_command == "native-ux-burnin":
+    if args.smoke_command in {"native-ux-burnin", "bridge-native-ux-burnin"}:
         return _run_native_ux_burnin(args)
+
+    if args.smoke_command == "desktop-native-ux-burnin":
+        return _run_desktop_native_ux_burnin(args)
+
+    if args.smoke_command == "native-runtime-burnin":
+        args.level = "bronze"
+        return _run_native_like_burnin(args)
 
     if args.smoke_command == "native-report-burnin":
         return _run_native_report_burnin(args)
+
+    if args.smoke_command == "native-tool-loop-burnin":
+        args.level = "all"
+        args.live = True
+        return _run_native_like_burnin(args)
 
     print("Usage: codex-oss smoke native-polish")
     return 1
@@ -727,6 +1089,7 @@ def _run_native_like_burnin(args) -> int:
 
     env = _os.environ.copy()
     env["PYTHONPATH"] = project_root
+    env["NATIVE_BURNIN_LEVEL"] = level
 
     print(f"Running native-like burn-in (level={level}, live={args.live})")
     if args.live:
@@ -755,7 +1118,7 @@ def _run_native_like_burnin(args) -> int:
 
 
 def _run_native_ux_burnin(args) -> int:
-    """Run Gold UX burn-in: prove spawned subagent user-visible commentary."""
+    """Run Bridge Gold UX burn-in: prove direct bridge-harness commentary."""
     import os as _os
     project_root = args.project or _os.getcwd()
     base_url = (args.base_url or f"http://127.0.0.1:{args.port}/v1").rstrip("/")
@@ -764,7 +1127,8 @@ def _run_native_ux_burnin(args) -> int:
 
     from codex_oss.spawned_transcript import run_gold_ux_burnin
 
-    print(f"Gold UX Burn-In — spawned subagent commentary proof")
+    print(f"Bridge Gold UX Burn-In — direct bridge-harness commentary proof")
+    print("  Note: this does not prove Codex Desktop spawned-agent UX; use desktop-native-ux-burnin for that.")
     print(f"  Bridge: {base_url}")
     print(f"  Models: {models}")
     print()
@@ -781,7 +1145,7 @@ def _run_native_ux_burnin(args) -> int:
     else:
         passed = report.get("gold_passed", 0)
         total = report.get("total_tests", 0)
-        print(f"Gold UX: {passed}/{total} passed")
+        print(f"Bridge Gold UX: {passed}/{total} passed")
         for result in report.get("results", []):
             name = result.get("test_name", "unknown")
             level = result.get("level", "none")
@@ -802,6 +1166,43 @@ def _run_native_ux_burnin(args) -> int:
     return 0 if report.get("gold_passed", 0) == report.get("total_tests", 0) else 1
 
 
+def _run_desktop_native_ux_burnin(args) -> int:
+    """Verify captured Codex Desktop spawned-agent native UX evidence."""
+    import json as _json
+    import os as _os
+
+    from codex_oss.desktop_native_verifier import verify_desktop_native_ux
+
+    project_root = args.project or _os.getcwd()
+    route_authority = None
+    if args.route_authority:
+        try:
+            with open(args.route_authority, "r", encoding="utf-8") as handle:
+                route_authority = _json.load(handle)
+        except OSError as exc:
+            print(f"Route authority file not readable: {exc}", file=sys.stderr)
+            return 1
+
+    report = verify_desktop_native_ux(
+        transcript_path=args.transcript,
+        mission_id=args.mission_id,
+        project_root=project_root,
+        route_authority=route_authority,
+    )
+    if args.json:
+        print(json_dumps_safe(report))
+    else:
+        print(f"Desktop Gold UX: {'PASS' if report.get('ok') else 'FAIL'}")
+        print(f"Mission: {report.get('mission_id', '')}")
+        print(f"Transcript: {report.get('transcript_path', '')}")
+        for check in report.get("checks", []):
+            marker = "✓" if check.get("ok") else "✗"
+            print(f"  {marker} {check.get('name')}")
+        for item in report.get("missing_evidence", []):
+            print(f"  missing: {item}")
+    return 0 if report.get("ok") else 1
+
+
 def _run_native_report_burnin(args) -> int:
     """Run Silver burn-in: prove model-authored narrative over runtime evidence."""
     import subprocess
@@ -818,6 +1219,7 @@ def _run_native_report_burnin(args) -> int:
     env = _os.environ.copy()
     env["PYTHONPATH"] = project_root
     env["LIVE"] = "0"
+    env["NATIVE_BURNIN_LEVEL"] = "silver"
 
     print("Silver Report Burn-In — model-authored narrative proof")
     print()
@@ -901,6 +1303,21 @@ def _mission_compile(args) -> int:
         print("Mission compile requires at least one --owned-path for A4/A5/A6", file=sys.stderr)
         return 1
     verification_commands = [_split_shell_words(command) for command in (args.verification_command or [])]
+    apply_mode = "isolated_worktree" if args.apply_mode == "isolated" else args.apply_mode
+    valid_apply_modes = {
+        "isolated_worktree",
+        "temp_project",
+        "workspace",
+        "workspace_explicit",
+        "workspace_low_risk",
+    }
+    if args.tier in ("A4", "A5", "A6") and apply_mode not in valid_apply_modes:
+        print(
+            "Mission compile --apply-mode must be one of "
+            f"{sorted(valid_apply_modes)}",
+            file=sys.stderr,
+        )
+        return 1
     sufficiency_policy = {}
     if args.sufficiency_min_main_claims is not None:
         sufficiency_policy["min_main_claims"] = int(args.sufficiency_min_main_claims)
@@ -931,7 +1348,7 @@ def _mission_compile(args) -> int:
             required_test_files=args.required_test_file or [],
             required_symbols=args.required_symbol or [],
             verification_commands=verification_commands,
-            apply_mode=args.apply_mode,
+            apply_mode=apply_mode,
             objective_style=args.objective_style,
             sufficiency_policy=sufficiency_policy or None,
             answer_obligations=[{"question": text} for text in (args.answer_obligation or []) if str(text).strip()],

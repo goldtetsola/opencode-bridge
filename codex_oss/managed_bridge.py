@@ -16,14 +16,13 @@ from codex_oss.decision_trace import append_decision, write_decision_trace
 from codex_oss.fast_path import run_deterministic_fast_path
 from codex_oss.implementation import run_implementation_mission
 from codex_oss.ledger import EvidenceLedger
-from codex_oss.mission import InvalidHandoffError, _build_mission
+from codex_oss.mission import InvalidHandoffError, _build_mission, extract_mission_v1_block
 from codex_oss.claim_graph import refresh_claim_graph
 from codex_oss.answer_graph import build_investigation_plan, refresh_answer_graph
 from codex_oss.runtime.loop import run_loop
 from codex_oss.runtime.policy import (
     acquire_mission_slot,
     build_deterministic_partial_report,
-    extract_single_handoff_block,
     release_mission_slot,
 )
 from codex_oss.validation import render_report
@@ -95,12 +94,24 @@ class ManagedMissionResult:
 
 
 def extract_handoff_from_body(body: JSON) -> str:
-    """Extract system/developer/user text from a Responses request body."""
+    """Extract active handoff text from a Responses request body.
+
+    User content is the authoritative handoff source. System/developer text may
+    contain examples or installed repo guidance, so use it only when no user
+    handoff marker is present.
+    """
+    user_text = _extract_text_for_roles(body, ("user",))
+    if "OSS_HANDOFF_JSON" in user_text:
+        return user_text
+    return _extract_text_for_roles(body, ("system", "developer", "user"))
+
+
+def _extract_text_for_roles(body: JSON, roles: tuple[str, ...]) -> str:
     text = ""
     for item in body.get("input", []):
         role = item.get("role", "")
         content = item.get("content", "")
-        if role not in ("system", "developer", "user") or not content:
+        if role not in roles or not content:
             continue
         if isinstance(content, str):
             text += content + "\n"
@@ -121,8 +132,8 @@ def should_handle_managed_mission_body(body: JSON, raw_model_alias: str) -> bool
     handoff = extract_handoff_from_body(body)
     runtime_alias = raw_model_alias in RUNTIME_MODEL_ALIASES
     try:
-        mission_block = extract_single_handoff_block(handoff) if handoff else None
-    except ValueError:
+        mission_block = extract_mission_v1_block(handoff) if handoff else None
+    except InvalidHandoffError:
         return True
 
     if not mission_block or "oss_agent_mission.v1" not in mission_block:
@@ -152,8 +163,8 @@ def run_managed_mission_from_body(
     handoff = extract_handoff_from_body(body)
     runtime_alias = raw_model_alias in RUNTIME_MODEL_ALIASES
     try:
-        mission_block = extract_single_handoff_block(handoff) if handoff else None
-    except ValueError as exc:
+        mission_block = extract_mission_v1_block(handoff) if handoff else None
+    except InvalidHandoffError as exc:
         log_fn("mission_entrypoint_invalid", error=str(exc))
         return ManagedMissionResult(
             handled=True,
@@ -300,6 +311,12 @@ def run_managed_mission_from_body(
                     project_root=os.getcwd(),
                     commentary=commentary,
                 )
+                commentary.close({
+                    "status": str(result.get("status", "FAILED")),
+                    "mission_id": mission.mission_id,
+                    "confidence": "HIGH" if str(result.get("status", "")).upper() in {"VERIFIED", "VALIDATED"} else "MEDIUM",
+                    "closure_source": "runtime_controlled_implementation",
+                })
             finally:
                 release_mission_slot(mission.mission_id)
             return ManagedMissionResult(
@@ -354,10 +371,13 @@ def run_managed_mission_from_body(
                     source="runtime",
                 )
                 commentary.close(report)
-                _write_readonly_mission_artifacts(mission, ledger, report, str(fast_path_result.get("status", "PARTIAL")))
+                _attach_commentary_delivery_summary(mission, report)
+                final_status = _write_readonly_mission_artifacts(mission, ledger, report, str(fast_path_result.get("status", "PARTIAL")))
+            else:
+                final_status = str(fast_path_result.get("status", "PARTIAL"))
             return ManagedMissionResult(
                 handled=True,
-                status=str(fast_path_result.get("status", "PARTIAL")),
+                status=final_status,
                 mission_id=mission.mission_id,
                 report_text=render_report(report),
             )
@@ -386,11 +406,14 @@ def run_managed_mission_from_body(
         if isinstance(report, dict):
             _attach_visible_commentary_paths(mission, report)
             commentary.close(report)
-            _write_readonly_mission_artifacts(mission, ledger, report, str(result.get("status", "PARTIAL")))
+            _attach_commentary_delivery_summary(mission, report)
+            final_status = _write_readonly_mission_artifacts(mission, ledger, report, str(result.get("status", "PARTIAL")))
+        else:
+            final_status = str(result.get("status", "PARTIAL"))
         report_text = render_report(report) if isinstance(report, dict) else str(report)
         return ManagedMissionResult(
             handled=True,
-            status=str(result.get("status", "PARTIAL")),
+            status=final_status,
             mission_id=mission.mission_id,
             report_text=report_text,
         )
@@ -445,9 +468,41 @@ def _attach_visible_commentary_paths(mission: Any, report: dict) -> None:
     mission_id = str(getattr(mission, "mission_id", "mission_unknown") or "mission_unknown")
     report["visible_commentary_path"] = f".codex-oss/missions/{mission_id}/visible_commentary.jsonl"
     report["summary_path"] = f".codex-oss/missions/{mission_id}/summary.md"
+    report["commentary_delivery_path"] = f".codex-oss/missions/{mission_id}/commentary_delivery.json"
 
 
-def _write_readonly_mission_artifacts(mission: Any, ledger: Any, report: dict, status: str) -> None:
+def _attach_commentary_delivery_summary(mission: Any, report: dict) -> None:
+    mission_id = str(getattr(mission, "mission_id", "mission_unknown") or "mission_unknown")
+    delivery_path = os.path.join(os.getcwd(), ".codex-oss", "missions", mission_id, "commentary_delivery.json")
+    try:
+        with open(delivery_path, encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except Exception:
+        return
+
+    state_counts: dict[str, int] = {}
+    events = payload.get("events") or {}
+    values = events.values() if isinstance(events, dict) else events
+    for event in values:
+        if not isinstance(event, dict):
+            continue
+        for state, value in (event.get("states") or {}).items():
+            if value is True:
+                state_counts[state] = state_counts.get(state, 0) + 1
+
+    delivery_summary = dict(payload.get("delivery_summary") or {})
+    delivery_summary.update(
+        {
+            "consumer_observed": state_counts.get("consumer_observed", 0),
+            "rendered_before_final": state_counts.get("rendered_before_final", 0),
+            "stream_enqueued": state_counts.get("stream_enqueued", 0),
+            "sse_emitted": state_counts.get("sse_emitted", 0),
+        }
+    )
+    report["commentary_delivery_summary"] = delivery_summary
+
+
+def _write_readonly_mission_artifacts(mission: Any, ledger: Any, report: dict, status: str) -> str:
     try:
         from codex_oss.runtime.autonomy import grade_trace
     except Exception:
@@ -517,6 +572,7 @@ def _write_readonly_mission_artifacts(mission: Any, ledger: Any, report: dict, s
     }
     claim_graph = refresh_claim_graph(mission, ledger, report=report, reason="artifact_write", persist=False)
     answer_graph = refresh_answer_graph(mission, ledger, claim_graph=claim_graph, report=report, reason="artifact_write", persist=False)
+    status = _reconcile_readonly_runtime_entitlement(report, status, answer_graph)
     coverage_graph = dict(answer_graph.get("coverage_graph", {}) or getattr(ledger, "coverage_graph", {}) or {})
     evidence_agenda = dict(answer_graph.get("evidence_agenda", {}) or getattr(ledger, "evidence_agenda", {}) or {})
     investigation_plan = build_investigation_plan(mission)
@@ -572,6 +628,73 @@ def _write_readonly_mission_artifacts(mission: Any, ledger: Any, report: dict, s
     visible_trace_path = os.path.join(artifact_dir, "visible_commentary.jsonl")
     if not os.path.exists(visible_trace_path):
         _write_text(os.path.join(artifact_dir, "summary.md"), "\n".join(summary_lines) + "\n")
+    return status
+
+
+def _reconcile_readonly_runtime_entitlement(report: dict, status: str, answer_graph: dict[str, Any]) -> str:
+    """Ensure MissionV1 read-only PARTIAL has runtime-owned insufficiency support.
+
+    If answer-graph coverage says the runtime can complete, a model-authored
+    PARTIAL cannot remain terminal merely because model finalization was weak.
+    Runtime truth owns the final status.
+    """
+    proposed = str(status or report.get("status", "PARTIAL") or "PARTIAL").upper()
+    suff = dict(answer_graph.get("sufficiency", {}) or {})
+    entitlement = dict(suff.get("closure_entitlement", {}) or {})
+    coverage = dict(answer_graph.get("coverage_graph", {}).get("coverage_status", {}) or {})
+    can_complete = bool(
+        entitlement.get("can_return_complete")
+        or suff.get("can_close")
+        or suff.get("can_complete")
+        or suff.get("coverage_complete")
+        or coverage.get("can_complete")
+        or coverage.get("coverage_complete")
+    )
+    reasons = _readonly_insufficiency_reasons(suff)
+    decision = {
+        "schema_version": "runtime_entitlement_reconciliation.v1",
+        "canonical_evidence_can_complete": can_complete,
+        "input_status": proposed,
+        "runtime_insufficiency_reasons": reasons,
+        "decision": "unchanged",
+    }
+    if proposed == "PARTIAL" and can_complete and not reasons:
+        proposed = "COMPLETE"
+        report["status"] = "COMPLETE"
+        decision["decision"] = "promoted_partial_to_complete"
+        decision["reason"] = "answer_graph_can_complete_without_runtime_insufficiency"
+        report.setdefault("caveats", []).append(
+            "Runtime promoted model PARTIAL to COMPLETE because required evidence and answer coverage were complete."
+        )
+    elif proposed == "PARTIAL" and not reasons:
+        decision["decision"] = "partial_supported_by_runtime_unknown_insufficiency"
+        decision["runtime_insufficiency_reasons"] = ["runtime_can_complete_false_without_detailed_reason"]
+    elif proposed == "PARTIAL":
+        decision["decision"] = "partial_supported_by_runtime_insufficiency"
+    decision["effective_status"] = proposed
+    report["runtime_entitlement_reconciliation"] = decision
+    return proposed
+
+
+def _readonly_insufficiency_reasons(sufficiency: dict[str, Any]) -> list[str]:
+    reasons: list[str] = []
+    for key in (
+        "missing_required_sources",
+        "contradicted_obligations",
+        "blocked_obligations",
+        "insufficient_evidence_obligations",
+    ):
+        values = sufficiency.get(key, [])
+        if values:
+            reasons.append(f"{key}:{','.join(str(item) for item in values)}")
+    required_total = int(sufficiency.get("required_obligations", sufficiency.get("required_total", 0)) or 0)
+    answered = int(sufficiency.get("answered_obligations", sufficiency.get("required_answered", 0)) or 0)
+    if required_total and answered < required_total:
+        reasons.append(f"required_obligations_unanswered:{answered}/{required_total}")
+    recommended = str(sufficiency.get("recommended_status", "") or "")
+    if recommended and recommended not in {"COMPLETE", ""}:
+        reasons.append(f"answer_graph_recommended_status:{recommended}")
+    return reasons
 
 
 def _readonly_trace_jsonl(ledger: Any, report: dict) -> str:

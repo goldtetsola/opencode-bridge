@@ -11,6 +11,19 @@ command = "echo"
 args = ["sk-local-codex-bridge"]
 timeout_ms = 1000
 
+[model_providers.desktop_pre_final_text_probe]
+name = "Desktop pre-final text probe"
+base_url = "http://127.0.0.1:43211/v1"
+wire_api = "responses"
+request_max_retries = 0
+stream_max_retries = 0
+stream_idle_timeout_ms = 30000
+
+[model_providers.desktop_pre_final_text_probe.auth]
+command = "echo"
+args = ["sk-local-desktop-render-probe"]
+timeout_ms = 1000
+
 [model_providers.oss_runtime]
 name = "OSS Agent Runtime"
 base_url = "http://127.0.0.1:4000/v1"

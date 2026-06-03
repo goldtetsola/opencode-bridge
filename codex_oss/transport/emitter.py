@@ -64,13 +64,21 @@ class ResponseEmitter:
                 }
             })
 
-    def emit_text_message(self, text: str, status: str = "completed", phase: Optional[str] = None):
+    def emit_text_message(
+        self,
+        text: str,
+        status: str = "completed",
+        phase: Optional[str] = None,
+        metadata: Optional[JSON] = None,
+    ):
         msg_id = _new_id("msg")
         idx = self._next_index()
         message_item = {"type": "message", "id": msg_id, "status": status, "role": "assistant",
                         "content": [{"type": "output_text", "text": text, "annotations": []}]}
         if phase:
             message_item["phase"] = phase
+        if metadata:
+            message_item["metadata"] = metadata
 
         if self.stream:
             if not self._sse_headers_sent:
@@ -78,20 +86,32 @@ class ResponseEmitter:
             item = {"type": "message", "id": msg_id, "status": "in_progress", "role": "assistant", "content": []}
             if phase:
                 item["phase"] = phase
-            self._write_sse("response.output_item.added", {
-                "type": "response.output_item.added", "output_index": idx, "item": item})
-            self._write_sse("response.content_part.added", {
+            if metadata:
+                item["metadata"] = metadata
+            added_payload = {"type": "response.output_item.added", "output_index": idx, "item": item}
+            part_added_payload = {
                 "type": "response.content_part.added", "output_index": idx, "content_index": 0,
-                "part": {"type": "output_text", "text": "", "annotations": []}, "item_id": msg_id})
-            self._write_sse("response.output_text.delta", {
-                "type": "response.output_text.delta", "output_index": idx, "content_index": 0, "delta": text})
-            self._write_sse("response.output_text.done", {
-                "type": "response.output_text.done", "output_index": idx, "content_index": 0, "text": text})
-            self._write_sse("response.content_part.done", {
+                "part": {"type": "output_text", "text": "", "annotations": []}, "item_id": msg_id}
+            delta_payload = {
+                "type": "response.output_text.delta", "output_index": idx, "content_index": 0, "delta": text}
+            text_done_payload = {
+                "type": "response.output_text.done", "output_index": idx, "content_index": 0, "text": text}
+            part_done_payload = {
                 "type": "response.content_part.done", "output_index": idx, "content_index": 0,
-                "part": {"type": "output_text", "text": text, "annotations": []}, "item_id": msg_id})
-            self._write_sse("response.output_item.done", {
-                "type": "response.output_item.done", "output_index": idx, "item": message_item})
+                "part": {"type": "output_text", "text": text, "annotations": []}, "item_id": msg_id}
+            item_done_payload = {"type": "response.output_item.done", "output_index": idx, "item": message_item}
+            if phase:
+                for payload in (added_payload, part_added_payload, delta_payload, text_done_payload, part_done_payload, item_done_payload):
+                    payload["phase"] = phase
+            if metadata:
+                for payload in (added_payload, part_added_payload, delta_payload, text_done_payload, part_done_payload, item_done_payload):
+                    payload["metadata"] = metadata
+            self._write_sse("response.output_item.added", added_payload)
+            self._write_sse("response.content_part.added", part_added_payload)
+            self._write_sse("response.output_text.delta", delta_payload)
+            self._write_sse("response.output_text.done", text_done_payload)
+            self._write_sse("response.content_part.done", part_done_payload)
+            self._write_sse("response.output_item.done", item_done_payload)
         else:
             self._json_response = {
                 "id": self.response_id, "object": "response",
@@ -106,8 +126,8 @@ class ResponseEmitter:
             }
         self._emitted_output.append(message_item)
 
-    def emit_commentary_message(self, text: str):
-        self.emit_text_message(text, phase="commentary")
+    def emit_commentary_message(self, text: str, metadata: Optional[JSON] = None):
+        self.emit_text_message(text, phase="commentary", metadata=metadata)
 
     def emit_error(self, message: str, status_code: int = 400, error_type: str = "invalid_request_error"):
         if self.stream and self._sse_headers_sent:

@@ -613,6 +613,10 @@ def _persist_implementation_runtime_artifacts(
     impl_narrative = report.get("implementation_narrative")
     if isinstance(impl_narrative, dict):
         _write_json(os.path.join(artifact_dir, "implementation_narrative.json"), impl_narrative)
+    adoption_path = os.path.join(artifact_dir, "tool_call_adoption_probes.json")
+    if not os.path.exists(adoption_path):
+        from codex_oss.tool_call_adoption import persist_adoption_probes
+        persist_adoption_probes(artifact_dir, [], None)
     readiness_graph = validation.get("implementation_readiness_graph")
     if isinstance(readiness_graph, dict):
         _write_json(os.path.join(artifact_dir, "implementation_readiness_graph.json"), readiness_graph)
@@ -1083,6 +1087,9 @@ def _repair_patch_intent_build_failure(
         _patch_intent_contract_text()
         + "\n\nThe previous PatchIntentV1 could not be turned into a patch. "
         "Return a corrected PatchIntentV1 JSON object only. Do not explain. "
+        "Path invariant: every edit object must include path, or the PatchIntentV1 object must include "
+        "a top-level path/file_path/target_file that applies to all edits. For create_file, the target "
+        "file path is still required by that exact invariant. "
         "The corrected intent must change file content; do not return old_text equal to new_text, "
         "and do not repeat the same no-op edit.\n\n"
         f"Build error: {error}\n\n"
@@ -1806,6 +1813,8 @@ def _patch_intent_contract_text() -> str:
         "The object must include patch_intent_version='1.0', summary, edits, risk_assessment, "
         "verification_plan, evidence_refs, and caveats. Supported edit operations are "
         "insert_before, insert_after, replace_exact, replace_range, append_to_file, and create_file. "
+        "Every edit object must include path, or the PatchIntentV1 object must include one top-level "
+        "path/file_path/target_file that applies to all edits; create_file has the same path requirement. "
         "For insert_before/insert_after, anchor must match exactly once in the target file. "
         "For replace_exact, old_text must match exactly once. For replace_range, include start_line, "
         "end_line, expected_old_text_sha256 when available, and new_text. "
@@ -3004,6 +3013,100 @@ def _coverage_advisories(coverage_graph: JSON) -> list[str]:
     return advisories
 
 
+SUCCESSFUL_IMPLEMENTATION_STATUSES = {
+    "PASS",
+    "VERIFIED",
+    "APPLIED_IN_ISOLATION",
+    "APPLIED_TO_WORKSPACE",
+    "APPLIED_IN_TEMP_PROJECT",
+}
+
+
+def _explicit_noop_objective(mission: Any) -> bool:
+    spec = getattr(mission, "objective_spec", None)
+    if isinstance(spec, dict):
+        target = spec.get("target") if isinstance(spec.get("target"), dict) else {}
+        if bool(spec.get("explicit_noop")) or bool(target.get("explicit_noop")):
+            return True
+        if str(spec.get("objective_type", "") or "").lower() in {"noop", "no_op", "no-op"}:
+            return True
+    objective = str(getattr(mission, "objective", "") or "").strip().lower()
+    return objective.startswith("no-op:") or objective.startswith("noop:")
+
+
+def build_implementation_witness(
+    *,
+    status: str,
+    mission: Any,
+    changed_files: list[str],
+    canonical_patch: JSON,
+    verification_scope: JSON,
+) -> JSON:
+    """ImplementationWitnessV1: semantic witness for terminal implementation claims."""
+    normalized_status = str(status or "").upper()
+    successful_status = normalized_status in SUCCESSFUL_IMPLEMENTATION_STATUSES
+    reasons: list[str] = []
+    explicit_noop = _explicit_noop_objective(mission)
+    changed = [path for path in changed_files if isinstance(path, str) and path.strip()]
+
+    if successful_status and not changed and not explicit_noop:
+        reasons.append("changed_files_empty_for_successful_implementation")
+
+    outside_owned = [path for path in changed if not _path_allowed(path, mission)]
+    if successful_status and outside_owned:
+        reasons.append("changed_files_outside_owned_paths:" + ",".join(sorted(outside_owned)))
+
+    target_required = _required_target_paths(mission)
+    missing_required = [path for path in target_required if path not in changed]
+    if successful_status and missing_required:
+        reasons.append("required_target_not_changed:" + ",".join(sorted(missing_required)))
+
+    if successful_status and not isinstance(canonical_patch, dict):
+        reasons.append("canonical_patch_evidence_missing")
+    elif successful_status:
+        if canonical_patch.get("schema_version") != "canonical_patch_evidence.v1":
+            reasons.append("canonical_patch_evidence_invalid_schema")
+        if sorted(canonical_patch.get("changed_paths", []) or []) != sorted(changed):
+            reasons.append("canonical_patch_evidence_changed_paths_mismatch")
+
+    if normalized_status in {"PASS", "VERIFIED"}:
+        if str(verification_scope.get("level", "") or "") not in {"targeted"}:
+            reasons.append("verification_scope_not_targeted")
+
+    ok = not reasons
+    return {
+        "schema_version": "implementation_witness.v1",
+        "ok": ok,
+        "status_checked": normalized_status,
+        "explicit_noop": explicit_noop,
+        "changed_files_non_empty": bool(changed) or explicit_noop,
+        "changed_files_within_owned_paths": not outside_owned,
+        "required_targets_changed": not missing_required,
+        "canonical_patch_evidence_present": isinstance(canonical_patch, dict),
+        "canonical_patch_evidence_matches_changed_files": (
+            isinstance(canonical_patch, dict)
+            and sorted(canonical_patch.get("changed_paths", []) or []) == sorted(changed)
+        ),
+        "verification_scope": verification_scope,
+        "status_authority": "runtime",
+        "reasons": reasons,
+    }
+
+
+def _required_target_paths(mission: Any) -> list[str]:
+    spec = getattr(mission, "objective_spec", None)
+    if not isinstance(spec, dict):
+        return []
+    target = spec.get("target") if isinstance(spec.get("target"), dict) else {}
+    paths: list[str] = []
+    for key in ("required_changed_files", "required_source_files", "required_test_files"):
+        paths.extend(_target_list(target, key))
+    test_file = str(target.get("test_file", "") or "").strip()
+    if test_file:
+        paths.append(test_file)
+    return sorted(set(path for path in paths if path))
+
+
 def _implementation_report(
     status: str,
     mission: Any,
@@ -3018,6 +3121,7 @@ def _implementation_report(
     execution_mode: str = "",
 ) -> JSON:
     changed = validation.get("changed_files", [])
+    verification_scope = _verification_scope(validation.get("changed_files", []) or [], verification)
     proposal_source = str(
         proposal.get("proposal_source", "")
         or validation.get("proposal_source", "")
@@ -3046,6 +3150,29 @@ def _implementation_report(
         verification_method="readback_exact_match" if verification else "none",
         rollback_available=bool(patch_path),
     )
+    implementation_witness = build_implementation_witness(
+        status=status,
+        mission=mission,
+        changed_files=list(changed),
+        canonical_patch=canonical_patch,
+        verification_scope=verification_scope,
+    )
+    if status.upper() in SUCCESSFUL_IMPLEMENTATION_STATUSES and not implementation_witness.get("ok"):
+        status = "FAILED"
+        witness_reasons = ", ".join(implementation_witness.get("reasons", []) or [])
+        caveats = list(caveats or []) + [f"Implementation witness failed: {witness_reasons}"]
+        canonical_patch = build_canonical_patch_evidence(
+            mission_id=getattr(mission, "mission_id", ""),
+            owned_paths=list(getattr(mission, "owned_paths", []) or []),
+            changed_paths=list(changed),
+            write_status="not_applied",
+            readback_status="failed",
+            writes_outside_owned_paths=bool(main_workspace_mutated),
+            verification_status="passed" if verification and all(isinstance(v, dict) and v.get("exit_code") == 0 for v in verification) else ("failed" if verification else "skipped"),
+            verification_method="readback_exact_match" if verification else "none",
+            rollback_available=bool(patch_path),
+        )
+        implementation_witness["downgraded_terminal_status_to"] = status
 
     impl_narrative = build_implementation_narrative_draft(
         change_summary=str(model_narrative.get("summary", "") or proposal.get("summary", "") or ""),
@@ -3055,6 +3182,24 @@ def _implementation_report(
     )
     impl_narrative_valid, impl_narrative_errors = validate_implementation_narrative_draft(
         impl_narrative, list(changed)
+    )
+    from codex_oss.final_claim_gate import evaluate_final_claim_gate
+    from codex_oss.route_authority import build_route_authority
+
+    final_claim_gate = evaluate_final_claim_gate(
+        claim_type="implementation",
+        requested_status=status,
+        route_authority=build_route_authority(
+            agent_name="runtime_implementation",
+            model_alias=str(getattr(mission, "runtime_model_alias", "") or "mission-a5"),
+            handoff_obj={"schema_version": "oss_agent_mission.v1"},
+            consumer_kind="direct_bridge_harness",
+        ),
+        mission_id=str(getattr(mission, "mission_id", "") or ""),
+        runtime_admission_id=str(getattr(mission, "runtime_admission_id", "") or ""),
+        implementation_witness=implementation_witness,
+        changed_owned_paths=list(changed),
+        artifact_paths=[path for path in (patch_path, rollback_path) if path],
     )
 
     return {
@@ -3076,7 +3221,9 @@ def _implementation_report(
         "verification_plan_ok": bool(validation.get("checks", {}).get("verification_plan_ok", False)),
         "verification_plan_score": int(validation.get("checks", {}).get("verification_plan_score", 0) or 0),
         "implementation_readiness": readiness,
-        "verification_scope": _verification_scope(validation.get("changed_files", []) or [], verification),
+        "verification_scope": verification_scope,
+        "implementation_witness": implementation_witness,
+        "final_claim_gate": final_claim_gate,
         "changed_files": changed,
         "patch_artifact": patch_path,
         "report_artifact": os.path.join(os.path.dirname(patch_path), "report.json"),

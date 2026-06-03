@@ -56,6 +56,8 @@ from bridge import validate_model_read_narrative
 from bridge import sanitize_model_read_narrative
 from bridge import verification_contract_requested
 from bridge import _default_local_read_executor
+from bridge import _visible_event_stream_identity
+from bridge import _visible_event_stream_text
 from codex_oss.transport.chat_stream import ChatStreamAssembler
 from codex_oss.transport.response_builder import build_response_object_from_chat
 from codex_oss.doctor import DoctorReport, _check_agreements
@@ -68,6 +70,33 @@ def assert_malformed_handoff_fails_closed():
     envelope = parse_task_envelope(handoff)
     assert envelope["schema_error"], envelope
     assert select_mode(envelope) == "invalid_handoff", envelope
+
+
+def assert_visible_commentary_projection_preserves_identity():
+    event = {
+        "schema_version": "visible_commentary_event.v1",
+        "mission_id": "mission_123",
+        "event_id": "evt_abc",
+        "seq": 3,
+        "event_type": "coverage_update",
+        "phase": "NARROW",
+        "source": "coverage",
+        "safe_for_user": True,
+        "title": "Coverage updated",
+        "message": "Required obligations answered: 2/3.",
+    }
+    metadata = _visible_event_stream_identity(event)
+    identity = metadata["oss_visible_event"]
+    assert identity["mission_id"] == "mission_123", identity
+    assert identity["event_id"] == "evt_abc", identity
+    assert identity["seq"] == 3, identity
+    assert identity["event_type"] == "coverage_update", identity
+    assert identity["safe_for_user"] is True, identity
+
+    text = _visible_event_stream_text(event)
+    assert text.startswith("[OSS progress mission=mission_123 event=evt_abc seq=3 type=coverage_update]"), text
+    assert "Coverage updated" in text, text
+    assert "Required obligations answered: 2/3." in text, text
 
 
 def assert_exact_write_requires_exact_content():
@@ -498,7 +527,7 @@ def assert_shell_append_parser_supports_common_native_forms():
     ) == ("tmp/file.txt", "APPEND_OK\n")
 
 
-def assert_pending_owned_verification_can_complete_server_side():
+def assert_pending_owned_verification_without_mutation_cannot_pass():
     rel = "tmp/protocol-owned-verify-recovery.txt"
     target = Path(ROOT, rel)
     target.parent.mkdir(exist_ok=True)
@@ -548,10 +577,11 @@ def assert_pending_owned_verification_can_complete_server_side():
             handoff_text=handoff,
             project_root=ROOT,
         )
-        assert report.startswith("PASS"), report
+        assert not report.startswith("PASS"), report
         assert "Verification status: observed" in report, report
         assert "OWNED_VERIFY_OK" in report, report
-        assert f"Changed owned paths: {rel}" in report, report
+        assert "Changed owned paths: none" in report, report
+        assert "read-only verification cannot certify owned-path mutation" in report, report
     finally:
         try:
             target.unlink()
@@ -624,6 +654,71 @@ def assert_pending_owned_verification_can_complete_declared_marker_write():
             pass
 
 
+def assert_read_only_verification_cannot_certify_owned_mutation():
+    rel_owned = "tmp/protocol-owned-missing-mutation.txt"
+    rel_read_only = "tmp/protocol-readonly-marker.txt"
+    owned = Path(ROOT, rel_owned)
+    readonly = Path(ROOT, rel_read_only)
+    owned.parent.mkdir(exist_ok=True)
+    try:
+        owned.write_text("owned unchanged\n", encoding="utf-8")
+        readonly.write_text("READONLY_MARKER_OK\n", encoding="utf-8")
+        handoff = (
+            "OSS_HANDOFF_JSON:\n"
+            + json.dumps({
+                "schema_version": 1,
+                "role": "Bounded implementation smoke worker",
+                "goal": f"Change {rel_owned}, then verify READONLY_MARKER_OK in {rel_read_only}.",
+                "task_type": "bounded_write",
+                "owned_paths": [rel_owned],
+                "read_only_paths": [rel_read_only],
+                "forbidden_actions": ["Do not edit any other file"],
+                "verification_steps": [f"Search {rel_read_only} for READONLY_MARKER_OK"],
+                "deliverable_fields": ["files changed", "verification", "confidence", "caveats"],
+                "completion_rule": "stop after verification",
+                "escalation_rule": "stop on scope drift",
+                "write_allowed": True,
+            })
+        )
+        child = StoredResponse(
+            response_id="resp_readonly_verify_child",
+            model_alias="ocg-deepseek-v4-pro",
+            model_upstream="deepseek-v4-pro",
+            messages=[
+                {"role": "user", "content": handoff},
+                {"role": "assistant", "content": "", "tool_calls": [{
+                    "id": "call_readonly_verify",
+                    "type": "function",
+                    "function": {
+                        "name": "exec_command",
+                        "arguments": json.dumps({"cmd": f'rg "READONLY_MARKER_OK" "{rel_read_only}"'}),
+                    },
+                }]},
+            ],
+            pending_call_ids=["call_readonly_verify"],
+            created_at=1,
+            tool_exchange_count=1,
+            task_max_exchanges=6,
+            previous_response_id="resp_parent",
+            pending_replay_count=3,
+        )
+        report = execute_pending_owned_verification_from_bridge(
+            parent_response_id="resp_parent",
+            child_state=child,
+            handoff_text=handoff,
+            project_root=ROOT,
+        )
+        assert not report.startswith("PASS"), report
+        assert "Changed owned paths: none" in report, report
+        assert "read-only verification cannot certify owned-path mutation" in report, report
+    finally:
+        for path in (owned, readonly):
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+
+
 def assert_pending_owned_generic_shell_can_complete_multi_file_write_server_side():
     with tempfile.TemporaryDirectory(dir=ROOT) as tmp:
         rel_a = os.path.relpath(os.path.join(tmp, "owned-a.txt"), ROOT)
@@ -685,6 +780,54 @@ def assert_pending_owned_generic_shell_can_complete_multi_file_write_server_side
         assert f"Changed owned paths: {rel_a}, {rel_b}" in report, report
         assert "GENERIC_MULTI_OK a" in Path(ROOT, rel_a).read_text(encoding="utf-8")
         assert "GENERIC_MULTI_OK b" in Path(ROOT, rel_b).read_text(encoding="utf-8")
+
+
+def assert_streaming_tool_calls_initialize_adoption_state():
+    stored = []
+    events = []
+
+    def new_id(prefix):
+        counters[prefix] = counters.get(prefix, 0) + 1
+        return f"{prefix}{counters[prefix]}"
+
+    counters = {}
+    assembler = ChatStreamAssembler(
+        body={"previous_response_id": "resp_parent"},
+        base_messages=[{"role": "user", "content": "run tool"}],
+        model_alias="oss_kimi_rapid",
+        model_upstream="kimi",
+        reverse_name_map={},
+        response_id="resp_stream_adoption",
+        created_at=1,
+        write_sse=lambda event, payload: events.append((event, payload)),
+        write_progress=lambda note: None,
+        state_put=lambda state: stored.append(state),
+        stored_response_factory=StoredResponse,
+        build_response_shell=lambda body, model_alias, response_id, created_at, status, output: {
+            "id": response_id,
+            "created_at": created_at,
+            "status": status,
+            "model": model_alias,
+            "output": output,
+        },
+        repair_chat_history=lambda messages, _: messages,
+        extract_budget=lambda messages: 4,
+        restore_tool_name=lambda name, reverse: name,
+        new_id=new_id,
+        json_dumps=json.dumps,
+        as_text=str,
+    )
+    assembler.on_tool_call_delta({
+        "index": 0,
+        "id": "call_stream_adopt",
+        "function": {"name": "exec_command", "arguments": json.dumps({"cmd": "echo ok"})},
+    })
+    assembler.finalize()
+    assert stored, "stream finalization must persist response state"
+    payload = json.loads(stored[-1].adoption_probes_json)
+    assert "call_stream_adopt" in payload["calls"], payload
+    assert payload["calls"]["call_stream_adopt"]["completed"] is False, payload
+    assert payload["calls"]["call_stream_adopt"]["adopted"] is False, payload
 
 
 def assert_pending_owned_generic_shell_rejects_outside_workdir():
@@ -2163,6 +2306,7 @@ def assert_doctor_rejects_embedded_mission_examples_in_agreements():
 
 def main():
     assert_malformed_handoff_fails_closed()
+    assert_visible_commentary_projection_preserves_identity()
     assert_exact_write_requires_exact_content()
     assert_bounded_write_handoffs_receive_tools_by_default()
     assert_installed_oss_agent_names_map_to_provider_models()
@@ -2175,9 +2319,11 @@ def main():
     assert_pending_owned_append_can_complete_server_side()
     assert_pending_owned_append_recovery_is_idempotent_for_ignored_paths()
     assert_shell_append_parser_supports_common_native_forms()
-    assert_pending_owned_verification_can_complete_server_side()
+    assert_pending_owned_verification_without_mutation_cannot_pass()
     assert_pending_owned_verification_can_complete_declared_marker_write()
+    assert_read_only_verification_cannot_certify_owned_mutation()
     assert_pending_owned_generic_shell_can_complete_multi_file_write_server_side()
+    assert_streaming_tool_calls_initialize_adoption_state()
     assert_pending_owned_generic_shell_rejects_outside_workdir()
     assert_incomplete_evidence_blocks_confident_pass()
     assert_patch_acceptance_requires_scope_change_and_verification()

@@ -26,6 +26,7 @@ def empty_task_envelope() -> dict:
         "exact_content": "", "no_tools_required": False,
         "proof_critical": False, "schema_error": "",
         "completion_rule": "", "escalation_rule": "",
+        "mission_id": "",
     }
 
 
@@ -81,6 +82,7 @@ def structured_handoff_to_envelope(handoff_text: str) -> Optional[dict]:
             errors.append(f"{field} must be a string")
 
     envelope["role"] = str(obj.get("role", "")).strip()
+    envelope["mission_id"] = str(obj.get("mission_id", "")).strip()
     envelope["goal"] = str(obj.get("goal", "")).strip()
     envelope["task_type"] = str(obj.get("task_type", "")).strip()
     envelope["owned_paths"] = validate_string_list(obj, "owned_paths", errors)

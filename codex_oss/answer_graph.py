@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 from typing import Any
+
+from codex_oss.evidence_shapes import detect_registered_shapes
 
 
 def build_investigation_plan(mission: Any) -> dict[str, Any]:
@@ -44,7 +47,8 @@ def refresh_answer_graph(
     plan = build_investigation_plan(mission)
     claims = list((claim_graph or getattr(ledger, "claim_graph", {}) or {}).get("claims", []) or getattr(ledger, "claims", []) or [])
     command_refs = _command_refs(ledger)
-    inspected_paths = set((getattr(ledger, "files_inspected", {}) or {}).keys())
+    file_entries = getattr(ledger, "files_inspected", {}) or {}
+    inspected_paths = set(file_entries.keys())
     obligation_views = []
     agenda_items = []
     declared_requirement_paths: set[str] = set()
@@ -53,15 +57,11 @@ def refresh_answer_graph(
         obligation = _normalize_obligation(raw)
         requirement_views = []
         for requirement in list(obligation.get("source_requirements", []) or []):
-            requirement_views.append(_source_requirement_view(requirement, inspected_paths, command_refs))
+            requirement_views.append(_source_requirement_view(requirement, inspected_paths, command_refs, file_entries))
             declared_requirement_paths.add(str(requirement.get("path", "") or ""))
         evidence_refs = _obligation_evidence_refs(obligation, claims, ledger, command_refs, requirement_views)
         linked_claims = _obligation_claim_ids(obligation, claims, requirement_views)
-        missing_evidence = [
-            f"inspect:{item['path']}"
-            for item in requirement_views
-            if bool(item.get("required", True)) and item.get("status") != "satisfied"
-        ]
+        missing_evidence = _missing_evidence_for_requirements(requirement_views)
         status = _obligation_status(obligation, linked_claims, evidence_refs, missing_evidence, requirement_views, ledger)
         confidence = _obligation_confidence(status, evidence_refs)
         obligation_view = {
@@ -86,18 +86,23 @@ def refresh_answer_graph(
             "obligation_id": "global_must_inspect",
             "priority": "high",
             "status": "done" if path in inspected_paths else "pending",
+            "source_state": "read_satisfied" if path in inspected_paths else "missing",
             "reason": "Mission declared this path as must_inspect.",
             "prefetch": True,
         })
 
     agenda_items = _dedupe_agenda(agenda_items)
     coverage_status = _coverage_status(obligation_views, agenda_items)
+    source_states = _source_states_from_obligations(obligation_views)
+    source_state_hash = _source_state_hash(source_states)
     coverage_graph = {
         "coverage_graph_version": "1.0",
         "mission_id": str(getattr(mission, "mission_id", "") or ""),
         "nodes": obligation_views,
         "next_required_actions": _next_required_actions(agenda_items),
         "coverage_status": coverage_status,
+        "source_states": source_states,
+        "source_state_hash": source_state_hash,
     }
     evidence_agenda = {
         "agenda_version": "1.0",
@@ -122,6 +127,8 @@ def refresh_answer_graph(
         "coverage_graph": coverage_graph,
         "evidence_agenda": evidence_agenda,
         "sufficiency": sufficiency,
+        "source_states": source_states,
+        "source_state_hash": source_state_hash,
         "investigation_state": {
             "phase": _phase_from_obligations(obligation_views, agenda_items, ledger, sufficiency),
             "enough_evidence_to_report": bool(sufficiency.get("can_close")),
@@ -246,7 +253,9 @@ def evaluate_answer_sufficiency(
     pending_required_sources = [
         str(item.get("path", "") or "")
         for item in agenda_items
-        if item.get("kind") == "required_read" and item.get("status") != "done"
+        if item.get("kind") == "required_read"
+        and item.get("status") == "pending"
+        and str(item.get("source_state", "") or "") == "missing"
     ]
     partial_extracts = any(
         not bool(getattr(entry, "complete", False))
@@ -395,12 +404,15 @@ def build_runtime_report_from_answer_graph(
         "contradicted_obligations": contradicted,
         "blocked_obligations": blocked,
         "insufficient_evidence_obligations": insufficient,
+        "source_states": list(answer_graph.get("source_states", []) or []),
+        "source_state_hash": str(answer_graph.get("source_state_hash", "") or ""),
         "next_required_actions": list(sufficiency.get("next_required_actions", []) or []),
         "caveats": list(dict.fromkeys(caveats)),
         "escalation_recommendation": "GPT-5.5 review required",
         "missing_fields": list(dict.fromkeys(
             list(sufficiency.get("open_high_priority_questions", []) or [])
             + [f"inspect:{path}" for path in missing_sources]
+            + _typed_insufficiency_fields(answer_graph)
         )),
         "report_source": report_source,
         "closure_source": report_source,
@@ -410,6 +422,7 @@ def build_runtime_report_from_answer_graph(
             "can_close": sufficiency.get("can_close", False),
             "reason": sufficiency.get("reason", ""),
             "partial_evidence_entitlement": sufficiency.get("partial_evidence_entitlement"),
+            "source_state_hash": str(answer_graph.get("source_state_hash", "") or ""),
         },
     }
     return report
@@ -470,6 +483,7 @@ def _normalize_obligation(raw: dict[str, Any]) -> dict[str, Any]:
                 "pattern": str(item.get("pattern", "") or ""),
                 "command_requirement": dict(item.get("command_requirement", {}) or {}),
                 "required_shapes": [str(shape) for shape in (item.get("required_shapes", []) or []) if str(shape)],
+                "shape_patterns": dict(item.get("shape_patterns", {}) or {}) if isinstance(item.get("shape_patterns"), dict) else {},
                 "contradiction_markers": [str(marker) for marker in (item.get("contradiction_markers", []) or []) if str(marker)],
                 "completeness_policy": str(item.get("completeness_policy", "") or "") or "shape_sufficient",
                 "shape_match_policy": str(item.get("shape_match_policy", "") or "") or "all",
@@ -507,7 +521,7 @@ def _fallback_obligations(mission: Any) -> list[dict[str, Any]]:
     ]
 
 
-def _source_requirement_view(requirement: dict[str, Any], inspected_paths: set[str], command_refs: list[dict[str, Any]]) -> dict[str, Any]:
+def _source_requirement_view(requirement: dict[str, Any], inspected_paths: set[str], command_refs: list[dict[str, Any]], file_entries: dict[str, Any] | None = None) -> dict[str, Any]:
     path = str(requirement.get("path", "") or "")
     evidence_plane = _evidence_plane(requirement)
     command_requirement = dict(requirement.get("command_requirement", {}) or {})
@@ -525,10 +539,18 @@ def _source_requirement_view(requirement: dict[str, Any], inspected_paths: set[s
                 evidence_refs.append(str(item.get("ref")))
             else:
                 failed_reads.append(str(item.get("ref")))
-    if successful_read and path in inspected_paths:
+    file_entry = (file_entries or {}).get(path)
+    file_read_success = bool(
+        file_entry is not None
+        and getattr(file_entry, "complete", False)
+        and os.path.exists(path)
+        and (getattr(file_entry, "cached_text", "") or getattr(file_entry, "sha256", ""))
+    )
+    if file_read_success:
+        successful_read = True
         evidence_refs.append(f"file:{path}#extract:1")
     required_shapes = [str(shape) for shape in (requirement.get("required_shapes", []) or []) if str(shape)]
-    detected_shapes = _detected_shapes_for_path(path) if evidence_plane != "command_result" else _detected_command_shapes(path, command_refs)
+    detected_shapes = _detected_shapes_for_path(path, requirement) if evidence_plane != "command_result" else _detected_command_shapes(path, command_refs)
     shape_match_policy = str(requirement.get("shape_match_policy", "") or "") or "all"
     contradiction_markers = [str(marker) for marker in (requirement.get("contradiction_markers", []) or []) if str(marker)]
     matched_contradictions = _matched_contradiction_markers(path, contradiction_markers)
@@ -540,14 +562,19 @@ def _source_requirement_view(requirement: dict[str, Any], inspected_paths: set[s
     )
     if matched_contradictions:
         status = "contradicted"
+        source_state = "contradicted"
     elif failed_reads and not evidence_refs:
         status = "blocked_source"
+        source_state = "blocked"
     elif not evidence_refs:
         status = "missing"
+        source_state = "missing"
     elif not shape_satisfied:
         status = "insufficient_evidence"
+        source_state = "read_insufficient_shape"
     else:
         status = "satisfied"
+        source_state = "read_satisfied"
     completeness_policy = str(requirement.get("completeness_policy", "") or "") or "shape_sufficient"
     return {
         "path": path,
@@ -558,6 +585,7 @@ def _source_requirement_view(requirement: dict[str, Any], inspected_paths: set[s
         "required": bool(requirement.get("required", True)),
         "prefetch": bool(requirement.get("prefetch", True)),
         "required_shapes": required_shapes,
+        "shape_patterns": dict(requirement.get("shape_patterns", {}) or {}) if isinstance(requirement.get("shape_patterns"), dict) else {},
         "detected_shapes": detected_shapes,
         "missing_shapes": missing_shapes,
         "shape_match_policy": shape_match_policy,
@@ -566,6 +594,19 @@ def _source_requirement_view(requirement: dict[str, Any], inspected_paths: set[s
         "matched_contradictions": matched_contradictions,
         "completeness_policy": completeness_policy,
         "status": status,
+        "source_state": source_state,
+        "source_state_v1": {
+            "schema_version": "source_state.v1",
+            "path": path,
+            "state": source_state,
+            "status": status,
+            "evidence_refs": list(dict.fromkeys(evidence_refs + failed_reads)),
+            "required_shapes": required_shapes,
+            "detected_shapes": detected_shapes,
+            "missing_shapes": missing_shapes,
+            "blocked_refs": failed_reads if source_state == "blocked" else [],
+            "contradiction_markers": matched_contradictions,
+        },
         "evidence_refs": list(dict.fromkeys(evidence_refs + failed_reads)),
     }
 
@@ -696,6 +737,8 @@ def _agenda_items_for_obligation(obligation: dict[str, Any]) -> list[dict[str, A
         plane = _evidence_plane(requirement)
         kind, tool_name = _agenda_kind_for_requirement(requirement, plane)
         pattern = _command_pattern_for_requirement(requirement, obligation)
+        source_state = str(requirement.get("source_state", "") or "missing")
+        item_status = "pending" if source_state == "missing" else "done"
         items.append({
             "id": f"agenda_{obligation.get('id', 'q')}_{_slug(path)}",
             "kind": kind,
@@ -704,7 +747,9 @@ def _agenda_items_for_obligation(obligation: dict[str, Any]) -> list[dict[str, A
             "pattern": pattern,
             "obligation_id": str(obligation.get("id", "") or ""),
             "priority": "high",
-            "status": "done" if requirement.get("status") == "satisfied" else "pending",
+            "status": item_status,
+            "source_state": source_state,
+            "insufficiency_reasons": list(requirement.get("missing_shapes", []) or []) if source_state == "read_insufficient_shape" else [],
             "reason": f"Required source for obligation {obligation.get('id', '')}.",
             "prefetch": bool(requirement.get("prefetch", True)),
             "required_shapes": list(requirement.get("required_shapes", []) or []),
@@ -731,6 +776,54 @@ def _command_pattern_for_requirement(requirement: dict[str, Any], obligation: di
         if match:
             return match.group(1)
     return ""
+
+
+def _missing_evidence_for_requirements(requirement_views: list[dict[str, Any]]) -> list[str]:
+    missing: list[str] = []
+    for item in requirement_views:
+        if not bool(item.get("required", True)):
+            continue
+        state = str(item.get("source_state", "") or "missing")
+        path = str(item.get("path", "") or "")
+        if state == "missing":
+            missing.append(f"inspect:{path}")
+        elif state == "read_insufficient_shape":
+            shapes = ",".join(str(shape) for shape in (item.get("missing_shapes", []) or [])) or "unknown_shape"
+            missing.append(f"insufficient_shape:{path}:{shapes}")
+        elif state == "blocked":
+            missing.append(f"blocked_source:{path}")
+        elif state == "contradicted":
+            missing.append(f"contradicted_source:{path}")
+    return missing
+
+
+def _source_states_from_obligations(obligations: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    states: list[dict[str, Any]] = []
+    for obligation in obligations:
+        obligation_id = str(obligation.get("id", "") or "")
+        for requirement in list(obligation.get("source_requirements", []) or []):
+            state = dict(requirement.get("source_state_v1", {}) or {})
+            if not state:
+                continue
+            state["obligation_id"] = obligation_id
+            states.append(state)
+    return states
+
+
+def _source_state_hash(source_states: list[dict[str, Any]]) -> str:
+    payload = json.dumps(source_states, sort_keys=True, separators=(",", ":"))
+    return "sha256:" + hashlib.sha256(payload.encode()).hexdigest()
+
+
+def _typed_insufficiency_fields(answer_graph: dict[str, Any]) -> list[str]:
+    fields: list[str] = []
+    for state in list(answer_graph.get("source_states", []) or []):
+        if str(state.get("state", "") or "") != "read_insufficient_shape":
+            continue
+        path = str(state.get("path", "") or "")
+        shapes = ",".join(str(shape) for shape in (state.get("missing_shapes", []) or [])) or "unknown_shape"
+        fields.append(f"insufficient_shape:{path}:{shapes}")
+    return fields
 
 
 def _agenda_kind_for_requirement(requirement: dict[str, Any], plane: str) -> tuple[str, str]:
@@ -763,7 +856,9 @@ def _coverage_status(obligations: list[dict[str, Any]], agenda_items: list[dict[
     missing_sources = [
         str(item.get("path", "") or "")
         for item in agenda_items
-        if str(item.get("kind", "") or "").startswith("required_") and item.get("status") != "done"
+        if str(item.get("kind", "") or "").startswith("required_")
+        and item.get("status") == "pending"
+        and str(item.get("source_state", "") or "") == "missing"
     ]
     coverage_complete = len(answered) == len(required) and not missing_sources and not contradicted and not blocked and not insufficient
     if contradicted or blocked:
@@ -916,7 +1011,7 @@ def _command_refs(ledger: Any) -> list[dict[str, Any]]:
     return refs
 
 
-def _detected_shapes_for_path(path: str) -> list[str]:
+def _detected_shapes_for_path(path: str, requirement: dict[str, Any] | None = None) -> list[str]:
     if not path:
         return []
     try:
@@ -924,7 +1019,14 @@ def _detected_shapes_for_path(path: str) -> list[str]:
             text = handle.read()
     except OSError:
         return []
-    return _detect_shapes(text)
+    shapes = _detect_shapes(text)
+    for shape, pattern in (dict((requirement or {}).get("shape_patterns", {}) or {}) if isinstance((requirement or {}).get("shape_patterns"), dict) else {}).items():
+        try:
+            if re.search(str(pattern), text, re.MULTILINE):
+                shapes.append(str(shape))
+        except re.error:
+            continue
+    return list(dict.fromkeys(shapes))
 
 
 def _matched_contradiction_markers(path: str, markers: list[str]) -> list[str]:
@@ -939,26 +1041,7 @@ def _matched_contradiction_markers(path: str, markers: list[str]) -> list[str]:
 
 
 def _detect_shapes(text: str) -> list[str]:
-    content = str(text or "")
-    lowered = content.lower()
-    shapes: list[str] = []
-    patterns = {
-        "function_definition": r"^\s*def\s+[A-Za-z_][A-Za-z0-9_]*\s*\(",
-        "class_definition": r"^\s*class\s+[A-Za-z_][A-Za-z0-9_]*\s*[\(:]",
-        "mapping_assignment": r"[A-Za-z_][A-Za-z0-9_]*\s*=\s*\{",
-        "config_value": r"[\"'][A-Za-z0-9_.-]+[\"']\s*:\s*[^,\n]+",
-        "flag_parameter": r"\b(flag|allow|require)_[A-Za-z0-9_]+\b",
-        "flag_read": r"\.(get|pop)\(\s*[\"'](?:flag|allow|require)_[A-Za-z0-9_]+[\"']",
-        "behavior_derivation": r"\b(derive|derived|observed behavior|behavior provenance)\b",
-        "zero_match": r"\b0 matches\b",
-        "test_assertion": r"\bassert\b|\bself\.assert",
-        "verification_command": r"\b(pytest|unittest|verify|verification)\b",
-    }
-    for shape, pattern in patterns.items():
-        flags = re.MULTILINE if shape in {"function_definition", "class_definition"} else 0
-        if re.search(pattern, content if flags else lowered, flags):
-            shapes.append(shape)
-    return shapes
+    return detect_registered_shapes(text)
 
 
 def _default_source_requirements(paths: list[str], evidence_kind: str) -> list[dict[str, Any]]:

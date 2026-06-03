@@ -9,6 +9,8 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Any
 
+from codex_oss.evidence_shapes import custom_shape_patterns, shape_is_registered_or_custom
+
 JSON = Dict[str, Any]
 
 
@@ -135,7 +137,7 @@ class MissionV1:
 
 def parse_mission_v1(handoff_text: str) -> MissionV1:
     """Parse a MissionV1 from OSS_HANDOFF_JSON block or structured JSON."""
-    block = _extract_handoff_json_block(handoff_text)
+    block = extract_mission_v1_block(handoff_text)
     if not block:
         raise InvalidHandoffError("No OSS_HANDOFF_JSON block found")
 
@@ -147,10 +149,28 @@ def parse_mission_v1(handoff_text: str) -> MissionV1:
     return _build_mission(raw)
 
 
-def _extract_handoff_json_block(text: str) -> Optional[str]:
-    """Extract exactly one OSS_HANDOFF_JSON block from text."""
+def extract_mission_v1_block(text: str) -> Optional[str]:
+    """Extract exactly one active MissionV1 handoff block from text.
+
+    The public handoff template uses ``OSS_HANDOFF_JSON: { ... }`` while older
+    runtime tests and harnesses use ``<OSS_HANDOFF_JSON>...</OSS_HANDOFF_JSON>``.
+    Both forms are accepted. Non-MissionV1 examples are ignored so repo
+    instructions can mention handoff templates without shadowing the active
+    mission. Multiple valid MissionV1 blocks still fail closed.
+    """
     import re
     blocks = re.findall(r"<OSS_HANDOFF_JSON>(.*?)</OSS_HANDOFF_JSON>", text, re.DOTALL)
+    for match in re.finditer(r"(?<!<)OSS_HANDOFF_JSON\s*:", text):
+        tail = text[match.end():].lstrip()
+        if tail.startswith("```"):
+            lines = tail.splitlines()
+            if lines:
+                tail = "\n".join(lines[1:])
+        try:
+            _, end = json.JSONDecoder().raw_decode(tail)
+        except json.JSONDecodeError:
+            continue
+        blocks.append(tail[:end])
     if not blocks:
         return None
 
@@ -173,6 +193,11 @@ def _extract_handoff_json_block(text: str) -> Optional[str]:
         raise InvalidHandoffError("No valid MissionV1 OSS_HANDOFF_JSON block found among multiple candidates")
 
     return blocks[0].strip()
+
+
+def _extract_handoff_json_block(text: str) -> Optional[str]:
+    """Backward-compatible alias for older callers/tests."""
+    return extract_mission_v1_block(text)
 
 
 def _build_mission(raw: dict) -> MissionV1:
@@ -406,6 +431,13 @@ def _validate_objective_spec(raw: Any) -> Optional[dict]:
     for field_name in ("required_outputs", "required_evidence_shapes", "completion_criteria"):
         if field_name in raw and not isinstance(raw.get(field_name), list):
             raise InvalidHandoffError(f"objective_spec.{field_name} must be a list")
+    shape_patterns = custom_shape_patterns(raw.get("shape_patterns"))
+    for shape in [str(item) for item in (raw.get("required_evidence_shapes", []) or []) if str(item)]:
+        if not shape_is_registered_or_custom(shape, shape_patterns):
+            raise InvalidHandoffError(
+                f"objective_spec.required_evidence_shapes contains unknown shape {shape!r}; "
+                "register it or provide objective_spec.shape_patterns[shape]"
+            )
     if "confidence_policy" in raw and not isinstance(raw.get("confidence_policy"), dict):
         raise InvalidHandoffError("objective_spec.confidence_policy must be an object")
     return dict(raw)
@@ -562,12 +594,21 @@ def _validate_source_requirements(raw: Any, *, field_name: str) -> List[dict]:
         evidence_kind = str(item.get("evidence_kind", "source_read") or "source_read").strip()
         if not evidence_kind:
             raise InvalidHandoffError(f"{field_name}[{idx}].evidence_kind must not be empty")
+        required_shapes = [str(shape) for shape in (item.get("required_shapes", []) or []) if str(shape)]
+        shape_patterns = custom_shape_patterns(item.get("shape_patterns"))
+        for shape in required_shapes:
+            if not shape_is_registered_or_custom(shape, shape_patterns):
+                raise InvalidHandoffError(
+                    f"{field_name}[{idx}].required_shapes contains unknown shape {shape!r}; "
+                    "register it or provide shape_patterns[shape]"
+                )
         requirements.append({
             "path": path,
             "evidence_kind": evidence_kind,
             "required": bool(item.get("required", True)),
             "prefetch": bool(item.get("prefetch", True)),
-            "required_shapes": [str(shape) for shape in (item.get("required_shapes", []) or []) if str(shape)],
+            "required_shapes": required_shapes,
+            "shape_patterns": shape_patterns,
             "contradiction_markers": [str(marker) for marker in (item.get("contradiction_markers", []) or []) if str(marker)],
             "completeness_policy": _validate_completeness_policy(item.get("completeness_policy"), evidence_kind),
             "shape_match_policy": _validate_shape_match_policy(item.get("shape_match_policy"), item.get("required_shapes")),

@@ -13,6 +13,8 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
+from codex_oss.native_experience import CommentaryDeliveryTracker
+
 JSON = dict[str, Any]
 
 SECRET_PATTERNS: list[tuple[str, str]] = [
@@ -254,6 +256,7 @@ class VisibleCommentarySink:
         self._events: list[JSON] = []
         self._compacted = False
         self._compacted_count = 0
+        self._delivery = CommentaryDeliveryTracker(mission_id)
         os.makedirs(self.mission_dir, exist_ok=True)
 
     @property
@@ -324,8 +327,10 @@ class VisibleCommentarySink:
         )
 
         self._seq += 1
+        event_id = f"evt_{self._seq:04d}"
         event: JSON = {
             "schema_version": "visible_commentary_event.v1",
+            "event_id": event_id,
             "mission_id": self.mission_id,
             "seq": self._seq,
             "timestamp": str(int(time.time())),
@@ -344,13 +349,26 @@ class VisibleCommentarySink:
             "redactions_applied": redacted,
             "metadata": safe_metadata,
         }
+        self._delivery.create_event(
+            event_type,
+            safe_message,
+            event_id=event_id,
+            phase=safe_phase,
+        )
+        self._delivery.mark_sanitized(event_id)
         self._events.append(event)
         self._write_event(event)
         if stream and self._stream:
+            self._delivery.mark_stream_enqueued(event_id)
             try:
                 self._stream(event)
-            except Exception:
-                pass
+                self._delivery.mark_sse_emitted(event_id)
+            except Exception as exc:
+                self._delivery.mark_failed(event_id, str(exc)[:240])
+        elif stream and self._stream is None:
+            # No stream consumer was attached. The event is still artifact-visible,
+            # but not proven as SSE-emitted/rendered user experience.
+            pass
         return event
 
     def _write_event(self, event: JSON):
@@ -360,6 +378,11 @@ class VisibleCommentarySink:
     def close(self, final_report: JSON | None = None):
         self._ensure_terminal_lifecycle_event(final_report)
         self._render_summary_md(final_report)
+        for event in self._events:
+            event_id = str(event.get("event_id", "") or "")
+            if event_id:
+                self._delivery.mark_reconciled(event_id)
+        self._delivery.persist(str(self.mission_dir))
 
     def _ensure_terminal_lifecycle_event(self, final_report: JSON | None = None):
         if self.mode == "off":

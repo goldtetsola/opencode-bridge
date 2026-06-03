@@ -215,6 +215,19 @@ def run_loop(mission: Any, ledger: Any, call_model_fn, tools, emitter,
         source_module="codex_oss/runtime/policy.py",
         input_payload={"tier": getattr(mission, "tier", ""), "apply_mode": getattr(mission, "apply_mode", "")},
     )
+    if commentary is not None:
+        commentary.emit(
+            "mission_started",
+            "Mission accepted",
+            "I'm loading the compiled MissionV1 contract and running the runtime preflight checks.",
+            phase="PLAN",
+            source="runtime",
+            model=str(getattr(mission, "runtime_model_alias", "") or ""),
+            metadata={
+                "tier": str(getattr(mission, "tier", "") or ""),
+                "risk_tier": str(getattr(mission, "risk_tier", "") or ""),
+            },
+        )
 
     try:
         # Risk tier check
@@ -229,6 +242,16 @@ def run_loop(mission: Any, ledger: Any, call_model_fn, tools, emitter,
                 source_module="codex_oss/runtime/policy.py",
                 input_payload={"risk_tier": mission.risk_tier, "tier": mission.tier},
             )
+            if commentary is not None:
+                commentary.emit(
+                    "preflight_checked",
+                    "Runtime preflight blocked autonomy",
+                    f"The mission stopped before tool work because the risk policy rejected it: {risk_reason}.",
+                    phase="PLAN",
+                    source="preflight",
+                    severity="warning",
+                    runtime_decision="risk_tier_rejected",
+                )
             return {"status": "ESCALATE", "reason": risk_reason,
                     "report": _partial_dict(mission, ledger, risk_reason)}
 
@@ -244,6 +267,16 @@ def run_loop(mission: Any, ledger: Any, call_model_fn, tools, emitter,
                 source_module="codex_oss/runtime/policy.py",
                 input_payload={"allowed_roots": list(getattr(mission, "allowed_roots", []) or [])},
             )
+            if commentary is not None:
+                commentary.emit(
+                    "preflight_checked",
+                    "Runtime preflight blocked scope",
+                    f"The mission stopped before tool work because the scope policy rejected it: {scope_error}.",
+                    phase="PLAN",
+                    source="preflight",
+                    severity="warning",
+                    runtime_decision="scope_validation_rejected",
+                )
             return {"status": "ESCALATE", "reason": scope_error,
                     "report": _partial_dict(mission, ledger, scope_error)}
         append_decision(
@@ -274,8 +307,8 @@ def run_loop(mission: Any, ledger: Any, call_model_fn, tools, emitter,
             required_count = len(list((initial_answer_graph.get("evidence_agenda", {}) or {}).get("items", []) or []))
             style = str(getattr(mission, "objective_style", "") or "")
             commentary.emit(
-                "mission_started", "Mission accepted",
-                f"I'm loading the compiled MissionV1 contract{f' ({required_count} required source(s))' if required_count else ''}.",
+                "agenda_created", "Evidence agenda created",
+                f"The runtime found {required_count} required source(s) to inspect before final closure.",
                 phase="PLAN", source="runtime", model=str(getattr(mission, "runtime_model_alias", "") or ""),
                 metadata={"mode": mode, "objective_style": style, "required_sources": required_count},
             )

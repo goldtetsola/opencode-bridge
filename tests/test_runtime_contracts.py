@@ -18,7 +18,7 @@ sys.path.insert(0, ROOT)
 from codex_oss.ledger import EvidenceLedger
 from codex_oss.health import build_health_status
 from codex_oss.audit import audit_mission
-from codex_oss.managed_bridge import run_managed_mission_from_body, should_handle_managed_mission_body
+from codex_oss.managed_bridge import extract_handoff_from_body, run_managed_mission_from_body, should_handle_managed_mission_body
 from codex_oss.mission import InvalidHandoffError, _build_mission, parse_mission_v1
 from codex_oss.runtime import ToolResult, resolve_path
 from codex_oss.runtime.loop import (
@@ -33,7 +33,7 @@ from codex_oss.runtime.objectives import classify_objective, synthesize_objectiv
 from codex_oss.validation import validate_report
 from codex_oss.runtime.policy import acquire_mission_slot, release_mission_slot
 from codex_oss.runtime.closure import record_closure_telemetry
-from codex_oss.answer_graph import pending_required_agenda_items, refresh_answer_graph
+from codex_oss.answer_graph import build_runtime_report_from_answer_graph, pending_required_agenda_items, refresh_answer_graph
 from codex_oss.transport.emitter import ResponseEmitter
 
 
@@ -229,6 +229,47 @@ def assert_mission_parser_ignores_non_mission_wrapper_examples():
         assert "Multiple OSS_HANDOFF_JSON" in str(exc), exc
     else:
         raise AssertionError("multiple valid MissionV1 blocks should still fail closed")
+
+
+def assert_mission_parser_accepts_documented_labeled_json_and_user_authority():
+    valid = {
+        "schema_version": "oss_agent_mission.v1",
+        "mission_id": "colon_labeled_mission",
+        "tier": "A3",
+        "mode": "managed_investigation",
+        "objective": "Probe documented handoff form.",
+        "allowed_paths": ["README.md"],
+        "allowed_tool_classes": ["read"],
+        "required_outputs": ["findings"],
+    }
+    handoff = (
+        "Standing instructions may mention a reusable template:\n"
+        "OSS_HANDOFF_JSON:\n"
+        '{"schema_version":1,"role":"example only","goal":"not active"}\n\n'
+        "Actual runtime mission:\n"
+        "OSS_HANDOFF_JSON:\n"
+        + json.dumps(valid)
+        + "\n"
+    )
+    parsed = parse_mission_v1(handoff)
+    assert parsed.mission_id == "colon_labeled_mission", parsed
+
+    body = {
+        "input": [
+            {
+                "role": "system",
+                "content": (
+                    "<OSS_HANDOFF_JSON>\n"
+                    + json.dumps({**valid, "mission_id": "stale_system_mission"})
+                    + "\n</OSS_HANDOFF_JSON>\n"
+                ),
+            },
+            {"role": "user", "content": handoff},
+        ]
+    }
+    active = extract_handoff_from_body(body)
+    parsed_active = parse_mission_v1(active)
+    assert parsed_active.mission_id == "colon_labeled_mission", parsed_active
 
 
 def assert_path_policy_blocks_empty_scope_and_denied_symlink():
@@ -607,7 +648,10 @@ def assert_readonly_mission_writes_artifact_bundle():
             report_json = json.load(handle)
         assert report_json["visible_commentary_path"].endswith("/visible_commentary.jsonl"), report_json
         assert report_json["summary_path"].endswith("/summary.md"), report_json
+        assert report_json["commentary_delivery_path"].endswith("/commentary_delivery.json"), report_json
+        assert report_json["commentary_delivery_summary"]["sse_emitted"] >= 1, report_json
         assert "Visible work:" in result.report_text, result.report_text
+        assert "Delivery status:" in result.report_text, result.report_text
         with open(os.path.join(artifact_dir, "trace_grading.json"), encoding="utf-8") as handle:
             grading = json.load(handle)
         assert "productive_exploration" in grading["labels"], grading
@@ -634,6 +678,50 @@ def assert_readonly_mission_writes_artifact_bundle():
     finally:
         os.chdir(cwd)
         shutil.rmtree(root)
+
+
+def assert_preflight_scope_rejection_emits_visible_commentary():
+    from codex_oss.visible_commentary import VisibleCommentarySink
+
+    with tempfile.TemporaryDirectory(dir=ROOT) as d:
+        m = mission(
+            mission_id="mission_scope_reject_commentary",
+            allowed_roots=["."],
+            allowed_paths=[],
+            allow_broad_read_scope=False,
+        )
+        ledger = EvidenceLedger(mission_id=m.mission_id, tool_budget_remaining=m.tool_budget)
+        live_events = []
+        commentary = VisibleCommentarySink(
+            m.mission_id,
+            d,
+            stream_callback=live_events.append,
+        )
+
+        result = run_loop(
+            m,
+            ledger,
+            lambda messages, tools, timeout: (_ for _ in ()).throw(AssertionError("model should not be called")),
+            [],
+            None,
+            m.allowed_roots,
+            m.allowed_paths,
+            request_deadline=30,
+            commentary=commentary,
+        )
+        commentary.close(result.get("report", {}))
+
+        assert result["status"] == "ESCALATE", result
+        with open(os.path.join(d, "visible_commentary.jsonl"), encoding="utf-8") as handle:
+            visible_events = [json.loads(line) for line in handle if line.strip()]
+        event_types = [event["event_type"] for event in visible_events]
+        assert event_types[0] == "mission_started", visible_events
+        assert "preflight_checked" in event_types, visible_events
+        assert visible_events[-1]["event_type"] in {"mission_completed", "mission_escalated", "mission_partial"}, visible_events
+        assert [event["event_type"] for event in live_events] == event_types[:len(live_events)], live_events
+        preflight = [event for event in visible_events if event["event_type"] == "preflight_checked"][0]
+        assert preflight["source"] == "preflight", preflight
+        assert preflight["severity"] == "warning", preflight
 
 
 def assert_visible_commentary_close_adds_terminal_lifecycle_event():
@@ -747,11 +835,17 @@ def assert_response_emitter_streams_commentary_and_final_phases():
 
     added = [payload["item"] for event, payload in frames if event == "response.output_item.added"]
     done = [payload["item"] for event, payload in frames if event == "response.output_item.done"]
+    deltas = [payload for event, payload in frames if event == "response.output_text.delta"]
+    text_done = [payload for event, payload in frames if event == "response.output_text.done"]
     completed = [payload["response"] for event, payload in frames if event == "response.completed"]
     assert added[0]["phase"] == "commentary", added
     assert added[1]["phase"] == "final_answer", added
     assert done[0]["phase"] == "commentary", done
     assert done[1]["phase"] == "final_answer", done
+    assert deltas[0]["phase"] == "commentary", deltas
+    assert deltas[1]["phase"] == "final_answer", deltas
+    assert text_done[0]["phase"] == "commentary", text_done
+    assert text_done[1]["phase"] == "final_answer", text_done
     assert [item["phase"] for item in completed[-1]["output"]] == ["commentary", "final_answer"], completed
 
 
@@ -4625,6 +4719,178 @@ def assert_record_closure_telemetry_persists_error_and_skip_fields():
         shutil.rmtree(root)
 
 
+def assert_readonly_runtime_entitlement_reconciles_unsupported_partial():
+    from codex_oss.managed_bridge import _reconcile_readonly_runtime_entitlement
+
+    report = {"status": "PARTIAL", "caveats": []}
+    answer_graph = {
+        "sufficiency": {
+            "required_obligations": 1,
+            "answered_obligations": 1,
+            "missing_required_sources": [],
+            "contradicted_obligations": [],
+            "blocked_obligations": [],
+            "insufficient_evidence_obligations": [],
+            "can_complete": True,
+            "coverage_complete": True,
+            "recommended_status": "COMPLETE",
+        }
+    }
+    status = _reconcile_readonly_runtime_entitlement(report, "PARTIAL", answer_graph)
+    assert status == "COMPLETE", report
+    assert report["status"] == "COMPLETE", report
+    assert report["runtime_entitlement_reconciliation"]["decision"] == "promoted_partial_to_complete", report
+
+    source_floor_report = {"status": "PARTIAL", "caveats": []}
+    source_floor_status = _reconcile_readonly_runtime_entitlement(source_floor_report, "PARTIAL", {
+        "sufficiency": {
+            "required_obligations": 0,
+            "required_total": 0,
+            "missing_required_sources": [],
+            "contradicted_obligations": [],
+            "blocked_obligations": [],
+            "insufficient_evidence_obligations": [],
+            "can_close": True,
+            "closure_entitlement": {
+                "can_return_complete": True,
+                "reason_code": "all_satisfied",
+            },
+            "recommended_status": "COMPLETE",
+        },
+        "coverage_graph": {
+            "coverage_status": {
+                "can_complete": True,
+                "coverage_complete": True,
+            }
+        },
+    })
+    assert source_floor_status == "COMPLETE", source_floor_report
+    assert source_floor_report["runtime_entitlement_reconciliation"]["canonical_evidence_can_complete"] is True, source_floor_report
+
+    partial_report = {"status": "PARTIAL", "caveats": []}
+    partial_status = _reconcile_readonly_runtime_entitlement(partial_report, "PARTIAL", {
+        "sufficiency": {
+            "required_obligations": 2,
+            "answered_obligations": 1,
+            "missing_required_sources": ["docs/missing.md"],
+            "can_complete": False,
+            "recommended_status": "PARTIAL",
+        }
+    })
+    assert partial_status == "PARTIAL", partial_report
+    reasons = partial_report["runtime_entitlement_reconciliation"]["runtime_insufficiency_reasons"]
+    assert any("missing_required_sources" in reason for reason in reasons), partial_report
+
+
+def assert_source_state_distinguishes_read_insufficient_shape_from_missing_inspection():
+    with tempfile.TemporaryDirectory(dir=ROOT) as td:
+        cwd = os.getcwd()
+        try:
+            os.chdir(ROOT)
+            rel = os.path.relpath(os.path.join(td, "desktop_contract.py"), ROOT)
+            with open(os.path.join(ROOT, rel), "w", encoding="utf-8") as handle:
+                handle.write("def bridge_gold_only():\n    return 'bridge'\n")
+            m = mission(
+                mission_id="mission_source_state_shape",
+                objective="Check Desktop-native contract requirements.",
+                objective_style="open_investigation",
+                allowed_paths=[rel],
+                read_only_paths=[rel],
+                answer_obligations=[{
+                    "id": "desktop_contract",
+                    "question": "Does the source define the Desktop Gold transcript requirement?",
+                    "required": True,
+                    "source_requirements": [{
+                        "path": rel,
+                        "evidence_kind": "desktop_contract",
+                        "required": True,
+                        "required_shapes": ["desktop_gold_requires_transcript", "claim_tuple", "consumer_kind"],
+                    }],
+                }],
+                exploration_policy={"after_required_floor": "close_immediately", "min_optional_actions_after_floor": 0, "max_optional_actions_after_floor": 0, "require_contradiction_search": False},
+            )
+            ledger = EvidenceLedger(mission_id=m.mission_id, tool_budget_remaining=3)
+            ledger.add_file(rel, ToolResult(
+                tool="rtk_read",
+                args={"path": rel},
+                stdout="def bridge_gold_only():\n    return 'bridge'\n",
+                stderr="",
+                exit_code=0,
+                complete=True,
+            ), turn=1)
+            graph = refresh_answer_graph(m, ledger, reason="test")
+            source_state = graph["source_states"][0]
+            assert source_state["state"] == "read_insufficient_shape", graph
+            assert source_state["path"] == rel, graph
+            assert graph["sufficiency"]["missing_required_sources"] == [], graph
+            assert graph["sufficiency"]["insufficient_evidence_obligations"] == ["desktop_contract"], graph
+            assert graph["source_state_hash"].startswith("sha256:"), graph
+            report = build_runtime_report_from_answer_graph(m, ledger, graph, reason="test")
+            assert f"inspect:{rel}" not in report["missing_fields"], report
+            assert any(field.startswith(f"insufficient_shape:{rel}:") for field in report["missing_fields"]), report
+            assert report["source_state_hash"] == graph["source_state_hash"], report
+            from codex_oss.completion import build_completion_envelope
+            envelope = build_completion_envelope(m, report, graph, graph["sufficiency"], None)
+            assert envelope["source_state_hash"] == graph["source_state_hash"], envelope
+        finally:
+            os.chdir(cwd)
+
+
+def assert_unknown_required_shape_fails_early_without_pattern():
+    try:
+        mission(
+            mission_id="mission_unknown_shape",
+            objective="Unknown shape should fail admission.",
+            objective_style="open_investigation",
+            allowed_paths=["codex_oss/answer_graph.py"],
+            answer_obligations=[{
+                "id": "unknown",
+                "question": "Check unknown shape.",
+                "source_requirements": [{
+                    "path": "codex_oss/answer_graph.py",
+                    "required_shapes": ["not_a_registered_shape"],
+                }],
+            }],
+        )
+    except InvalidHandoffError as exc:
+        assert "unknown shape" in str(exc), exc
+    else:
+        raise AssertionError("unknown required shape must fail admission")
+
+
+def assert_custom_required_shape_with_pattern_is_allowed_and_detected():
+    with tempfile.TemporaryDirectory(dir=ROOT) as td:
+        cwd = os.getcwd()
+        try:
+            os.chdir(ROOT)
+            rel = os.path.relpath(os.path.join(td, "custom_shape.txt"), ROOT)
+            text = "CUSTOM_DESKTOP_CONSUMER_WITNESS=yes\n"
+            with open(os.path.join(ROOT, rel), "w", encoding="utf-8") as handle:
+                handle.write(text)
+            m = mission(
+                mission_id="mission_custom_shape",
+                objective="Check custom shape.",
+                objective_style="open_investigation",
+                allowed_paths=[rel],
+                answer_obligations=[{
+                    "id": "custom",
+                    "question": "Does the file include the custom witness marker?",
+                    "source_requirements": [{
+                        "path": rel,
+                        "required_shapes": ["custom_consumer_witness"],
+                        "shape_patterns": {"custom_consumer_witness": "CUSTOM_DESKTOP_CONSUMER_WITNESS=yes"},
+                    }],
+                }],
+            )
+            ledger = EvidenceLedger(mission_id=m.mission_id, tool_budget_remaining=3)
+            ledger.add_file(rel, ToolResult(tool="rtk_read", args={"path": rel}, stdout=text, stderr="", exit_code=0, complete=True), turn=1)
+            graph = refresh_answer_graph(m, ledger, reason="test")
+            assert graph["source_states"][0]["state"] == "read_satisfied", graph
+            assert "custom_consumer_witness" in graph["source_states"][0]["detected_shapes"], graph
+        finally:
+            os.chdir(cwd)
+
+
 def main():
     assert_run_loop_accepts_valid_final_report()
     assert_model_text_extraction_handles_provider_variants()
@@ -4638,9 +4904,11 @@ def main():
     assert_file_extract_refs_resolve()
     assert_report_validation_rejects_non_object_findings_without_crashing()
     assert_managed_bridge_returns_terminal_report_on_runtime_error()
+    assert_mission_parser_accepts_documented_labeled_json_and_user_authority()
     assert_runtime_model_alias_requires_mission_and_maps_reasoning_model()
     assert_runtime_model_alias_uses_fallback_on_model_failure()
     assert_readonly_mission_writes_artifact_bundle()
+    assert_preflight_scope_rejection_emits_visible_commentary()
     assert_visible_commentary_close_adds_terminal_lifecycle_event()
     assert_a3_allowed_paths_become_required_inspection_floor()
     assert_response_emitter_streams_commentary_and_final_phases()
@@ -4712,6 +4980,10 @@ def main():
     assert_completion_envelope_caps_unanswered_complete()
     assert_run_loop_downgrades_hollow_model_complete()
     assert_record_closure_telemetry_persists_error_and_skip_fields()
+    assert_readonly_runtime_entitlement_reconciles_unsupported_partial()
+    assert_source_state_distinguishes_read_insufficient_shape_from_missing_inspection()
+    assert_unknown_required_shape_fails_early_without_pattern()
+    assert_custom_required_shape_with_pattern_is_allowed_and_detected()
     print("PASS: runtime contract suite")
 
 

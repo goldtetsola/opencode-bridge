@@ -1,7 +1,8 @@
-"""Spawned-subagent transcript harness — proves native-like UX end-to-end.
+"""Bridge transcript harness — proves bridge-local native-like UX.
 
-Captures user-visible transcripts from actual spawned OSS subagents and
-reconciles them with mission artifacts. This is the Gold UX gate.
+Captures local Responses/SSE transcripts and reconciles them with mission
+artifacts. This is the Bridge Gold gate; Codex Desktop Gold requires
+``codex_oss.desktop_native_verifier`` with captured Desktop transcript evidence.
 """
 
 from __future__ import annotations
@@ -14,6 +15,8 @@ import time
 import urllib.request
 from pathlib import Path
 from typing import Any
+
+from codex_oss.route_authority import build_route_authority
 
 JSON = dict[str, Any]
 
@@ -56,6 +59,7 @@ class SpawnedSubagentRunner:
                 "role": "Read-only scout",
                 "goal": handoff_goal,
                 "task_type": "scout",
+                "owned_paths": [],
                 "read_only_paths": read_only_paths,
                 "forbidden_actions": ["Do not edit files"],
                 "verification_steps": ["Verify all required files were inspected"],
@@ -129,6 +133,198 @@ class SpawnedSubagentRunner:
 
         return self._spawn(model, content, mid, "bounded_implementation")
 
+    def run_pending_read_recovery(
+        self,
+        *,
+        model: str,
+        read_only_paths: list[str],
+        mission_id: str = "",
+    ) -> SpawnedTranscript:
+        """Run pending-read recovery through runtime code and capture rendered SSE."""
+        mid = mission_id or f"ux_pending_read_{int(time.time())}"
+        handoff = self._read_handoff(mid, read_only_paths, "Recover a pending read evidence floor")
+        pending_path = read_only_paths[0] if read_only_paths else "README.md"
+        return self._runtime_recovery_transcript(
+            model=model,
+            mission_id=mid,
+            task_class="read_floor",
+            handoff=handoff,
+            pending_tool={
+                "id": "call_pending_read",
+                "type": "function",
+                "function": {
+                    "name": "exec_command",
+                    "arguments": json.dumps({"cmd": f"rtk read {pending_path}", "workdir": os.getcwd()}),
+                },
+            },
+        )
+
+    def run_grep_recovery(
+        self,
+        *,
+        model: str,
+        read_only_paths: list[str],
+        pattern: str = "NativeExperience",
+        mission_id: str = "",
+    ) -> SpawnedTranscript:
+        """Run grep/search recovery through runtime code and capture rendered SSE."""
+        mid = mission_id or f"ux_grep_{int(time.time())}"
+        handoff = self._read_handoff(mid, read_only_paths, "Recover pending grep evidence")
+        target = read_only_paths[0] if read_only_paths else "README.md"
+        return self._runtime_recovery_transcript(
+            model=model,
+            mission_id=mid,
+            task_class="search_floor",
+            handoff=handoff,
+            pending_tool={
+                "id": "call_pending_grep",
+                "type": "function",
+                "function": {
+                    "name": "exec_command",
+                    "arguments": json.dumps({"cmd": f"rtk grep {json.dumps(pattern)} {target}", "workdir": os.getcwd()}),
+                },
+            },
+        )
+
+    def run_ls_recovery(
+        self,
+        *,
+        model: str,
+        read_only_paths: list[str],
+        mission_id: str = "",
+    ) -> SpawnedTranscript:
+        """Run ls/list recovery through runtime code and capture rendered SSE."""
+        mid = mission_id or f"ux_ls_{int(time.time())}"
+        handoff = self._read_handoff(mid, read_only_paths, "Recover pending list evidence")
+        return self._runtime_recovery_transcript(
+            model=model,
+            mission_id=mid,
+            task_class="search_floor",
+            handoff=handoff,
+            pending_tool={
+                "id": "call_pending_ls",
+                "type": "function",
+                "function": {
+                    "name": "exec_command",
+                    "arguments": json.dumps({"cmd": "rtk ls codex_oss", "workdir": os.getcwd()}),
+                },
+            },
+        )
+
+    @staticmethod
+    def _read_handoff(mission_id: str, read_only_paths: list[str], goal: str) -> str:
+        return (
+            "OSS_HANDOFF_JSON:\n"
+            + json.dumps({
+                "schema_version": 1,
+                "role": "Read-only recovery scout",
+                "goal": goal,
+                "task_type": "scout",
+                "owned_paths": [],
+                "read_only_paths": read_only_paths,
+                "forbidden_actions": ["Do not edit files"],
+                "verification_steps": ["Verify required evidence was recovered"],
+                "deliverable_fields": ["files inspected", "confidence", "caveats"],
+                "completion_rule": "stop after recovered evidence report",
+                "escalation_rule": "stop on scope drift",
+                "mission_id": mission_id,
+            })
+        )
+
+    def _runtime_recovery_transcript(
+        self,
+        *,
+        model: str,
+        mission_id: str,
+        task_class: str,
+        handoff: str,
+        pending_tool: JSON,
+    ) -> SpawnedTranscript:
+        """Capture runtime pending-recovery SSE using the same transcript parser."""
+        os.environ.setdefault("ALLOW_MISSING_OPENCODE_KEY", "1")
+        from bridge import StoredResponse, complete_pending_reads_from_bridge
+        from codex_oss.transport.emitter import ResponseEmitter
+
+        class FakeWFile:
+            def __init__(self):
+                self.data = bytearray()
+
+            def write(self, chunk):
+                self.data.extend(chunk)
+
+            def flush(self):
+                pass
+
+        class FakeHandler:
+            def __init__(self):
+                self.wfile = FakeWFile()
+                self.statuses = []
+                self.headers = []
+
+            def send_response(self, status):
+                self.statuses.append(status)
+
+            def send_header(self, key, value):
+                self.headers.append((key, value))
+
+            def end_headers(self):
+                pass
+
+        started = time.time()
+        transcript = SpawnedTranscript(mission_id=mission_id, model=model, task_class=task_class, started_at=started)
+        transcript.route_authority = build_route_authority(
+            agent_name=model,
+            model_alias=model,
+            handoff_text=handoff,
+            consumer_kind="direct_bridge_harness",
+        )
+        handler = FakeHandler()
+        emitter = ResponseEmitter(handler, f"resp_{mission_id}", model, True)
+        child = StoredResponse(
+            response_id=f"resp_child_{mission_id}",
+            model_alias=model,
+            model_upstream=model,
+            messages=[
+                {"role": "user", "content": handoff},
+                {"role": "assistant", "content": "", "tool_calls": [pending_tool]},
+            ],
+            pending_call_ids=[str(pending_tool.get("id", ""))],
+            created_at=int(started),
+            tool_exchange_count=1,
+            task_max_exchanges=6,
+            previous_response_id=f"resp_parent_{mission_id}",
+            pending_replay_count=3,
+        )
+
+        def finalizer(_prompt: str, _timeout: float) -> str:
+            return (
+                "Findings: The pending recovery path gathered the required runtime-owned evidence.\n"
+                "Confidence: HIGH\n"
+                "Caveats: This recovery narrative is limited to the recovered evidence excerpts."
+            )
+
+        try:
+            report_text = complete_pending_reads_from_bridge(
+                parent_response_id=f"resp_parent_{mission_id}",
+                child_state=child,
+                handoff_text=handoff,
+                project_root=os.getcwd(),
+                finalizer_call=finalizer,
+                finalizer_timeout_seconds=3,
+                emitter=emitter,
+            )
+            if report_text:
+                emitter.emit_text_message(report_text, phase="final_answer")
+                emitter.complete()
+            transcript.http_status = 200
+        except Exception as exc:
+            transcript.error = str(exc)
+        transcript.ended_at = time.time()
+        self._process_captured_sse(handler.wfile.data.decode("utf-8", errors="replace"), transcript)
+        transcript.load_artifacts()
+        transcript.extract_commentary()
+        return transcript
+
     def _spawn(
         self,
         model: str,
@@ -150,6 +346,12 @@ class SpawnedSubagentRunner:
             model=model,
             task_class=task_class,
             started_at=started,
+        )
+        transcript.route_authority = build_route_authority(
+            agent_name=model,
+            model_alias=model,
+            handoff_text=content,
+            consumer_kind="direct_bridge_harness",
         )
 
         try:
@@ -192,11 +394,23 @@ class SpawnedSubagentRunner:
 
         return transcript
 
+    def _process_captured_sse(self, stream_text: str, transcript: SpawnedTranscript) -> None:
+        for raw_frame in stream_text.split("\n\n"):
+            if raw_frame.strip():
+                self._process_sse_line(raw_frame, transcript)
+
     def _process_sse_line(self, line: str, transcript: SpawnedTranscript) -> None:
         """Process a single SSE data line."""
-        if not line.startswith("data: "):
+        event_name = ""
+        data_lines: list[str] = []
+        for raw_line in line.splitlines():
+            if raw_line.startswith("event: "):
+                event_name = raw_line[len("event: "):].strip()
+            elif raw_line.startswith("data: "):
+                data_lines.append(raw_line[len("data: "):])
+        if not data_lines:
             return
-        data_str = line[6:].strip()
+        data_str = "\n".join(data_lines).strip()
         if data_str == "[DONE]":
             transcript.stream_done = True
             return
@@ -207,13 +421,31 @@ class SpawnedSubagentRunner:
             transcript.unparseable_lines += 1
             return
 
-        event_type = event.get("type", "")
+        event_type = event.get("type", "") or event_name
+        output_index = event.get("output_index")
+        phase = str(event.get("phase", "") or "")
 
         # Capture response.created for metadata
         if event_type == "response.created":
             resp = event.get("response", {})
             transcript.response_id = resp.get("id", "")
             return
+
+        if event_type in {"response.output_item.added", "response.output_item.done"}:
+            item = event.get("item", {}) if isinstance(event.get("item"), dict) else {}
+            item_phase = str(item.get("phase", "") or phase)
+            if item_phase and isinstance(output_index, int):
+                transcript._phase_by_output_index[output_index] = item_phase
+            item_id_for_phase = str(item.get("id", "") or "")
+            if item_phase and item_id_for_phase:
+                transcript._phase_by_item_id[item_id_for_phase] = item_phase
+            phase = item_phase or phase
+
+        item_id = str(event.get("item_id", "") or "")
+        if not phase and isinstance(output_index, int):
+            phase = transcript._phase_by_output_index.get(output_index, "")
+        if not phase and item_id:
+            phase = transcript._phase_by_item_id.get(item_id, "")
 
         # Capture response.completed for final status
         if event_type == "response.completed":
@@ -230,7 +462,7 @@ class SpawnedSubagentRunner:
                 "timestamp": timestamp,
                 "event_type": event_type,
                 "text": text,
-                "phase": event.get("phase", ""),
+                "phase": phase,
             })
             transcript.all_text.append(text)
 
@@ -240,6 +472,14 @@ class SpawnedSubagentRunner:
         delta = event.get("delta", "")
         if isinstance(delta, str) and delta.strip():
             return delta
+
+        text = event.get("text", "")
+        if isinstance(text, str) and text.strip():
+            return text
+
+        part = event.get("part", {})
+        if isinstance(part, dict) and part.get("text"):
+            return str(part["text"])
 
         # Content array in item
         item = event.get("item", {})
@@ -285,6 +525,8 @@ class SpawnedTranscript:
         # Captured messages
         self.raw_messages: list[JSON] = []
         self.all_text: list[str] = []
+        self._phase_by_output_index: dict[int, str] = {}
+        self._phase_by_item_id: dict[str, str] = {}
 
         # Extracted commentary
         self.commentary_messages: list[JSON] = []
@@ -298,6 +540,11 @@ class SpawnedTranscript:
         # Evaluation
         self.unparseable_lines: int = 0
         self.safety_violations: list[str] = []
+        self.route_authority: JSON = build_route_authority(
+            agent_name=model,
+            model_alias=model,
+            consumer_kind="direct_bridge_harness",
+        )
 
     @property
     def duration_seconds(self) -> float:
@@ -317,11 +564,14 @@ class SpawnedTranscript:
             "summary.md",
             "canonical_read_evidence.json",
             "read_report_skeleton.json",
+            "read_narrative_draft.json",
+            "merged_read_report.json",
             "report.json",
             "canonical_patch_evidence.json",
             "implementation_narrative.json",
             "tool_call_adoption_probes.json",
             "server_side_read_finalizer_attempts.jsonl",
+            "commentary_delivery.json",
         ]
 
         for name in expected:
@@ -345,49 +595,108 @@ class SpawnedTranscript:
 
     def extract_commentary(self) -> None:
         """Extract commentary messages from the transcript and artifacts."""
-        from codex_oss.native_experience import classify_commentary_event, extract_event_classes
+        from codex_oss.native_experience import classify_commentary_event
 
-        # From SSE transcript: look for messages tagged as commentary
-        for msg in self.raw_messages:
-            text = str(msg.get("text", "") or "")
-            phase = str(msg.get("phase", "") or "")
+        self.commentary_messages = []
+        self.commentary_before_final = []
+        self.commentary_event_classes = set()
 
-            # Commentary messages have a phase field or are tagged
-            is_commentary = bool(phase) or "[OSS progress]" in text or self._looks_like_progress(text)
+        final_ts = self._first_final_answer_timestamp()
+        seen: set[tuple[float, str]] = set()
+        reconciled_timestamps: set[float] = set()
 
-            if is_commentary:
-                self.commentary_messages.append(msg)
-                event_type = phase if phase else "transcript_progress"
-                self.commentary_event_classes.add(classify_commentary_event(event_type))
-
-        # From artifacts: load JSONL commentary
+        # Reconcile artifact events only when the transcript actually observed
+        # their text. Artifact-only progress is producer evidence, not rendered UX.
         jsonl = self.artifact_data.get("visible_commentary.jsonl")
         if isinstance(jsonl, list):
             for event in jsonl:
                 if isinstance(event, dict):
                     event_type = str(event.get("event_type", "") or "")
-                    self.commentary_event_classes.add(classify_commentary_event(event_type))
-                    # These are "emitted" but were they observed?
                     text = str(event.get("message", "") or "")
-                    observed = any(
-                        text[:50] in str(m.get("text", ""))
-                        for m in self.raw_messages
-                    )
-                    if observed and event not in self.commentary_messages:
-                        self.commentary_messages.append({
-                            "timestamp": event.get("timestamp", 0),
-                            "event_type": event_type,
-                            "text": text,
-                            "phase": event.get("phase", ""),
-                            "source": "artifact_reconciled",
-                        })
+                    observed_msg = self._observed_message_for_artifact_text(text)
+                    if observed_msg is None:
+                        continue
+                    observed_ts = float(observed_msg.get("timestamp", 0) or 0)
+                    reconciled = {
+                        "timestamp": observed_ts,
+                        "event_type": event_type,
+                        "text": text,
+                        "phase": event.get("phase", observed_msg.get("phase", "")),
+                        "source": "artifact_reconciled",
+                        "event_id": event.get("event_id", ""),
+                    }
+                    key = (observed_ts, text)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    reconciled_timestamps.add(observed_ts)
+                    self.commentary_messages.append(reconciled)
+                    if final_ts is None or observed_ts < final_ts:
+                        self.commentary_before_final.append(reconciled)
+                        self.commentary_event_classes.add(classify_commentary_event(event_type))
 
-        # Determine which commentary was before final
-        # (all commentary is before final in SSE since final is the last message)
-        self.commentary_before_final = [
-            m for m in self.commentary_messages
-            if m.get("event_type") != "mission_completed"
+        # Include transcript-only progress that has no matching artifact.
+        for msg in self.raw_messages:
+            if not self._is_commentary_message(msg):
+                continue
+            text = str(msg.get("text", "") or "")
+            ts = float(msg.get("timestamp", 0) or 0)
+            if ts in reconciled_timestamps:
+                continue
+            key = (ts, text)
+            if key in seen:
+                continue
+            seen.add(key)
+            self.commentary_messages.append(msg)
+            if final_ts is None or ts < final_ts:
+                self.commentary_before_final.append(msg)
+                self.commentary_event_classes.add(classify_commentary_event(self._event_type_for_raw_commentary(msg)))
+
+    def _first_final_answer_timestamp(self) -> float | None:
+        finals = [
+            float(msg.get("timestamp", 0) or 0)
+            for msg in self.raw_messages
+            if self._is_final_answer_message(msg)
         ]
+        return min(finals) if finals else None
+
+    def _observed_message_for_artifact_text(self, artifact_text: str) -> JSON | None:
+        needle = " ".join(str(artifact_text or "").split())
+        if not needle:
+            return None
+        prefix = needle[: min(80, len(needle))]
+        for msg in self.raw_messages:
+            if self._is_final_answer_message(msg):
+                continue
+            haystack = " ".join(str(msg.get("text", "") or "").split())
+            if needle in haystack or prefix in haystack:
+                return msg
+        return None
+
+    @staticmethod
+    def _is_final_answer_message(msg: JSON) -> bool:
+        phase = str(msg.get("phase", "") or "").strip().lower()
+        return phase in {"final_answer", "final", "answer"}
+
+    def _is_commentary_message(self, msg: JSON) -> bool:
+        if self._is_final_answer_message(msg):
+            return False
+        text = str(msg.get("text", "") or "")
+        phase = str(msg.get("phase", "") or "").strip().lower()
+        if phase in {"commentary", "read_floor", "plan", "propose", "validate_patch", "apply", "verify", "report"}:
+            return True
+        return "[OSS progress]" in text or self._looks_like_progress(text)
+
+    @staticmethod
+    def _event_type_for_raw_commentary(msg: JSON) -> str:
+        phase = str(msg.get("phase", "") or "").strip().lower()
+        if phase in {"plan", "mission", "start"}:
+            return "mission_started"
+        if phase in {"report", "verify"}:
+            return "mission_completed"
+        if phase in {"apply", "validate_patch", "propose"}:
+            return "tool_or_evidence_progress"
+        return "transcript_progress"
 
     @staticmethod
     def _looks_like_progress(text: str) -> bool:
@@ -428,10 +737,20 @@ class SpawnedTranscript:
 
         # Model narrative
         impl_narrative = self.artifact_data.get("implementation_narrative.json", {}) or {}
+        finalizer_attempts = self.artifact_data.get("server_side_read_finalizer_attempts.jsonl", []) or []
+        read_finalizer_success = any(
+            isinstance(item, dict) and item.get("result") == "success"
+            for item in finalizer_attempts
+        )
+        final_text = "\n".join(str(text) for text in self.all_text)
         model_narrative_valid = (
             isinstance(report, dict)
             and report.get("implementation_narrative_valid", False)
-        ) or bool(isinstance(impl_narrative, dict) and impl_narrative.get("schema_version"))
+        ) or bool(isinstance(impl_narrative, dict) and impl_narrative.get("schema_version")) \
+            or bool(self.artifacts.get("read_narrative_draft.json")) \
+            or bool(self.artifacts.get("merged_read_report.json")) \
+            or read_finalizer_success \
+            or "MODEL_AUTHORED_SERVER_SIDE_READ_COMPLETION" in final_text
 
         # Commentary
         commentary_observed = len(self.commentary_messages) > 0
@@ -456,11 +775,12 @@ class SpawnedTranscript:
                 ],
                 "must_be_observed_by_spawned_subagent_consumer": True,
             },
+            route_authority=self.route_authority,
         )
 
         result = evaluate_native_experience(
             contract,
-            artifacts_exist=self.artifacts,
+            artifacts_exist=self._contract_artifact_flags(),
             commentary_events_count=self.pre_final_commentary_count,
             commentary_event_classes=self.commentary_event_classes,
             commentary_observed=commentary_observed,
@@ -483,9 +803,23 @@ class SpawnedTranscript:
             "commentary_before_final": len(self.commentary_before_final),
             "event_classes_found": sorted(self.commentary_event_classes),
             "artifacts_found": sum(1 for v in self.artifacts.values() if v),
+            "consumer_kind": self.route_authority.get("consumer_kind", "direct_bridge_harness"),
+            "native_claim_scope": self.route_authority.get("native_claim_scope", "bridge_only"),
         }
 
         return result
+
+    def _contract_artifact_flags(self) -> dict[str, bool]:
+        """Map concrete mission files to NativeExperienceContract artifact names."""
+        return {
+            "visible_commentary_jsonl": bool(self.artifacts.get("visible_commentary.jsonl")),
+            "summary_md": bool(self.artifacts.get("summary.md")),
+            "canonical_evidence": bool(
+                self.artifacts.get("canonical_read_evidence.json")
+                or self.artifacts.get("canonical_patch_evidence.json")
+            ),
+            "adoption_probes": bool(self.artifacts.get("tool_call_adoption_probes.json")),
+        }
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -517,8 +851,11 @@ def run_gold_ux_burnin(
 
     return {
         "schema_version": "gold_ux_burnin_report.v1",
+        "claim_scope": "bridge_only",
+        "note": "This burn-in exercises the direct bridge harness; it does not prove Codex Desktop spawned-agent UX.",
         "models": models,
         "total_tests": total,
+        "bridge_gold_passed": passed,
         "gold_passed": passed,
         "gold_failed": total - passed,
         "results": results,
@@ -598,6 +935,40 @@ def _run_model_gold_tests(runner: SpawnedSubagentRunner, model: str) -> list[JSO
             os.remove(scratch_full)
         except FileNotFoundError:
             pass
+
+    # Test 3: Pending read recovery
+    if existing:
+        transcript = runner.run_pending_read_recovery(
+            model=model,
+            read_only_paths=existing[:2],
+            mission_id=f"gold_ux_pending_read_{model}_{int(time.time())}",
+        )
+        eval_result = transcript.evaluate_gold_ux()
+        eval_result["test_name"] = f"pending_read_recovery [{model}]"
+        results.append(eval_result)
+
+    # Test 4: Grep/search recovery
+    if existing:
+        transcript = runner.run_grep_recovery(
+            model=model,
+            read_only_paths=["README.md"],
+            pattern="codex",
+            mission_id=f"gold_ux_grep_{model}_{int(time.time())}",
+        )
+        eval_result = transcript.evaluate_gold_ux()
+        eval_result["test_name"] = f"grep_recovery [{model}]"
+        results.append(eval_result)
+
+    # Test 5: ls/list recovery
+    if existing:
+        transcript = runner.run_ls_recovery(
+            model=model,
+            read_only_paths=["README.md"],
+            mission_id=f"gold_ux_ls_{model}_{int(time.time())}",
+        )
+        eval_result = transcript.evaluate_gold_ux()
+        eval_result["test_name"] = f"ls_recovery [{model}]"
+        results.append(eval_result)
 
     return results
 

@@ -43,13 +43,14 @@ AGENTS_MD_BLOCK = '''
 <!-- codex-oss:start -->
 ## OSS delegation
 
-Use OSS agents for bounded low/medium-risk work only. Use runtime-controlled OSS agents for normal A2/A3 read-only investigation and higher-assurance MissionV1 A4/A5 implementation. `oss_deepseek_pro` can perform bounded low-risk implementation when the handoff declares owned paths and verification.
+Use OSS agents for bounded low/medium-risk work only. Use runtime-controlled MissionV1 OSS agents for native-feeling A2/A3 read-only investigation and higher-assurance A4/A5 implementation. Raw direct OSS agents are support/research lanes only; they must not be treated as Codex Desktop-native candidates.
 
 For implementation work:
 - Prefer `oss_deepseek_implementer` with a MissionV1 A4/A5 handoff when you need runtime-owned patch control.
-- Use `oss_deepseek_pro` for native-style bounded implementation when the scope is low-risk, owned paths are explicit, and verification is clear.
+- Use `oss_deepseek_pro` only as a raw direct bounded implementation/drafting lane when the scope is low-risk, owned paths are explicit, and external verification is clear.
 - Runtime owns patch construction, apply, verification, rollback, and final status.
 - The model owns narrative, patch intent, and rationale only.
+- Native-feeling product claims require MissionV1 runtime authority. Raw direct agents (`oss_deepseek_pro`, `oss_kimi_rapid`, `oss_flash_support`) are `raw_research_only` for public claims and cannot certify Desktop-native behavior.
 
 When spawning OSS agents, always use fork_turns: "none":
 - Full-history forks inherit GPT-5.5 model/reasoning, which conflicts with OSS agent overrides.
@@ -129,7 +130,9 @@ developer_instructions = """
 You are a raw OSS implementation-capable worker under GPT orchestration.
 
 You may edit only explicitly declared owned_paths when the handoff asks for bounded implementation.
-For higher assurance implementation, the parent may still use `oss_deepseek_implementer` with a MissionV1 A4/A5 runtime handoff.
+For higher assurance or native-feeling implementation, the parent must use `oss_deepseek_implementer` with a MissionV1 A4/A5 runtime handoff.
+This raw direct agent must not self-certify Desktop-native UX, changed-file truth, apply success, or verification success.
+For public claims, this lane is raw_research_only; Desktop-native proof must use a runtime-controlled MissionV1 lane plus captured Desktop consumer witness.
 
 CAPABILITIES:
 - Analyze single files or tightly coupled modules (max 2 files)
@@ -196,6 +199,7 @@ developer_instructions = """
 You are a fast repo-navigation worker under GPT-5.5 orchestration.
 
 Raw direct writes are blocked by default. Stay read-only unless the parent routes implementation through a MissionV1 A4/A5 runtime agent.
+This raw direct agent must not self-certify Desktop-native UX or runtime-owned status. For public claims, this lane is raw_research_only. Native-feeling read/investigation work should use `oss_kimi_investigator`, `oss_deepseek_investigator`, or `oss_flash_context` with MissionV1.
 
 CAPABILITIES:
 - Navigate and search the codebase
@@ -237,6 +241,7 @@ developer_instructions = """
 You are a low-cost documentation and support worker.
 
 Raw direct writes are blocked by default. Stay read-only unless the parent routes implementation through a MissionV1 A4/A5 runtime agent.
+This raw direct agent must not self-certify Desktop-native UX or runtime-owned status. For public claims, this lane is raw_research_only. Native-feeling docs/support work requires a runtime-controlled MissionV1 lane plus captured Desktop transcript evidence.
 
 CAPABILITIES:
 - Write and update docs, READMEs, comments

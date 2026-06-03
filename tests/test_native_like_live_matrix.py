@@ -21,6 +21,7 @@ JSON = dict[str, Any]
 LIVE_MODE = os.getenv("LIVE", "0") == "1"
 BRIDGE_URL = os.getenv("OSS_BRIDGE_URL", "http://127.0.0.1:4000/v1")
 AUTH = os.getenv("PROXY_API_KEY", "sk-local-codex-bridge")
+NATIVE_BURNIN_LEVEL = os.getenv("NATIVE_BURNIN_LEVEL", "all").strip().lower() or "all"
 
 TESTS_PASSED = 0
 TESTS_FAILED = 0
@@ -669,34 +670,42 @@ def main():
     print(" Native-Like OSS Subagent Burn-In Matrix")
     print("=" * 70)
     print(f" Live mode: {LIVE_MODE}")
+    print(f" Level: {NATIVE_BURNIN_LEVEL}")
     if LIVE_MODE:
         print(f" Bridge URL: {BRIDGE_URL}")
     print()
 
+    levels = {"bronze": 1, "silver": 2, "gold": 3, "all": 4}
+    selected = levels.get(NATIVE_BURNIN_LEVEL, 4)
+
     # ── Bronze ──
-    print("── Bronze: deterministic/runtime completion ──")
-    bronze_runtime_contract_completer()
-    bronze_grep_zero_match()
-    if LIVE_MODE:
-        bronze_read_floor_3_files()
-        bronze_no_writes_outside_scope()
+    if selected >= 1:
+        print("── Bronze: deterministic/runtime completion ──")
+        bronze_runtime_contract_completer()
+        bronze_grep_zero_match()
+        if LIVE_MODE:
+            bronze_read_floor_3_files()
+            bronze_no_writes_outside_scope()
 
     # ── Silver ──
-    print("\n── Silver: model-authored narration ──")
-    silver_canonical_read_evidence_artifacts()
-    silver_finalizer_attempts_logged()
-    silver_reject_action_as_narrative()
+    if selected >= 2:
+        print("\n── Silver: model-authored narration ──")
+        silver_canonical_read_evidence_artifacts()
+        silver_finalizer_attempts_logged()
+        silver_reject_action_as_narrative()
 
     # ── Gold ──
-    print("\n── Gold: native adoption probes ──")
-    gold_adoption_probe_schema()
-    gold_state_machine_ledger()
-    gold_promotion_gate()
+    if selected >= 3:
+        print("\n── Gold: native adoption probes ──")
+        gold_adoption_probe_schema()
+        gold_state_machine_ledger()
+        gold_promotion_gate()
 
     # ── Capability ──
-    print("\n── Capability: artifact integrity ──")
-    capability_read_evidence_artifact_integrity()
-    capability_visible_commentary_stream()
+    if selected >= 4:
+        print("\n── Capability: artifact integrity ──")
+        capability_read_evidence_artifact_integrity()
+        capability_visible_commentary_stream()
 
     print()
     print("=" * 70)

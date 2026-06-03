@@ -86,6 +86,12 @@ def test_contract_gold_requires_commentary():
     # Now with commentary observed
     result2 = evaluate_native_experience(
         contract,
+        artifacts_exist={
+            "visible_commentary_jsonl": True,
+            "summary_md": True,
+            "canonical_evidence": True,
+            "adoption_probes": True,
+        },
         runtime_owns_status=True,
         model_narrative_valid=True,
         commentary_events_count=3,
@@ -114,6 +120,12 @@ def test_contract_platinum_requires_adoption():
 
     result = evaluate_native_experience(
         contract,
+        artifacts_exist={
+            "visible_commentary_jsonl": True,
+            "summary_md": True,
+            "canonical_evidence": True,
+            "adoption_probes": True,
+        },
         runtime_owns_status=True,
         model_narrative_valid=True,
         commentary_events_count=3,
@@ -128,6 +140,53 @@ def test_contract_platinum_requires_adoption():
     assert result["platinum_pass"] is True
     assert result["level"] == "platinum"
     _pass(name, f"level={result['level']}")
+
+
+def test_desktop_gold_requires_consumer_observation_witness_not_hash_only():
+    """Desktop Gold provenance needs observed Desktop witness, not just a transcript hash."""
+    name = "desktop_gold_requires_consumer_witness"
+    from codex_oss.native_experience import build_native_experience_contract, evaluate_native_experience
+    from codex_oss.route_authority import build_route_authority
+
+    route = build_route_authority(
+        model_alias="mission-a3-deepseek",
+        handoff_obj={"schema_version": "oss_agent_mission.v1"},
+        consumer_kind="codex_desktop_spawned",
+    )
+    contract = build_native_experience_contract(
+        mission_id="desktop_hash_only",
+        task_class="read_floor",
+        route_authority=route,
+    )
+    contract["desktop_transcript_hash"] = "sha256:hash-is-not-witness"
+    common = dict(
+        artifacts_exist={
+            "visible_commentary_jsonl": True,
+            "summary_md": True,
+            "canonical_evidence": True,
+            "adoption_probes": True,
+        },
+        runtime_owns_status=True,
+        model_narrative_valid=True,
+        commentary_events_count=3,
+        commentary_event_classes={"mission_or_action_start", "tool_or_evidence_progress", "closure_or_verification_progress"},
+        commentary_observed=True,
+        commentary_rendered_before_final=True,
+    )
+    result = evaluate_native_experience(contract, **common)
+    assert result["gold_pass"] is True, result
+    assert result["desktop_gold_pass"] is False, result
+    assert "desktop_consumer_observation_witness_missing_or_failed" in result["missing_evidence"], result
+
+    contract["consumer_observation_witness"] = {"schema_version": "consumer_observation_witness.v1", "ok": True}
+    blocked_by_probe = evaluate_native_experience(contract, **common)
+    assert blocked_by_probe["desktop_gold_pass"] is False, blocked_by_probe
+    assert "desktop_pre_final_text_probe_not_passed:unknown" in blocked_by_probe["missing_evidence"], blocked_by_probe
+
+    contract["desktop_render_surface"] = {"probe_required": True, "probe_status": "pass"}
+    witnessed = evaluate_native_experience(contract, **common)
+    assert witnessed["desktop_gold_pass"] is True, witnessed
+    _pass(name, "hash-only desktop provenance rejected")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -317,6 +376,111 @@ def test_transcript_commentary_extraction():
     _pass(name, f"{len(transcript.commentary_messages)} commentary messages extracted")
 
 
+def test_transcript_gold_rejects_unobserved_artifact_commentary():
+    """Gold must fail if commentary exists only in artifacts and not in transcript."""
+    name = "transcript_gold_rejects_unobserved_artifacts"
+    from codex_oss.spawned_transcript import SpawnedTranscript
+    import time
+
+    with tempfile.TemporaryDirectory() as tmp:
+        mission_id = "test_unobserved_artifacts"
+        mission_dir = Path(tmp) / ".codex-oss" / "missions" / mission_id
+        mission_dir.mkdir(parents=True)
+
+        artifact_events = [
+            {"schema_version": "visible_commentary_event.v1", "event_type": "mission_started", "message": "I found a declared read-only evidence floor."},
+            {"schema_version": "visible_commentary_event.v1", "event_type": "server_side_read_started", "message": "I inspected bridge.py, README.md, and codex_oss/read_evidence.py."},
+            {"schema_version": "visible_commentary_event.v1", "event_type": "mission_completed", "message": "The read floor is complete; finalizing from canonical evidence."},
+        ]
+        (mission_dir / "visible_commentary.jsonl").write_text(
+            "".join(json.dumps(event) + "\n" for event in artifact_events),
+            encoding="utf-8",
+        )
+        (mission_dir / "summary.md").write_text("# Summary\n", encoding="utf-8")
+        (mission_dir / "canonical_read_evidence.json").write_text(
+            json.dumps({"status_entitlement": {"can_complete": True}}),
+            encoding="utf-8",
+        )
+        (mission_dir / "read_report_skeleton.json").write_text("{}", encoding="utf-8")
+        (mission_dir / "report.json").write_text(
+            json.dumps({"report_source": "runtime", "implementation_narrative_valid": True}),
+            encoding="utf-8",
+        )
+
+        old_cwd = os.getcwd()
+        try:
+            os.chdir(tmp)
+            transcript = SpawnedTranscript(mission_id, "test_model", "read_floor", time.time())
+            transcript.raw_messages = [
+                {"timestamp": 1, "event_type": "response.output_text.delta", "text": "Final answer only.", "phase": "final_answer"},
+            ]
+            transcript.load_artifacts()
+            transcript.extract_commentary()
+            result = transcript.evaluate_gold_ux()
+        finally:
+            os.chdir(old_cwd)
+
+    assert result["gold_pass"] is False, result
+    assert result["transcript_metadata"]["commentary_before_final"] == 0, result
+    _pass(name, "artifact-only commentary is not accepted as rendered UX")
+
+
+def test_transcript_reconciles_observed_artifact_event_classes():
+    """Observed transcript text should inherit its artifact event class for Gold."""
+    name = "transcript_observed_artifact_event_classes"
+    from codex_oss.spawned_transcript import SpawnedTranscript
+    import time
+
+    with tempfile.TemporaryDirectory() as tmp:
+        mission_id = "test_observed_artifacts"
+        mission_dir = Path(tmp) / ".codex-oss" / "missions" / mission_id
+        mission_dir.mkdir(parents=True)
+        artifact_events = [
+            {"schema_version": "visible_commentary_event.v1", "event_type": "mission_started", "message": "I found a declared read-only evidence floor."},
+            {"schema_version": "visible_commentary_event.v1", "event_type": "server_side_read_started", "message": "I inspected bridge.py, README.md, and codex_oss/read_evidence.py."},
+            {"schema_version": "visible_commentary_event.v1", "event_type": "mission_completed", "message": "The read floor is complete; finalizing from canonical evidence."},
+        ]
+        (mission_dir / "visible_commentary.jsonl").write_text(
+            "".join(json.dumps(event) + "\n" for event in artifact_events),
+            encoding="utf-8",
+        )
+        (mission_dir / "summary.md").write_text("# Summary\n", encoding="utf-8")
+        (mission_dir / "canonical_read_evidence.json").write_text(
+            json.dumps({"status_entitlement": {"can_complete": True}}),
+            encoding="utf-8",
+        )
+        (mission_dir / "read_report_skeleton.json").write_text("{}", encoding="utf-8")
+        (mission_dir / "report.json").write_text(
+            json.dumps({"report_source": "runtime", "implementation_narrative_valid": True}),
+            encoding="utf-8",
+        )
+        (mission_dir / "tool_call_adoption_probes.json").write_text(
+            json.dumps({"probes": []}),
+            encoding="utf-8",
+        )
+
+        old_cwd = os.getcwd()
+        try:
+            os.chdir(tmp)
+            transcript = SpawnedTranscript(mission_id, "test_model", "read_floor", time.time())
+            transcript.raw_messages = [
+                {"timestamp": 1, "event_type": "response.output_text.delta", "text": "[OSS progress] I found a declared read-only evidence floor.", "phase": "commentary"},
+                {"timestamp": 2, "event_type": "response.output_text.delta", "text": "[OSS progress] I inspected bridge.py, README.md, and codex_oss/read_evidence.py.", "phase": "commentary"},
+                {"timestamp": 3, "event_type": "response.output_text.delta", "text": "[OSS progress] The read floor is complete; finalizing from canonical evidence.", "phase": "commentary"},
+                {"timestamp": 4, "event_type": "response.output_text.delta", "text": "Final answer.", "phase": "final_answer"},
+            ]
+            transcript.load_artifacts()
+            transcript.extract_commentary()
+            result = transcript.evaluate_gold_ux()
+        finally:
+            os.chdir(old_cwd)
+
+    assert result["gold_pass"] is True, result
+    assert result["level"] == "gold", result
+    assert result["transcript_metadata"]["commentary_before_final"] == 3, result
+    _pass(name, "observed commentary reconciles to artifact event classes")
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Main
 # ═══════════════════════════════════════════════════════════════════════════
@@ -333,6 +497,7 @@ def main():
     test_contract_build_and_evaluate_bronze()
     test_contract_gold_requires_commentary()
     test_contract_platinum_requires_adoption()
+    test_desktop_gold_requires_consumer_observation_witness_not_hash_only()
 
     print("\n── CommentaryDeliveryV1 ──")
     test_commentary_delivery_lifecycle()
@@ -346,6 +511,8 @@ def main():
     test_transcript_looks_like_progress()
     test_transcript_artifact_loading()
     test_transcript_commentary_extraction()
+    test_transcript_gold_rejects_unobserved_artifact_commentary()
+    test_transcript_reconciles_observed_artifact_event_classes()
 
     print()
     print("=" * 70)

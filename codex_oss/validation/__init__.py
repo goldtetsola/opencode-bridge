@@ -336,6 +336,8 @@ def render_report(report: dict) -> str:
     missing = report.get("missing_fields", [])
     visible_commentary_path = report.get("visible_commentary_path", "")
     summary_path = report.get("summary_path", "")
+    commentary_delivery_path = report.get("commentary_delivery_path", "")
+    commentary_delivery_summary = report.get("commentary_delivery_summary") or {}
 
     parts = [
         "OSS_REPORT_BEGIN",
@@ -387,12 +389,22 @@ def render_report(report: dict) -> str:
         for c in caveats:
             parts.append(f"- {c}")
 
-    if visible_commentary_path or summary_path:
+    if visible_commentary_path or summary_path or commentary_delivery_path:
         parts.append("Visible work:")
         if visible_commentary_path:
             parts.append(f"- Trace: {visible_commentary_path}")
         if summary_path:
             parts.append(f"- Summary: {summary_path}")
+        if commentary_delivery_path:
+            parts.append(f"- Delivery: {commentary_delivery_path}")
+        if isinstance(commentary_delivery_summary, dict) and commentary_delivery_summary:
+            parts.append(
+                "- Delivery status: "
+                f"emitted={commentary_delivery_summary.get('sse_emitted', commentary_delivery_summary.get('emitted', 0))}, "
+                f"consumer_observed={commentary_delivery_summary.get('consumer_observed', 0)}, "
+                f"rendered_before_final={commentary_delivery_summary.get('rendered_before_final', commentary_delivery_summary.get('rendered', 0))}, "
+                f"failed={commentary_delivery_summary.get('failed', 0)}"
+            )
 
     if escalation:
         parts.append(f"Escalation:\n{escalation}")

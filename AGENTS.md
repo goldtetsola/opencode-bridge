@@ -2,13 +2,15 @@
 <!-- codex-oss:start -->
 ## OSS delegation
 
-Use OSS agents for bounded low/medium-risk work only. Use runtime-controlled OSS agents for normal A2/A3 read-only investigation and higher-assurance MissionV1 A4/A5 implementation. `oss_deepseek_pro` can perform bounded low-risk implementation when the handoff declares owned paths and verification.
+Use OSS agents for bounded low/medium-risk work only. Use runtime-controlled MissionV1 OSS agents for native-feeling A2/A3 read-only investigation and higher-assurance A4/A5 implementation. Raw direct OSS agents are support/research lanes only; they must not be treated as Codex Desktop-native candidates.
 
 For implementation work:
 - Prefer `oss_deepseek_implementer` with a MissionV1 A4/A5 handoff when you need runtime-owned patch control.
-- Use `oss_deepseek_pro` for native-style bounded implementation when the scope is low-risk, owned paths are explicit, and verification is clear.
+- Use `oss_deepseek_pro` only as a raw direct bounded implementation/drafting lane when the scope is low-risk, owned paths are explicit, and external verification is clear.
 - Runtime owns patch construction, apply, verification, rollback, and final status.
 - The model owns narrative, patch intent, and rationale only.
+- Native-feeling product claims require MissionV1 runtime authority. Raw direct agents (`oss_deepseek_pro`, `oss_kimi_rapid`, `oss_flash_support`) are `raw_research_only` for public claims and cannot certify Desktop-native behavior.
+- Desktop Gold requires `ConsumerObservationWitnessV1` from a raw Codex Desktop spawned-agent transcript with observed progress before final; bridge/runtime artifacts, transcript hashes, artifact-reconciled candidates, and terminal-only notifications are not Desktop-native proof.
 
 When spawning OSS agents, always use fork_turns: "none":
 - Full-history forks inherit GPT-5.5 model/reasoning, which conflicts with OSS agent overrides.

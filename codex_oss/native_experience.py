@@ -1,7 +1,8 @@
 """NativeExperienceContractV1 — end-to-end UX acceptance contract.
 
-A spawned OSS subagent is "native-like" only if all required dimensions pass.
-This contract is the product claim gate, not a collection of implemented components.
+A spawned OSS subagent is "native-like" only if all required dimensions pass
+for the declared consumer provenance. Bridge Gold and Desktop Gold are distinct
+claim scopes; RouteAuthorityV1 decides which one is allowed.
 """
 
 from __future__ import annotations
@@ -9,6 +10,9 @@ from __future__ import annotations
 import json
 import os
 from typing import Any
+
+from codex_oss.final_claim_gate import evaluate_final_claim_gate
+from codex_oss.route_authority import build_route_authority, route_allows_bridge_gold, route_allows_desktop_gold
 
 JSON = dict[str, Any]
 
@@ -27,6 +31,9 @@ def build_native_experience_contract(
     tool_loop: JSON | None = None,
     safety: JSON | None = None,
     artifacts: JSON | None = None,
+    route_authority: JSON | None = None,
+    consumer_observation_witness: JSON | None = None,
+    desktop_render_surface: JSON | None = None,
 ) -> JSON:
     """Build a NativeExperienceContractV1 for evaluation."""
 
@@ -71,6 +78,21 @@ def build_native_experience_contract(
             "canonical_evidence": True,
             "adoption_probes": True,
         },
+        "route_authority": route_authority or build_route_authority(
+            model_alias="",
+            consumer_kind="direct_bridge_harness",
+        ),
+        "consumer_observation_witness": consumer_observation_witness or {},
+        "desktop_render_surface": desktop_render_surface or {
+            "probe_required": True,
+            "probe_status": "unknown",
+            "claim_policy": {
+                "pass": "Desktop Gold claims allowed if observation gate passes",
+                "fail": "Desktop live-commentary claims disallowed",
+                "flaky": "Desktop live-commentary claims disallowed; best-effort only",
+                "unknown": "Desktop live-commentary claims disallowed",
+            },
+        },
     }
 
 
@@ -102,6 +124,17 @@ def evaluate_native_experience(
     """
 
     dims: JSON = {}
+    expected_artifacts = contract.get("artifacts", {}) if isinstance(contract.get("artifacts", {}), dict) else {}
+    route_authority = contract.get("route_authority", {}) if isinstance(contract.get("route_authority", {}), dict) else {}
+    consumer_observation_witness = contract.get("consumer_observation_witness", {}) if isinstance(contract.get("consumer_observation_witness", {}), dict) else {}
+    desktop_render_surface = contract.get("desktop_render_surface", {}) if isinstance(contract.get("desktop_render_surface", {}), dict) else {}
+    desktop_probe_status = str(desktop_render_surface.get("probe_status") or "unknown").lower()
+    desktop_probe_passed = desktop_probe_status == "pass"
+    artifact_flags = artifacts_exist or {}
+    required_artifacts_present = all(
+        not expected or bool(artifact_flags.get(name, False))
+        for name, expected in expected_artifacts.items()
+    )
 
     # ── Bronze: runtime-safe ──
     dims["bronze_runtime_safe"] = (
@@ -125,6 +158,8 @@ def evaluate_native_experience(
 
     dims["gold_visible_ux"] = (
         dims["silver_natural_report"]
+        and route_allows_bridge_gold(route_authority)
+        and required_artifacts_present
         and commentary_events_count >= min_events
         and required_classes.issubset(event_classes)
         and commentary_observed
@@ -134,9 +169,17 @@ def evaluate_native_experience(
     # ── Platinum: tool-loop parity ──
     dims["platinum_tool_loop"] = (
         dims["silver_natural_report"]
+        and required_artifacts_present
         and replay_loops == 0
         and not pending_after_final
         and adoption_recorded
+    )
+
+    dims["desktop_gold_provenance"] = (
+        dims["gold_visible_ux"]
+        and route_allows_desktop_gold(route_authority)
+        and desktop_probe_passed
+        and bool(consumer_observation_witness.get("ok"))
     )
 
     # Determine overall level
@@ -154,6 +197,16 @@ def evaluate_native_experience(
     # Identify failed dimensions
     failed = [name for name, ok in dims.items() if not ok]
     missing_evidence = _missing_evidence(dims, contract, artifacts_exist or {})
+    final_claim_gate = evaluate_final_claim_gate(
+        claim_type="desktop_gold" if route_allows_desktop_gold(route_authority) else "bridge_gold",
+        requested_status="GOLD" if dims["gold_visible_ux"] else level.upper(),
+        route_authority=route_authority,
+        mission_id=str(contract.get("mission_id", "") or ""),
+        pending_call_ids=[] if not pending_after_final else ["pending_after_final"],
+        recovery_used=bool(adoption_recorded),
+        consumer_observation_witness=consumer_observation_witness,
+        desktop_render_surface=desktop_render_surface,
+    )
 
     return {
         "schema_version": "native_experience_evaluation.v1",
@@ -164,6 +217,11 @@ def evaluate_native_experience(
         "silver_pass": dims["silver_natural_report"],
         "gold_pass": dims["gold_visible_ux"],
         "platinum_pass": dims["platinum_tool_loop"],
+        "desktop_gold_pass": dims["desktop_gold_provenance"],
+        "desktop_render_surface": desktop_render_surface,
+        "route_authority": route_authority,
+        "final_claim_gate": final_claim_gate,
+        "native_claim_scope": route_authority.get("native_claim_scope", "bridge_only") if isinstance(route_authority, dict) else "bridge_only",
         "dimensions": dims,
         "failed_dimensions": failed,
         "missing_evidence": missing_evidence,
@@ -185,6 +243,14 @@ def _missing_evidence(
         missing.append("commentary_not_observed_or_rendered_before_final")
     if not dims.get("platinum_tool_loop"):
         missing.append("tool_loop_parity_not_achieved")
+    route_authority = contract.get("route_authority", {}) if isinstance(contract.get("route_authority", {}), dict) else {}
+    consumer_observation_witness = contract.get("consumer_observation_witness", {}) if isinstance(contract.get("consumer_observation_witness", {}), dict) else {}
+    desktop_render_surface = contract.get("desktop_render_surface", {}) if isinstance(contract.get("desktop_render_surface", {}), dict) else {}
+    desktop_probe_status = str(desktop_render_surface.get("probe_status") or "unknown").lower()
+    if route_allows_desktop_gold(route_authority) and not consumer_observation_witness.get("ok"):
+        missing.append("desktop_consumer_observation_witness_missing_or_failed")
+    if route_allows_desktop_gold(route_authority) and desktop_probe_status != "pass":
+        missing.append(f"desktop_pre_final_text_probe_not_passed:{desktop_probe_status or 'unknown'}")
 
     expected_artifacts = contract.get("artifacts", {})
     for name, expected in expected_artifacts.items():

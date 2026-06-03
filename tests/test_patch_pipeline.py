@@ -24,6 +24,7 @@ from codex_oss.implementation import (
     run_implementation_mission,
     validate_patch_proposal,
 )
+from codex_oss.implementation import _proposal_from_model
 from codex_oss.audit import audit_mission
 from codex_oss.mission import InvalidHandoffError, _build_mission
 from codex_oss.visible_commentary import VisibleCommentarySink
@@ -550,6 +551,50 @@ def assert_patch_intent_uses_top_level_path_default():
         assert "+def test_top_level_path():" in patch["unified_diff"], patch
         result = validate_patch_proposal(patch, mission, root)
         assert result["status"] == "VALID", result
+    finally:
+        shutil.rmtree(root)
+
+
+def assert_patch_intent_repair_prompt_names_path_invariant_for_create_file():
+    root, _ = make_project()
+    try:
+        mission = implementation_mission(
+            owned_paths=["tests/test_new.py"],
+            allowed_paths=["tests/test_new.py"],
+            read_only_paths=[],
+            max_files_changed=1,
+        )
+        calls = []
+
+        def fake_model(messages, tools, timeout):
+            prompt = messages[-1]["content"]
+            calls.append(prompt)
+            if len(calls) == 1:
+                return {"choices": [{"message": {"content": json.dumps({
+                    "patch_intent_version": "1.0",
+                    "summary": "Create missing test file without path.",
+                    "edits": [{"operation": "create_file", "content": "def test_created():\n    assert True\n"}],
+                    "risk_assessment": {},
+                    "verification_plan": [],
+                    "evidence_refs": [],
+                    "caveats": [],
+                })}}]}
+            return {"choices": [{"message": {"content": json.dumps({
+                "patch_intent_version": "1.0",
+                "summary": "Create missing test file with path.",
+                "edits": [{"operation": "create_file", "path": "tests/test_new.py", "content": "def test_created():\n    assert True\n"}],
+                "risk_assessment": {},
+                "verification_plan": [],
+                "evidence_refs": [],
+                "caveats": [],
+            })}}]}
+
+        proposal, error = _proposal_from_model(mission, fake_model, 60, root)
+        assert error is None, error
+        assert proposal["changed_files"][0]["path"] == "tests/test_new.py", proposal
+        assert len(calls) == 2, calls
+        assert "Path invariant: every edit object must include path" in calls[1], calls[1]
+        assert "For create_file, the target file path is still required" in calls[1], calls[1]
     finally:
         shutil.rmtree(root)
 
@@ -1687,6 +1732,7 @@ def main():
     assert_patch_intent_supports_replace_and_create_file()
     assert_patch_intent_normalizes_common_model_aliases()
     assert_patch_intent_uses_top_level_path_default()
+    assert_patch_intent_repair_prompt_names_path_invariant_for_create_file()
     assert_patch_intent_infers_append_when_operation_missing()
     assert_patch_intent_noop_gets_targeted_repair()
     assert_malformed_desired_state_gets_targeted_repair()
