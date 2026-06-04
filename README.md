@@ -613,12 +613,18 @@ pre-final assistant text without depending on the spawned-child renderer:
 
 ```bash
 bin/codex-oss app-server-pre-final-text-probe --json
+bin/codex-oss app-server-visible-commentary-probe --json
 ```
 
 If this returns `probe_status: pass`, app-server can be used as an owned
 native-feeling progress surface. That does not by itself prove the existing
 Desktop spawned-child view renders pre-final text; it proves a separate Codex
 event channel can.
+
+Use `app-server-pre-final-text-probe` to test the bare app-server text channel.
+Use `app-server-visible-commentary-probe` to test the real product path:
+runtime `VisibleCommentaryV1` events rendered as app-server agent-message
+deltas before the final marker.
 
 Codex Desktop or the multi-agent consumer should feed the child Responses SSE
 through the Desktop consumer adapter:

@@ -370,6 +370,17 @@ def main():
     app_server_probe.add_argument("--output", default=".codex-oss/app_server_pre_final_text_probe_result.json")
     app_server_probe.add_argument("--json", action="store_true", help="Machine-readable output")
 
+    app_server_commentary_probe = sub.add_parser(
+        "app-server-visible-commentary-probe",
+        help="Probe Codex app-server delivery of runtime visible commentary events",
+    )
+    app_server_commentary_probe.add_argument("--cwd", default=".", help="Working directory for the app-server thread")
+    app_server_commentary_probe.add_argument("--port", type=int, default=0, help="Fake provider port; 0 chooses a free port")
+    app_server_commentary_probe.add_argument("--delay", type=float, default=0.25, help="Seconds between fake provider text deltas")
+    app_server_commentary_probe.add_argument("--timeout", type=float, default=8.0, help="Seconds to wait for app-server deltas")
+    app_server_commentary_probe.add_argument("--output", default=".codex-oss/app_server_visible_commentary_probe_result.json")
+    app_server_commentary_probe.add_argument("--json", action="store_true", help="Machine-readable output")
+
     # up — foreground supervisor
     up = sub.add_parser("up", help="Start bridge with foreground supervisor (keep terminal open)")
     up.add_argument("--port", type=int, default=4000)
@@ -755,6 +766,8 @@ def main():
 
     elif args.command == "app-server-pre-final-text-probe":
         sys.exit(_app_server_pre_final_text_probe(args))
+    elif args.command == "app-server-visible-commentary-probe":
+        sys.exit(_app_server_visible_commentary_probe(args))
 
     elif args.command == "up":
         sys.exit(_supervise(args.port, daemon=args.daemon, foreground=args.foreground, allow_missing_upstream=bool(args.allow_missing_upstream)))
@@ -1002,6 +1015,33 @@ def _app_server_pre_final_text_probe(args) -> int:
         print(f"  output: {output}")
         print(f"  item/agentMessage/delta: {str(bool(result.get('observed_agent_message_delta'))).lower()}")
         print(f"  progress before final: {str(bool(result.get('observed_progress_before_final'))).lower()}")
+    return 0 if result.get("probe_status") == "pass" else 1
+
+
+def _app_server_visible_commentary_probe(args) -> int:
+    from pathlib import Path
+
+    from codex_oss.app_server_probe import (
+        run_app_server_visible_commentary_probe,
+        write_app_server_probe_result,
+    )
+
+    result = run_app_server_visible_commentary_probe(
+        cwd=Path(args.cwd).resolve(),
+        port=args.port,
+        delay_seconds=args.delay,
+        timeout_seconds=args.timeout,
+    )
+    output = write_app_server_probe_result(result, args.output)
+    result["path"] = str(output)
+    if args.json:
+        print(json_dumps_safe(result))
+    else:
+        print(f"App-server visible commentary probe: {result.get('probe_status')}")
+        print(f"  output: {output}")
+        print(f"  item/agentMessage/delta: {str(bool(result.get('observed_agent_message_delta'))).lower()}")
+        print(f"  commentary before final: {str(bool(result.get('observed_commentary_before_final'))).lower()}")
+        print(f"  commentary events: {result.get('commentary_events_count')}")
     return 0 if result.get("probe_status") == "pass" else 1
 
 

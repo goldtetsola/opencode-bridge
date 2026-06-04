@@ -833,10 +833,14 @@ Implementation update:
 
 - Added `codex_oss/app_server_probe.py`.
 - Added `bin/codex-oss app-server-pre-final-text-probe`.
+- Added `bin/codex-oss app-server-visible-commentary-probe`.
 - The probe launches a fake Responses provider and a local `codex app-server`
   stdio session, then starts a thread/turn against the fake provider.
 - The probe records whether app-server emits `item/agentMessage/delta` before
   the final marker.
+- The visible-commentary probe builds real `VisibleCommentaryV1` runtime events
+  first, renders those public events as assistant text, then verifies that
+  app-server delivers them before final output.
 
 Empirical result:
 
@@ -848,10 +852,25 @@ observed_progress_before_final: true
 delta_text: PROGRESS_ONE / PROGRESS_TWO / PROGRESS_THREE / FINAL_DONE
 ```
 
+Follow-up empirical result:
+
+```text
+surface: codex_app_server
+schema_version: app_server_visible_commentary_probe_result.v1
+probe_status: pass
+commentary_events_count: 4
+observed_agent_message_delta: true
+observed_commentary_before_final: true
+delta_text: [PLAN] Mission accepted / [NARROW] Inspecting required source /
+            [VERIFY] Coverage updated / [REPORT] Mission completed /
+            FINAL_RUNTIME_REPORT_READY
+```
+
 Artifact:
 
 ```text
 .codex-oss/app_server_pre_final_text_probe_result.json
+.codex-oss/app_server_visible_commentary_probe_result.json
 ```
 
 Architectural conclusion:
@@ -876,6 +895,7 @@ Fresh verification:
 
 ```bash
 bin/codex-oss app-server-pre-final-text-probe --json
+bin/codex-oss app-server-visible-commentary-probe --json
 PYTHONPATH=. python3 tests/test_app_server_probe.py
 python3 -m py_compile codex_oss/app_server_probe.py codex_oss/desktop_pre_final_text_probe.py codex_oss/cli.py
 ```
