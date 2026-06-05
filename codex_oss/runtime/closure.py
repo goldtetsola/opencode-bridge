@@ -80,6 +80,73 @@ def _ledger_commands(ledger: Any) -> list[JSON]:
     return commands
 
 
+def _canonical_claim_text(raw: Any) -> str:
+    text = str(raw or "").strip()
+    prefix = "Evidence gathered while testing hypothesis:"
+    if text.startswith(prefix):
+        text = text[len(prefix):].strip()
+    return text[:500]
+
+
+def _looks_like_deliverable_label(text: str) -> bool:
+    normalized = str(text or "").strip()
+    if not normalized:
+        return True
+    if normalized.startswith("Answered obligation:"):
+        normalized = normalized[len("Answered obligation:"):].strip()
+    if normalized.startswith("Provide ") and len(normalized.split()) <= 8:
+        return True
+    return False
+
+
+def _claim_graph_findings(ledger: Any) -> list[JSON]:
+    raw_claims = list(((getattr(ledger, "claim_graph", {}) or {}).get("claims", []) or []))
+    raw_claims.extend(list(getattr(ledger, "claims", []) or []))
+    findings: list[JSON] = []
+    seen: set[tuple[str, tuple[str, ...]]] = set()
+    for claim in raw_claims:
+        if not isinstance(claim, dict):
+            continue
+        text = _canonical_claim_text(claim.get("text") or claim.get("claim"))
+        if _looks_like_deliverable_label(text):
+            continue
+        refs = [str(ref) for ref in (claim.get("evidence_refs", []) or []) if str(ref)]
+        if not refs:
+            continue
+        status = str(claim.get("status", "") or "").lower()
+        if status and status not in {"supported", "weak", "unverified"}:
+            continue
+        key = (text, tuple(refs[:4]))
+        if key in seen:
+            continue
+        seen.add(key)
+        findings.append({
+            "finding_id": f"finding_{len(findings) + 1:03d}",
+            "claim_id": str(claim.get("claim_id", "") or ""),
+            "claim": text,
+            "evidence_refs": refs[:4],
+            "confidence": str(claim.get("confidence", "LOW") or "LOW"),
+        })
+    return findings
+
+
+def _obligation_findings(answered: list[JSON], evidence_status: str) -> list[JSON]:
+    findings: list[JSON] = []
+    for o in answered:
+        refs = [str(ref) for ref in (o.get("evidence_refs", []) or []) if str(ref)][:4]
+        claim = str(o.get("question", "") or f"Obligation {len(findings) + 1}")[:200]
+        if _looks_like_deliverable_label(claim) and refs:
+            continue
+        findings.append({
+            "finding_id": f"finding_{len(findings) + 1:03d}",
+            "obligation_id": str(o.get("id", "") or ""),
+            "claim": claim,
+            "evidence_refs": refs,
+            "confidence": evidence_status,
+        })
+    return findings
+
+
 def build_completion_seed_report(
     mission: Any,
     answer_graph: JSON,
@@ -140,16 +207,9 @@ def build_canonical_answer(
     )
     answered = [o for o in obligations if o.get("status") == "answered"]
 
-    required_findings = []
-    for i, o in enumerate(answered):
-        refs = list(o.get("evidence_refs", []) or [])[:4]
-        required_findings.append({
-            "finding_id": f"finding_{i + 1:03d}",
-            "obligation_id": str(o.get("id", "") or ""),
-            "claim": str(o.get("question", "") or f"Obligation {i + 1}")[:200],
-            "evidence_refs": refs,
-            "confidence": envelope.get("evidence_status", "SUFFICIENT"),
-        })
+    claim_findings = _claim_graph_findings(ledger)
+    obligation_findings = _obligation_findings(answered, str(envelope.get("evidence_status", "SUFFICIENT") or "SUFFICIENT"))
+    required_findings = claim_findings or obligation_findings
 
     missing_sources = sufficiency.get("missing_required_sources", []) or []
     contradicted = sufficiency.get("contradicted_obligations", []) or []
@@ -187,6 +247,14 @@ def build_canonical_answer(
             "reason_codes": sufficiency.get("reason_code", ""),
         },
         "required_findings": required_findings,
+        "answered_obligations": [
+            {
+                "id": str(o.get("id", "") or ""),
+                "question": str(o.get("question", "") or ""),
+                "evidence_refs": [str(ref) for ref in (o.get("evidence_refs", []) or []) if str(ref)][:4],
+            }
+            for o in answered
+        ],
         "files_inspected": _ledger_files(ledger),
         "commands_run": _ledger_commands(ledger),
         "required_caveats": required_caveats,
@@ -273,7 +341,7 @@ def build_closer_draft_prompt(skeleton: JSON, *, max_chars: int = 5000) -> str:
 
 def merge_draft_into_report(canonical_answer: JSON, draft: JSON) -> JSON:
     """Merge a CloserDraftV1 into the canonical answer to produce the final report."""
-    finding_narratives = draft.get("finding_narratives", []) or []
+    finding_narratives = _narrative_list(draft.get("finding_narratives", []) or [])
 
     def _finding_text(index: int, fallback: str) -> str:
         if index >= len(finding_narratives):
@@ -285,6 +353,24 @@ def merge_draft_into_report(canonical_answer: JSON, draft: JSON) -> JSON:
             return item[:500]
         return fallback
 
+    def _required_finding(item: Any, index: int) -> JSON:
+        if isinstance(item, dict):
+            claim = str(item.get("claim") or item.get("question") or item.get("id") or f"Finding {index + 1}")[:500]
+            refs = item.get("evidence_refs", [])
+            if not isinstance(refs, list):
+                refs = []
+            finding = {"claim": claim, "evidence_refs": list(refs)}
+            narrative = _finding_text(index, claim)
+            if narrative and narrative != claim:
+                finding["narrative"] = narrative
+            return finding
+        claim = str(item or f"Finding {index + 1}")[:500]
+        finding = {"claim": claim, "evidence_refs": []}
+        narrative = _finding_text(index, claim)
+        if narrative and narrative != claim:
+            finding["narrative"] = narrative
+        return finding
+
     report = {
         "oss_report_version": "1.0",
         "mission_id": canonical_answer.get("mission_id", ""),
@@ -295,10 +381,7 @@ def merge_draft_into_report(canonical_answer: JSON, draft: JSON) -> JSON:
         "files_inspected": list(canonical_answer.get("files_inspected", []) or []),
         "commands_run": list(canonical_answer.get("commands_run", []) or []),
         "findings": [
-            {
-                "claim": _finding_text(i, f["claim"]),
-                "evidence_refs": f["evidence_refs"],
-            }
+            _required_finding(f, i)
             for i, f in enumerate(canonical_answer.get("required_findings", []) or [])
         ],
         "caveats": list(canonical_answer.get("required_caveats", []) or []),
@@ -314,6 +397,19 @@ def merge_draft_into_report(canonical_answer: JSON, draft: JSON) -> JSON:
     # Also include the canonical answer in the report for audit
     report["canonical_answer"] = canonical_answer
     return report
+
+
+def _narrative_list(value: Any) -> list[Any]:
+    if isinstance(value, list):
+        return value
+    if isinstance(value, dict):
+        def _sort_key(item: tuple[Any, Any]) -> tuple[int, str]:
+            key = str(item[0])
+            digits = "".join(ch for ch in key if ch.isdigit())
+            return (int(digits) if digits else 10_000, key)
+
+        return [item for _, item in sorted(value.items(), key=_sort_key)]
+    return []
 
 
 class NarrationAccumulator:

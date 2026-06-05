@@ -26,6 +26,8 @@ from codex_oss.semantic_review import build_semantic_review_report
 from codex_oss.runtime import resolve_path
 from codex_oss.runtime.loop import _extract_model_text
 from codex_oss.runtime.policy import is_critical_path, scan_secrets
+from codex_oss.native_certification import classify_implementation_status
+from codex_oss.native_work_ux import native_work_contract_text
 
 from codex_oss.read_evidence import (
     build_canonical_patch_evidence,
@@ -69,6 +71,7 @@ def run_implementation_mission(
 ) -> JSON:
     """Run A4/A5 patch-mediated implementation without raw write tools."""
     mission.runtime_model_alias = raw_model_alias
+    mission.runtime_handoff_raw = handoff
     mission.model_repair_count = 0
     artifact_dir = os.path.join(
         project_root,
@@ -81,9 +84,10 @@ def run_implementation_mission(
         commentary,
         "mission_started",
         "Implementation mission accepted",
-        "I'm compiling this as a runtime-controlled implementation mission. The model may propose intent, but the runtime owns patch validation, apply, verification, and final status.",
+        native_work_contract_text(mission),
         phase="PLAN",
         source="runtime",
+        metadata={"ux_shape": "native_work_contract.v1"},
     )
     append_decision(
         mission,
@@ -343,6 +347,7 @@ def render_implementation_report(mission: Any, report: JSON) -> str:
         f"Mission: {mission.mission_id}",
         f"Tier: {mission.tier}",
         f"Status: {report.get('status', 'FAILED')}",
+        f"Implementation status: {report.get('implementation_status', 'not_applicable')}",
         f"Changed files: {', '.join(changed) if changed else 'none'}",
         f"Patch artifact: {report.get('patch_artifact', '')}",
         f"Report artifact: {report.get('report_artifact', '')}",
@@ -378,6 +383,7 @@ def render_implementation_report(mission: Any, report: JSON) -> str:
     else:
         compact = {
             "status": report.get("status", "FAILED"),
+            "implementation_status": report.get("implementation_status", "not_applicable"),
             "changed_files": changed,
             "main_workspace_mutated": bool(report.get("main_workspace_mutated", False)),
             "runtime_built_diff": bool(report.get("runtime_built_diff", False)),
@@ -593,6 +599,11 @@ def _persist_implementation_runtime_artifacts(
     report: JSON,
     certification: JSON | None = None,
 ) -> None:
+    from codex_oss.mission_authority_artifacts import (
+        write_adoption_or_recovery,
+        write_canonical_evidence_artifacts,
+    )
+
     _write_json(os.path.join(artifact_dir, "patch_proposal.json"), proposal)
     model_narrative = report.get("model_narrative") if isinstance(report.get("model_narrative"), dict) else validation.get("model_narrative")
     if isinstance(model_narrative, dict):
@@ -610,6 +621,16 @@ def _persist_implementation_runtime_artifacts(
     canonical_patch = report.get("canonical_patch_evidence")
     if isinstance(canonical_patch, dict):
         _write_json(os.path.join(artifact_dir, "canonical_patch_evidence.json"), canonical_patch)
+    write_canonical_evidence_artifacts(
+        artifact_dir=artifact_dir,
+        mission_id=str(getattr(mission, "mission_id", "mission_unknown")),
+        task_class="implementation",
+        answer_graph={},
+        coverage_graph=validation.get("implementation_coverage_graph") if isinstance(validation.get("implementation_coverage_graph"), dict) else {},
+        claim_graph={},
+        ledger_payload={},
+        report=report,
+    )
     impl_narrative = report.get("implementation_narrative")
     if isinstance(impl_narrative, dict):
         _write_json(os.path.join(artifact_dir, "implementation_narrative.json"), impl_narrative)
@@ -617,6 +638,14 @@ def _persist_implementation_runtime_artifacts(
     if not os.path.exists(adoption_path):
         from codex_oss.tool_call_adoption import persist_adoption_probes
         persist_adoption_probes(artifact_dir, [], None)
+    if not os.path.exists(os.path.join(artifact_dir, "adoption_or_recovery.json")):
+        write_adoption_or_recovery(
+            artifact_dir=artifact_dir,
+            mission_id=str(getattr(mission, "mission_id", "mission_unknown")),
+            route_class="implementation",
+            pending_tool_calls_emitted=0,
+            runtime_recovery_used=False,
+        )
     readiness_graph = validation.get("implementation_readiness_graph")
     if isinstance(readiness_graph, dict):
         _write_json(os.path.join(artifact_dir, "implementation_readiness_graph.json"), readiness_graph)
@@ -3201,10 +3230,29 @@ def _implementation_report(
         changed_owned_paths=list(changed),
         artifact_paths=[path for path in (patch_path, rollback_path) if path],
     )
+    implementation_status_detail = classify_implementation_status({
+        "status": status,
+        "verification": verification,
+        "rollback": {
+            "available": bool(patch_path),
+            "artifact": rollback_path,
+            "method": "git apply -R rollback.diff",
+        },
+        "implementation_authority": authority,
+        "workspace_policy": workspace_policy,
+        "validation": validation,
+        "canonical_patch_evidence": canonical_patch,
+        "main_workspace_mutated": bool(main_workspace_mutated),
+        "patch_artifact": patch_path,
+        "runtime_built_diff": runtime_built_diff,
+        "execution_mode": execution_mode or getattr(mission, "apply_mode", ""),
+    })
 
     return {
         "implementation_report_version": "1.0",
         "status": status,
+        "implementation_status": implementation_status_detail.get("status", "not_applicable"),
+        "implementation_status_detail": implementation_status_detail,
         "report_source": "runtime",
         "closure_source": "runtime_patch_authority_model_narrative" if model_narrative.get("accepted") else "runtime_patch_authority",
         "explorer_model": getattr(mission, "last_reasoning_model", ""),
@@ -3286,6 +3334,8 @@ def _write_text(path: str, text: str) -> None:
 
 
 def _write_mission_artifact(mission: Any, project_root: str) -> None:
+    from codex_oss.mission_authority_artifacts import write_mission_authority_artifacts
+
     mission_id = str(getattr(mission, "mission_id", "mission_unknown"))
     artifact_dir = os.path.join(project_root, ".codex-oss", "missions", mission_id)
     os.makedirs(artifact_dir, exist_ok=True)
@@ -3302,6 +3352,16 @@ def _write_mission_artifact(mission: Any, project_root: str) -> None:
         "objective_spec": dict(getattr(mission, "objective_spec", {}) or {}) if isinstance(getattr(mission, "objective_spec", None), dict) else None,
     }
     _write_json(os.path.join(artifact_dir, "mission.json"), payload)
+    write_mission_authority_artifacts(
+        artifact_dir=artifact_dir,
+        mission=mission,
+        summary_payload=payload,
+        validation={
+            "tier": getattr(mission, "tier", ""),
+            "mode": getattr(mission, "mode", ""),
+            "runtime_model_alias": getattr(mission, "runtime_model_alias", ""),
+        },
+    )
 
 
 def _minimal_env() -> dict:

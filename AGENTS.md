@@ -16,16 +16,67 @@ When spawning OSS agents, always use fork_turns: "none":
 - Full-history forks inherit GPT-5.5 model/reasoning, which conflicts with OSS agent overrides.
 - OSS agents use different model providers and must not inherit the parent session.
 
-### Handoff template
+### Handoff templates
 
 Spawn <oss_agent> with fork_turns: "none".
 
-Include a machine-readable handoff block before prose. The bridge validates this before trusting task routing:
+For Codex Desktop runtime-controlled OSS roles (`oss_kimi_investigator`, `oss_deepseek_investigator`, `oss_flash_context`, `oss_deepseek_implementer`), send a native human-readable task contract to the child. The bridge synthesizes and validates MissionV1 internally; do not expose `OSS_HANDOFF_JSON` to the child unless you are intentionally testing the raw handoff parser:
 
-OSS_HANDOFF_JSON:
-{"schema_version":1,"role":"<worker role>","goal":"<concrete sub-task>","task_type":"scout|review|docs_support|bounded_write|implementation","owned_paths":[],"read_only_paths":["<files or dirs>"],"forbidden_actions":["<paths or operations>"],"verification_steps":["<checks>"],"deliverable_fields":["files inspected","confidence","caveats","escalation recommendation"],"completion_rule":"stop after the requested deliverable","escalation_rule":"stop if scope or critical-path risk appears"}
+```
+ROLE: <worker role>.
+MISSION ID: <stable mission id>
+GOAL: <concrete sub-task>.
+TASK TYPE: scout|review|docs_support|bounded_write|implementation.
+OWNED PATHS: <paths or none>.
+READ-ONLY PATHS: <files or dirs>.
+DO NOT TOUCH: <paths or operations>.
+VERIFICATION STEPS: <checks>.
+DELIVERABLE: <fields>.
+COMPLETION RULE: Clear result only.
+ESCALATION RULE: Stop if scope or critical-path risk appears.
+```
 
-After the JSON block, add any human-readable context needed for the worker. For reusable or high-stakes handoffs, validate the draft first with `codex-oss validate-handoff /path/to/handoff.md`.
+For compiled handoff files, CLI validation, or raw parser tests, use a canonical MissionV1 machine-readable handoff block before prose. Prefer generating it with `codex-oss mission compile --handoff`; the bridge validates this before trusting task routing:
+
+<OSS_HANDOFF_JSON>
+{
+  "schema_version": "oss_agent_mission.v1",
+  "mission_id": "<stable mission id>",
+  "tier": "A3",
+  "mode": "managed_investigation",
+  "objective": "<concrete sub-task>",
+  "risk_tier": "low",
+  "write_allowed": false,
+  "allowed_roots": [],
+  "allowed_paths": ["<files or dirs>"],
+  "read_only_paths": ["<files or dirs>"],
+  "owned_paths": [],
+  "forbidden_roots": [],
+  "allowed_tool_classes": ["read", "search", "list", "safe_git"],
+  "tool_budget": 10,
+  "time_budget_seconds": 90,
+  "objective_style": "open_investigation",
+  "answer_obligations": [
+    {"id": "files", "question": "Which files were inspected?"},
+    {"id": "evidence", "question": "What evidence supports the answer?"},
+    {"id": "caveats", "question": "What uncertainty remains?"}
+  ],
+  "required_outputs": [
+    "files_inspected",
+    "commands_run",
+    "findings",
+    "uncertainties",
+    "confidence",
+    "caveats",
+    "escalation_recommendation"
+  ],
+  "must_inspect": ["<primary file or dir>"],
+  "evidence_collection_mode": "agenda_guided",
+  "stop_conditions": ["valid_report", "budget_exhausted", "deadline_reached"]
+}
+</OSS_HANDOFF_JSON>
+
+After the JSON block, add any human-readable context needed for the worker. For reusable or high-stakes handoffs, validate the draft first with `codex-oss validate-mission-handoff /path/to/handoff.md`.
 
 ### Critical paths (never route to OSS)
 - Authentication, authorization, session management

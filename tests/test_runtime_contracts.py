@@ -18,7 +18,12 @@ sys.path.insert(0, ROOT)
 from codex_oss.ledger import EvidenceLedger
 from codex_oss.health import build_health_status
 from codex_oss.audit import audit_mission
-from codex_oss.managed_bridge import extract_handoff_from_body, run_managed_mission_from_body, should_handle_managed_mission_body
+from codex_oss.managed_bridge import (
+    _reconcile_readonly_runtime_entitlement,
+    extract_handoff_from_body,
+    run_managed_mission_from_body,
+    should_handle_managed_mission_body,
+)
 from codex_oss.mission import InvalidHandoffError, _build_mission, parse_mission_v1
 from codex_oss.runtime import ToolResult, resolve_path
 from codex_oss.runtime.loop import (
@@ -154,7 +159,8 @@ def assert_deterministic_fast_path_handles_single_file_function_location_without
     )
     assert result.handled, result
     assert result.status == "COMPLETE", result
-    assert "deterministic_fast_path" in result.report_text, result.report_text
+    assert "Outcome" in result.report_text, result.report_text
+    assert "OSS_REPORT_BEGIN" not in result.report_text, result.report_text
     assert "certify_project" in result.report_text, result.report_text
 
 
@@ -406,7 +412,8 @@ def assert_managed_bridge_returns_terminal_report_on_runtime_error():
     )
     assert result.handled, result
     assert result.status == "PARTIAL", result
-    assert "OSS_REPORT_BEGIN" in result.report_text, result.report_text
+    assert "Outcome" in result.report_text, result.report_text
+    assert "OSS_REPORT_BEGIN" not in result.report_text, result.report_text
     assert "model_call_failed" in result.report_text, result.report_text
 
     invalid = {
@@ -466,8 +473,52 @@ def assert_runtime_model_alias_requires_mission_and_maps_reasoning_model():
     )
     assert missing.handled, missing
     assert missing.status == "FAILED", missing
-    assert "requires exactly one OSS_HANDOFF_JSON MissionV1" in missing.report_text, missing.report_text
+    assert "MissionV1 handoff or native task contract" in missing.report_text, missing.report_text
     assert calls == [], calls
+
+    native_contract = run_managed_mission_from_body(
+        {
+            "input": [
+                {
+                    "role": "developer",
+                    "content": (
+                        "Project instructions include a reusable example:\n"
+                        "<OSS_HANDOFF_JSON>\n"
+                        '{"schema_version":"oss_agent_mission.v1","mission_id":"<stable mission id>",'
+                        '"tier":"A3","mode":"managed_investigation","objective":"<concrete sub-task>",'
+                        '"risk_tier":"low","write_allowed":false,"allowed_roots":[],'
+                        '"allowed_paths":["<files or dirs>"],"read_only_paths":["<files or dirs>"],'
+                        '"owned_paths":[],"forbidden_roots":[],"allowed_tool_classes":["read"],'
+                        '"tool_budget":10,"time_budget_seconds":90,"stop_conditions":["valid_report"]}'
+                        "\n</OSS_HANDOFF_JSON>"
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        "ROLE: Read-only OSS investigator.\n"
+                        "GOAL: Inspect README.md and report one evidence-backed fact.\n"
+                        "TASK TYPE: review.\n"
+                        "OWNED PATHS: none.\n"
+                        "READ-ONLY PATHS: README.md.\n"
+                        "DO NOT TOUCH: No code edits. Do not print secrets.\n"
+                        "DELIVERABLE: files inspected, evidence, caveats.\n"
+                        "COMPLETION RULE: Clear result only.\n"
+                    ),
+                }
+            ]
+        },
+        "mission-a3-kimi",
+        lambda *args, **kwargs: None,
+        call_payload,
+        lambda model: {"ocg-kimi-k2.6": "kimi-k2.6"}[model],
+        request_deadline=30,
+    )
+    assert native_contract.handled, native_contract
+    assert native_contract.status == "PARTIAL", native_contract
+    assert "Outcome" in native_contract.report_text, native_contract.report_text
+    assert "OSS_REPORT_BEGIN" not in native_contract.report_text, native_contract.report_text
+    assert calls[-1]["model"] == "kimi-k2.6", calls[-1]
 
     body = {
         "input": [
@@ -650,8 +701,10 @@ def assert_readonly_mission_writes_artifact_bundle():
         assert report_json["summary_path"].endswith("/summary.md"), report_json
         assert report_json["commentary_delivery_path"].endswith("/commentary_delivery.json"), report_json
         assert report_json["commentary_delivery_summary"]["sse_emitted"] >= 1, report_json
-        assert "Visible work:" in result.report_text, result.report_text
-        assert "Delivery status:" in result.report_text, result.report_text
+        assert "Outcome" in result.report_text, result.report_text
+        assert "Verification" in result.report_text, result.report_text
+        assert "Visible work:" not in result.report_text, result.report_text
+        assert "Delivery status:" not in result.report_text, result.report_text
         with open(os.path.join(artifact_dir, "trace_grading.json"), encoding="utf-8") as handle:
             grading = json.load(handle)
         assert "productive_exploration" in grading["labels"], grading
@@ -659,6 +712,10 @@ def assert_readonly_mission_writes_artifact_bundle():
             visible_events = [json.loads(line) for line in handle if line.strip()]
         assert visible_events, visible_events
         assert visible_events[0]["event_type"] == "mission_started", visible_events
+        assert visible_events[0]["metadata"]["ux_shape"] == "native_work_contract.v1", visible_events[0]
+        assert "ROLE: OSS investigation subagent." in visible_events[0]["message"], visible_events[0]
+        assert "GOAL: Inspect one file and report." in visible_events[0]["message"], visible_events[0]
+        assert "READ-ONLY PATHS: notes/example.txt." in visible_events[0]["message"], visible_events[0]
         assert visible_events[-1]["event_type"] == "mission_completed", visible_events
         assert all(event.get("safe_for_user") is True for event in visible_events), visible_events
         assert [event["event_type"] for event in live_events] == [event["event_type"] for event in visible_events], live_events
@@ -1546,7 +1603,7 @@ def assert_duplicate_full_read_returns_cached_extracts_and_requests_report():
         assert ledger.action_trace[1].runtime_decision == "redirected", ledger.action_trace[1]
         assert "Cached extracts" in calls[-1], calls
         assert "Return exactly one final_report" in calls[-1], calls
-        assert max(duplicate_read_timeouts[2:]) <= 20, duplicate_read_timeouts
+        assert max(duplicate_read_timeouts[2:]) <= 75, duplicate_read_timeouts
     finally:
         try:
             os.unlink(fixture_path)
@@ -1904,6 +1961,72 @@ def assert_definition_claims_require_definition_shaped_evidence():
     assert "definition assignment" in " ".join(validation.errors), validation.errors
 
 
+def assert_markdown_filename_contains_claim_does_not_require_definition_assignment():
+    path = "AGENTS.md"
+    ledger = EvidenceLedger(mission_id="mission_runtime_test", tool_budget_remaining=1)
+    result = ToolResult(
+        tool="rtk_read",
+        args={"path": path},
+        stdout="## OSS delegation\nUse OSS agents for bounded low/medium-risk work only.\n",
+        stderr="",
+        exit_code=0,
+        complete=True,
+    )
+    ledger.add_file(path, result, 0)
+    report = {
+        "oss_report_version": "1.0",
+        "mission_id": "mission_runtime_test",
+        "status": "COMPLETE",
+        "confidence": "LOW",
+        "files_inspected": [{"path": path, "complete": True}],
+        "commands_run": [],
+        "findings": [
+            {
+                "claim": "AGENTS.md contains OSS delegation instructions.",
+                "evidence_refs": [f"file:{path}#extract:1"],
+                "confidence": "LOW",
+            }
+        ],
+        "uncertainties": [],
+        "caveats": [],
+        "escalation_recommendation": "No escalation required",
+        "missing_fields": [],
+    }
+
+    validation = validate_report(report, ledger)
+    assert validation.is_valid is True, validation.errors
+
+
+def assert_generic_objective_synthesizes_source_fact_from_markdown_evidence():
+    path = "AGENTS.md"
+    m = mission(
+        mission_id="mission_generic_doc_fact",
+        objective="Inspect AGENTS.md for one concrete fact about OSS delegation UX.",
+        objective_style="open_investigation",
+        allowed_paths=[path],
+    )
+    ledger = EvidenceLedger(mission_id=m.mission_id, tool_budget_remaining=1)
+    result = ToolResult(
+        tool="rtk_read",
+        args={"path": path},
+        stdout=(
+            "## OSS delegation\n"
+            "Use OSS agents for bounded low/medium-risk work only.\n"
+            "Desktop Gold requires ConsumerObservationWitnessV1 from a raw Codex Desktop spawned-agent transcript with observed progress before final.\n"
+        ),
+        stderr="",
+        exit_code=0,
+        complete=True,
+    )
+    ledger.add_file(path, result, 0)
+
+    finding = synthesize_objective_finding(m, ledger)
+    assert finding, "generic markdown evidence should synthesize a source-backed finding"
+    assert finding["claim"].startswith("AGENTS.md says:"), finding
+    assert "OSS agents" in finding["claim"] or "Desktop Gold" in finding["claim"], finding
+    assert finding["evidence_refs"] == ["file:AGENTS.md#extract:1"], finding
+
+
 def assert_definition_claims_can_be_supported_by_command_evidence():
     ledger = EvidenceLedger(mission_id="mission_runtime_test", tool_budget_remaining=1)
     command_result = ToolResult(
@@ -2238,6 +2361,117 @@ def assert_mission_accepts_explicit_objective_spec_and_strict_mode():
         raise AssertionError("unknown objective_spec type should fail closed")
 
 
+def assert_placeholder_mission_examples_do_not_shadow_active_handoff():
+    from codex_oss.mission import extract_mission_v1_block
+
+    template = {
+        "schema_version": "oss_agent_mission.v1",
+        "mission_id": "<stable mission id>",
+        "tier": "A3",
+        "mode": "managed_investigation",
+        "objective": "<concrete sub-task>",
+        "risk_tier": "low",
+        "write_allowed": False,
+        "allowed_roots": [],
+        "allowed_paths": ["<files or dirs>"],
+        "read_only_paths": ["<files or dirs>"],
+        "owned_paths": [],
+        "forbidden_roots": [],
+        "allowed_tool_classes": ["read", "search", "list", "safe_git"],
+        "tool_budget": 10,
+        "time_budget_seconds": 90,
+        "stop_conditions": ["valid_report"],
+    }
+    active = {
+        "schema_version": "oss_agent_mission.v1",
+        "mission_id": "active_desktop_handoff",
+        "tier": "A3",
+        "mode": "managed_investigation",
+        "objective": "Inspect AGENTS.md.",
+        "risk_tier": "low",
+        "write_allowed": False,
+        "allowed_roots": [],
+        "allowed_paths": ["AGENTS.md"],
+        "read_only_paths": ["AGENTS.md"],
+        "owned_paths": [],
+        "forbidden_roots": [],
+        "allowed_tool_classes": ["read"],
+        "tool_budget": 2,
+        "time_budget_seconds": 30,
+        "stop_conditions": ["valid_report"],
+    }
+    text = (
+        "Project instructions include an example:\n"
+        "<OSS_HANDOFF_JSON>\n"
+        + json.dumps(template)
+        + "\n</OSS_HANDOFF_JSON>\n\n"
+        "Actual spawned-agent request:\n"
+        "<OSS_HANDOFF_JSON>\n"
+        + json.dumps(active)
+        + "\n</OSS_HANDOFF_JSON>\n"
+    )
+
+    block = extract_mission_v1_block(text)
+    parsed = json.loads(block)
+    assert parsed["mission_id"] == "active_desktop_handoff", parsed
+
+    placeholder_only = (
+        "Project instructions include an example:\n"
+        "<OSS_HANDOFF_JSON>\n"
+        + json.dumps(template)
+        + "\n</OSS_HANDOFF_JSON>\n"
+    )
+    assert extract_mission_v1_block(placeholder_only) is None
+
+
+def assert_native_work_contract_fits_visible_event_budget():
+    from codex_oss.native_work_ux import native_final_report_text, native_work_contract_text
+
+    m = mission(
+        objective=(
+            "Inspect AGENTS.md and README.md/docs references for one concrete fact about "
+            "OSS delegation UX, then report evidence, uncertainty, caveats, and a clear "
+            "bounded recommendation for the parent orchestrator."
+        ),
+        allowed_roots=[],
+        allowed_paths=["AGENTS.md", "README.md", "docs/", "ORCHESTRATION.md", "docs/CONTINUITY.md"],
+        read_only_paths=["AGENTS.md", "README.md", "docs/", "ORCHESTRATION.md", "docs/CONTINUITY.md"],
+        forbidden_roots=[".env", "*.env", "secrets/", ".git/", "node_modules/", ".codex-oss/logs/"],
+    )
+
+    contract = native_work_contract_text(m)
+    assert len(contract) <= 500, contract
+    assert "ROLE: OSS investigation subagent." in contract, contract
+    assert "COMPLETION RULE: Clear result only." in contract, contract
+    assert ".codex-oss/logs" not in contract, contract
+
+    report_text = native_final_report_text({
+        "status": "COMPLETE",
+        "confidence": "MEDIUM",
+        "mission_question": "Inspect AGENTS.md for one concrete fact about OSS delegation UX.",
+        "files_inspected": [{"path": "AGENTS.md", "complete": True}],
+        "commands_run": [{"tool": "rtk_read", "args": {"path": "AGENTS.md"}}],
+        "findings": [
+            {"claim": "Answered obligation: Provide files inspected.", "evidence_refs": ["file:AGENTS.md#extract:2"]},
+            {
+                "claim": (
+                    "Evidence gathered while testing hypothesis: AGENTS.md contains documentation "
+                    "about agent delegation patterns or user experience."
+                ),
+                "evidence_refs": ["file:AGENTS.md#extract:2"],
+            },
+        ],
+        "caveats": [
+            "The model call timed out, so the runtime closed from the answer graph.",
+            "Report rendered from runtime answer graph.",
+        ],
+    })
+    assert "Answered obligation" not in report_text, report_text
+    assert "Report rendered from runtime answer graph" not in report_text, report_text
+    assert "AGENTS.md contains documentation about agent delegation patterns or user experience" in report_text, report_text
+    assert "OSS model timed out during final narration" in report_text, report_text
+
+
 def assert_explicit_objective_spec_overrides_prose_classifier():
     m = mission(
         objective="Find function mission-a3-kimi and return file path.",
@@ -2419,7 +2653,7 @@ def assert_explicit_objective_satisfaction_switches_to_short_closure():
         result = run_loop(m, ledger, fake_model, [], None, m.allowed_roots, m.allowed_paths, request_deadline=90)
         assert result["status"] == "COMPLETE", result
         assert any("explicit objective_spec appears satisfied" in item for item in calls), calls
-        assert closure_timeouts[1] <= 20, closure_timeouts
+        assert closure_timeouts[1] <= 75, closure_timeouts
     finally:
         try:
             os.unlink(fixture_path)
@@ -3489,6 +3723,201 @@ def assert_runtime_final_synthesis_uses_fast_bounded_closer_alias():
         assert alias == "mission-a2-flash", calls
         assert "required source floor" in prompt.lower(), prompt
         assert result["report"]["closure_status"] == "MODEL_NARRATED_RUNTIME_CLOSED", result
+
+
+def assert_runtime_closer_draft_merges_without_crashing():
+    with tempfile.TemporaryDirectory(dir=ROOT) as td:
+        from pathlib import Path
+
+        target = Path(td) / "closer_source.py"
+        target.write_text("VALUE = 'closer-covered'\n", encoding="utf-8")
+        target_rel = os.path.relpath(target, ROOT)
+        m = mission(
+            mission_id="mission_closer_draft_merge",
+            objective="Inspect the required source floor and narrate the result.",
+            objective_style="open_investigation",
+            allowed_roots=[],
+            allowed_paths=[target_rel],
+            allowed_tool_classes=["read"],
+            tool_budget=3,
+            must_inspect=[target_rel],
+            evidence_collection_mode="prefetch_floor",
+            exploration_policy={"after_required_floor": "close_immediately", "min_optional_actions_after_floor": 0, "max_optional_actions_after_floor": 0, "require_contradiction_search": False},
+        )
+        ledger = EvidenceLedger(mission_id=m.mission_id, tool_budget_remaining=m.tool_budget)
+        old_timeout = os.environ.get("RUNTIME_FINAL_REPORT_MODEL_TIMEOUT_SECONDS")
+        old_source_floor_closer = os.environ.get("RUNTIME_SOURCE_FLOOR_MODEL_CLOSER")
+        os.environ["RUNTIME_FINAL_REPORT_MODEL_TIMEOUT_SECONDS"] = "30"
+        os.environ["RUNTIME_SOURCE_FLOOR_MODEL_CLOSER"] = "1"
+
+        def fake_model(messages, tools, timeout, model_alias_override=None):
+            return {
+                "choices": [{
+                    "message": {
+                        "content": json.dumps({
+                            "schema_version": "closer_draft.v1",
+                            "narrative_summary": "I inspected the required source and found the requested coverage.",
+                            "finding_narratives": {
+                                "finding_001": {"text": "The required source was inspected and supports the requested answer."}
+                            },
+                            "caveat_narratives": [],
+                            "verification_summary": "Verified by the runtime read evidence.",
+                            "confidence_rationale": "Evidence comes from the required source read.",
+                        })
+                    }
+                }]
+            }
+
+        try:
+            result = run_loop(m, ledger, fake_model, [], None, m.allowed_roots, m.allowed_paths, request_deadline=90)
+        finally:
+            if old_timeout is None:
+                os.environ.pop("RUNTIME_FINAL_REPORT_MODEL_TIMEOUT_SECONDS", None)
+            else:
+                os.environ["RUNTIME_FINAL_REPORT_MODEL_TIMEOUT_SECONDS"] = old_timeout
+            if old_source_floor_closer is None:
+                os.environ.pop("RUNTIME_SOURCE_FLOOR_MODEL_CLOSER", None)
+            else:
+                os.environ["RUNTIME_SOURCE_FLOOR_MODEL_CLOSER"] = old_source_floor_closer
+
+        assert result["status"] == "COMPLETE", result
+        report = result["report"]
+        assert report["closure_status"] == "MODEL_NARRATED_RUNTIME_CLOSED", report
+        assert report["report_source"] == "model_narrated_runtime_closed", report
+        assert report["findings"], report
+        finding_text = (report["findings"][0].get("claim", "") + " " + report["findings"][0].get("narrative", "")).lower()
+        assert "required source" in finding_text, report
+
+
+def assert_runtime_closer_default_timeout_allows_live_sized_finalizer_window():
+    with tempfile.TemporaryDirectory(dir=ROOT) as td:
+        from pathlib import Path
+
+        target = Path(td) / "closer_default_timeout_source.py"
+        target.write_text("VALUE = 'default-timeout-covered'\n", encoding="utf-8")
+        target_rel = os.path.relpath(target, ROOT)
+        m = mission(
+            mission_id="mission_closer_default_timeout",
+            objective="Inspect the required source floor and narrate the result.",
+            objective_style="open_investigation",
+            allowed_roots=[],
+            allowed_paths=[target_rel],
+            allowed_tool_classes=["read"],
+            tool_budget=3,
+            must_inspect=[target_rel],
+            evidence_collection_mode="prefetch_floor",
+            exploration_policy={"after_required_floor": "close_immediately", "min_optional_actions_after_floor": 0, "max_optional_actions_after_floor": 0, "require_contradiction_search": False},
+        )
+        ledger = EvidenceLedger(mission_id=m.mission_id, tool_budget_remaining=m.tool_budget)
+        old_timeout = os.environ.get("RUNTIME_FINAL_REPORT_MODEL_TIMEOUT_SECONDS")
+        old_source_floor_closer = os.environ.get("RUNTIME_SOURCE_FLOOR_MODEL_CLOSER")
+        os.environ.pop("RUNTIME_FINAL_REPORT_MODEL_TIMEOUT_SECONDS", None)
+        os.environ["RUNTIME_SOURCE_FLOOR_MODEL_CLOSER"] = "1"
+        calls = []
+
+        def fake_model(messages, tools, timeout, model_alias_override=None):
+            calls.append(timeout)
+            return {
+                "choices": [{
+                    "message": {
+                        "content": json.dumps({
+                            "schema_version": "closer_draft.v1",
+                            "narrative_summary": "The required source was inspected.",
+                            "finding_narratives": [{"text": "The required source was inspected."}],
+                            "caveat_narratives": [],
+                            "verification_summary": "Verified by runtime evidence.",
+                            "confidence_rationale": "Runtime evidence floor is covered.",
+                        })
+                    }
+                }]
+            }
+
+        try:
+            result = run_loop(m, ledger, fake_model, [], None, m.allowed_roots, m.allowed_paths, request_deadline=90)
+        finally:
+            if old_timeout is not None:
+                os.environ["RUNTIME_FINAL_REPORT_MODEL_TIMEOUT_SECONDS"] = old_timeout
+            if old_source_floor_closer is None:
+                os.environ.pop("RUNTIME_SOURCE_FLOOR_MODEL_CLOSER", None)
+            else:
+                os.environ["RUNTIME_SOURCE_FLOOR_MODEL_CLOSER"] = old_source_floor_closer
+
+        assert result["status"] == "COMPLETE", result
+        assert calls and calls[0] >= 60, calls
+
+
+def assert_canonical_answer_prefers_claim_findings_over_deliverable_labels():
+    from codex_oss.runtime.closure import build_canonical_answer
+
+    m = mission(
+        mission_id="mission_canonical_claim_findings",
+        objective="Inspect AGENTS.md and report a concrete observation.",
+        objective_style="open_investigation",
+        answer_obligations=[
+            {"id": "files", "question": "Provide files inspected.", "required": True},
+            {"id": "evidence", "question": "Provide evidence.", "required": True},
+            {"id": "observation", "question": "Provide observation.", "required": True},
+        ],
+    )
+    ledger = EvidenceLedger(mission_id=m.mission_id, tool_budget_remaining=m.tool_budget)
+    claim = {
+        "claim_id": "claim_001",
+        "text": "Evidence gathered while testing hypothesis: AGENTS.md documents the OSS delegation UX contract.",
+        "status": "unverified",
+        "confidence": "LOW",
+        "evidence_refs": ["file:AGENTS.md#extract:2"],
+        "source": "action_hypothesis",
+    }
+    ledger.add_claim(claim)
+    ledger.claim_graph = {"claims": [claim]}
+    answer_graph = {
+        "sufficiency": {"confidence_cap": "MEDIUM", "closure_entitlement": {"can_return_complete": True}},
+        "required_obligations": [
+            {"id": "files", "question": "Provide files inspected.", "status": "answered", "evidence_refs": ["file:AGENTS.md#extract:2"]},
+            {"id": "evidence", "question": "Provide evidence.", "status": "answered", "evidence_refs": ["file:AGENTS.md#extract:2"]},
+            {"id": "observation", "question": "Provide observation.", "status": "answered", "evidence_refs": ["file:AGENTS.md#extract:2"]},
+        ],
+        "optional_obligations": [],
+    }
+    envelope = {
+        "final_status": "COMPLETE",
+        "answer_status": "ANSWERED",
+        "evidence_status": "SUFFICIENT",
+        "verification_status": "NOT_REQUIRED",
+    }
+
+    canonical = build_canonical_answer(m, answer_graph, envelope, ledger)
+    claims = [finding["claim"] for finding in canonical["required_findings"]]
+    assert claims == ["AGENTS.md documents the OSS delegation UX contract."], canonical
+    assert not any(claim.startswith("Provide ") for claim in claims), canonical
+    assert canonical["answered_obligations"][0]["question"] == "Provide files inspected.", canonical
+
+
+def assert_model_narrative_does_not_overwrite_canonical_finding_claim():
+    from codex_oss.runtime.closure import merge_draft_into_report
+
+    canonical = {
+        "mission_id": "mission_preserve_claim",
+        "recommended_status": "COMPLETE",
+        "confidence_cap": "MEDIUM",
+        "required_findings": [{
+            "claim": "AGENTS.md says: Desktop Gold requires ConsumerObservationWitnessV1 from a raw Codex Desktop spawned-agent transcript.",
+            "evidence_refs": ["file:AGENTS.md#extract:2"],
+        }],
+        "files_inspected": [{"path": "AGENTS.md", "complete": True}],
+        "commands_run": [],
+        "required_caveats": [],
+        "missing_fields": [],
+        "unanswered_obligations": [],
+    }
+    draft = {
+        "schema_version": "closer_draft.v1",
+        "finding_narratives": [{"text": "I inspected AGENTS.md."}],
+    }
+
+    report = merge_draft_into_report(canonical, draft)
+    assert report["findings"][0]["claim"].startswith("AGENTS.md says:"), report
+    assert report["findings"][0]["narrative"] == "I inspected AGENTS.md.", report
 
 
 def assert_open_investigation_redirects_to_pending_required_source():
@@ -4891,6 +5320,47 @@ def assert_custom_required_shape_with_pattern_is_allowed_and_detected():
             os.chdir(cwd)
 
 
+def assert_missing_global_must_inspect_read_cannot_complete():
+    missing = "tests/fixtures/definitely_missing_oss_subagent_probe_source.md"
+    m = mission(
+        mission_id="mission_missing_global_must_inspect",
+        objective="Prove a missing required source cannot complete.",
+        objective_style="deterministic_lookup",
+        allowed_paths=[missing],
+        must_inspect=[missing],
+    )
+    ledger = EvidenceLedger(mission_id=m.mission_id, tool_budget_remaining=3)
+    result = ToolResult(
+        tool="rtk_read",
+        args={"path": missing},
+        stdout="",
+        stderr="No such file or directory",
+        exit_code=1,
+        complete=False,
+    )
+    ledger.add_file(missing, result, turn=1)
+    ledger.add_command("rtk_read", {"path": missing}, result, turn=1)
+
+    graph = refresh_answer_graph(m, ledger, reason="test")
+    agenda = graph["evidence_agenda"]["items"]
+    required = [item for item in agenda if item.get("path") == missing]
+    assert required, graph
+    assert required[0]["status"] == "pending", required[0]
+    assert required[0]["source_state"] == "blocked", required[0]
+
+    sufficiency = graph["sufficiency"]
+    assert sufficiency["recommended_status"] != "COMPLETE", sufficiency
+    assert sufficiency["closure_entitlement"]["can_return_complete"] is False, sufficiency
+    assert missing in sufficiency["missing_required_sources"], sufficiency
+    assert graph["coverage_graph"]["coverage_status"]["can_complete"] is False, graph["coverage_graph"]
+
+    report = {"status": "COMPLETE", "caveats": []}
+    final_status = _reconcile_readonly_runtime_entitlement(report, "COMPLETE", graph)
+    assert final_status == "PARTIAL", report
+    assert report["status"] == "PARTIAL", report
+    assert report["runtime_entitlement_reconciliation"]["decision"] == "demoted_complete_to_partial", report
+
+
 def main():
     assert_run_loop_accepts_valid_final_report()
     assert_model_text_extraction_handles_provider_variants()
@@ -4930,6 +5400,8 @@ def main():
     assert_deterministic_finalizer_does_not_treat_symbol_mentions_as_definitions()
     assert_range_read_does_not_block_later_full_read_or_finalizer_claim()
     assert_definition_claims_require_definition_shaped_evidence()
+    assert_markdown_filename_contains_claim_does_not_require_definition_assignment()
+    assert_generic_objective_synthesizes_source_fact_from_markdown_evidence()
     assert_definition_claims_can_be_supported_by_command_evidence()
     assert_deterministic_finalizer_mines_command_profile_evidence()
     assert_deterministic_finalizer_mines_alias_mapping_from_file_evidence()
@@ -4938,6 +5410,8 @@ def main():
     assert_answer_graph_preserves_command_result_requirements()
     assert_config_value_extraction_uses_target_block_not_first_fields()
     assert_mission_accepts_explicit_objective_spec_and_strict_mode()
+    assert_placeholder_mission_examples_do_not_shadow_active_handoff()
+    assert_native_work_contract_fits_visible_event_budget()
     assert_explicit_objective_spec_overrides_prose_classifier()
     assert_complete_report_with_explicit_spec_requires_required_value()
     assert_explicit_objective_satisfaction_switches_to_short_closure()
@@ -4960,6 +5434,10 @@ def main():
     assert_open_investigation_prefetch_reads_required_sources_before_model_loop()
     assert_source_floor_only_prefetch_closes_without_final_model_timeout()
     assert_runtime_final_synthesis_uses_fast_bounded_closer_alias()
+    assert_runtime_closer_draft_merges_without_crashing()
+    assert_runtime_closer_default_timeout_allows_live_sized_finalizer_window()
+    assert_canonical_answer_prefers_claim_findings_over_deliverable_labels()
+    assert_model_narrative_does_not_overwrite_canonical_finding_claim()
     assert_open_investigation_redirects_to_pending_required_source()
     assert_open_investigation_reports_insufficient_evidence_when_shape_missing()
     assert_open_investigation_escalates_on_contradiction_marker()
@@ -4984,6 +5462,7 @@ def main():
     assert_source_state_distinguishes_read_insufficient_shape_from_missing_inspection()
     assert_unknown_required_shape_fails_early_without_pattern()
     assert_custom_required_shape_with_pattern_is_allowed_and_detected()
+    assert_missing_global_must_inspect_read_cannot_complete()
     print("PASS: runtime contract suite")
 
 

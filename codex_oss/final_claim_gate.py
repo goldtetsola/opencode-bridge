@@ -63,9 +63,12 @@ def evaluate_final_claim_gate(
         if not transcript_path:
             reasons.append("desktop_transcript_hash_missing")
         surface = desktop_render_surface if isinstance(desktop_render_surface, dict) else {}
-        probe_status = str(surface.get("probe_status") or "unknown").lower()
-        if probe_status != "pass":
+        render_surface_proof = _render_surface_proof(witness=witness, surface=surface)
+        if not render_surface_proof.get("ok"):
+            probe_status = str(surface.get("probe_status") or "unknown").lower()
             reasons.append(f"desktop_pre_final_text_probe_not_passed:{probe_status or 'unknown'}")
+    else:
+        render_surface_proof = {}
 
     if claim in {"implementation", "raw_implementation", "bounded_implementation"}:
         witness = implementation_witness if isinstance(implementation_witness, dict) else {}
@@ -121,6 +124,7 @@ def evaluate_final_claim_gate(
         "consumer_observation_witness_ok": bool((consumer_observation_witness or {}).get("ok")) if isinstance(consumer_observation_witness, dict) else False,
         "consumer_observation_witness": dict(consumer_observation_witness or {}) if isinstance(consumer_observation_witness, dict) else {},
         "desktop_render_surface": dict(desktop_render_surface or {}) if isinstance(desktop_render_surface, dict) else {},
+        "render_surface_proof": render_surface_proof,
         "changed_owned_paths": list(changed_owned_paths or []),
         "transcript_hash": _hash_file(transcript_path) if transcript_path else "",
         "artifact_hashes": {path: _hash_file(path) for path in (artifact_paths or []) if path},
@@ -140,6 +144,41 @@ def _implementation_decision(claim: str, status: str, reasons: list[str]) -> str
     if status not in {"PASS", "VERIFIED"}:
         return "implementation_success_denied"
     return "implementation_success_allowed" if not reasons else "implementation_success_denied"
+
+
+def _render_surface_proof(*, witness: JSON, surface: JSON) -> JSON:
+    identity_count = int(witness.get("identity_progress_before_final", 0) or 0) if isinstance(witness, dict) else 0
+    if (
+        isinstance(witness, dict)
+        and witness.get("ok")
+        and witness.get("raw_desktop_provenance_ok")
+        and witness.get("final_present")
+        and identity_count >= int(witness.get("min_progress_before_final", 3) or 3)
+    ):
+        return {
+            "schema_version": "render_surface_proof.v1",
+            "ok": True,
+            "source": "mission_bound_transcript_witness",
+            "matched_pre_final_event_count": identity_count,
+            "basis": "raw_desktop_transcript_with_matched_pre_final_event_ids",
+        }
+    probe_status = str((surface or {}).get("probe_status") or "unknown").lower()
+    if probe_status == "pass":
+        return {
+            "schema_version": "render_surface_proof.v1",
+            "ok": True,
+            "source": "global_desktop_pre_final_probe",
+            "probe_status": probe_status,
+            "basis": "fresh_or_recorded_desktop_pre_final_probe_passed",
+        }
+    return {
+        "schema_version": "render_surface_proof.v1",
+        "ok": False,
+        "source": "none",
+        "probe_status": probe_status,
+        "matched_pre_final_event_count": identity_count,
+        "basis": "no_render_surface_proof",
+    }
 
 
 def _hash_file(path: str) -> str:

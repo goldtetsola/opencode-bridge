@@ -80,6 +80,19 @@ def _generic_progress_messages() -> list[dict]:
     ]
 
 
+def _capture_spawned_authority(root: Path, mission_id: str, transcript: Path) -> None:
+    from codex_oss.desktop_observation import capture_thread_observation
+
+    result = capture_thread_observation(
+        project_root=str(root),
+        mission_id=mission_id,
+        transcript_path=str(transcript),
+        thread_id=f"thread_{mission_id}",
+        spawned_agent_id=f"agent_{mission_id}",
+    )
+    assert result["ok"] is True, result
+
+
 def assert_verifier_fails_without_transcript():
     name = "verifier_fails_without_transcript"
     from codex_oss.desktop_native_verifier import verify_desktop_native_ux
@@ -137,10 +150,11 @@ def assert_verifier_passes_with_desktop_mission_evidence():
         mission_id = "desktop_mission"
         _write_required_artifacts(root, mission_id)
         transcript = root / "transcript.txt"
-        transcript.write_text(json.dumps({"mission_id": mission_id, "consumer_kind": "codex_desktop_spawned", "transcript_kind": "codex_desktop_raw_export", "messages": [
+        transcript.write_text(json.dumps({"mission_id": mission_id, "consumer_kind": "codex_desktop_spawned", "transcript_kind": "codex_desktop_raw_export", "thread_id": f"thread_{mission_id}", "spawned_agent_id": f"agent_{mission_id}", "messages": [
             *_identity_progress_messages(mission_id, ["mission started", "evidence collected", "verification complete"]),
             {"text": "Final answer from runtime evidence.", "phase": "final_answer"},
         ]}), encoding="utf-8")
+        _capture_spawned_authority(root, mission_id, transcript)
         route = build_route_authority(
             agent_name="oss_deepseek_investigator",
             model_alias="mission-a3-deepseek",
@@ -205,10 +219,11 @@ def assert_verifier_accepts_explicit_zero_pending_adoption_ledger():
             "probes": [],
         }), encoding="utf-8")
         transcript = root / "transcript.json"
-        transcript.write_text(json.dumps({"mission_id": mission_id, "consumer_kind": "codex_desktop_spawned", "transcript_kind": "codex_desktop_raw_export", "messages": [
+        transcript.write_text(json.dumps({"mission_id": mission_id, "consumer_kind": "codex_desktop_spawned", "transcript_kind": "codex_desktop_raw_export", "thread_id": f"thread_{mission_id}", "spawned_agent_id": f"agent_{mission_id}", "messages": [
             *_identity_progress_messages(mission_id, ["start", "patch", "verify"]),
             {"text": "final", "phase": "final_answer"},
         ]}), encoding="utf-8")
+        _capture_spawned_authority(root, mission_id, transcript)
         route = build_route_authority(
             agent_name="oss_deepseek_implementer",
             model_alias="mission-a5-deepseek",
@@ -223,6 +238,63 @@ def assert_verifier_accepts_explicit_zero_pending_adoption_ledger():
         )
     assert report["ok"] is True, report
     assert report["desktop_gold_pass"] is True, report
+    _pass(name)
+
+
+def assert_verifier_accepts_transcript_witness_over_unknown_probe_with_bundle():
+    name = "verifier_accepts_transcript_witness_over_unknown_probe_with_bundle"
+    from codex_oss.desktop_native_verifier import verify_desktop_native_ux
+    from codex_oss.route_authority import build_route_authority
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        mission_id = "desktop_bundle_witness"
+        _write_required_artifacts(root, mission_id)
+        mission_dir = root / ".codex-oss" / "missions" / mission_id
+        (mission_dir / "canonical_read_evidence.json").unlink()
+        (mission_dir / "tool_call_adoption_probes.json").unlink()
+        (mission_dir / "canonical_evidence_bundle.json").write_text(json.dumps({
+            "schema_version": "canonical_evidence_bundle.v1",
+            "mission_id": mission_id,
+            "status_entitlement": {"can_complete": True, "can_return_complete": True},
+            "coverage_status": {"blocked_obligations": []},
+            "missing_required_sources": [],
+        }), encoding="utf-8")
+        (mission_dir / "adoption_or_recovery.json").write_text(json.dumps({
+            "schema_version": "adoption_or_recovery.v1",
+            "mission_id": mission_id,
+            "status": "NOT_APPLICABLE",
+            "reason": "no_pending_desktop_tool_calls",
+            "pending_tool_calls_emitted": 0,
+            "runtime_recovery_used": False,
+            "artifacts": [],
+        }), encoding="utf-8")
+        (root / ".codex-oss" / "desktop_pre_final_text_probe_result.json").write_text(json.dumps({
+            "schema_version": "desktop_pre_final_text_probe_result.v1",
+            "probe_status": "setup_failed",
+            "desktop_render_surface": {"probe_required": True, "probe_status": "unknown"},
+        }), encoding="utf-8")
+        transcript = root / "transcript.json"
+        transcript.write_text(json.dumps({"mission_id": mission_id, "consumer_kind": "codex_desktop_spawned", "transcript_kind": "codex_desktop_raw_export", "thread_id": f"thread_{mission_id}", "spawned_agent_id": f"agent_{mission_id}", "messages": [
+            *_identity_progress_messages(mission_id, ["start", "read", "verify"]),
+            {"text": "final", "phase": "final_answer"},
+        ]}), encoding="utf-8")
+        _capture_spawned_authority(root, mission_id, transcript)
+        route = build_route_authority(
+            agent_name="oss_deepseek_investigator",
+            model_alias="mission-a3-deepseek",
+            handoff_obj={"schema_version": "oss_agent_mission.v1"},
+            consumer_kind="codex_desktop_spawned",
+        )
+        report = verify_desktop_native_ux(
+            transcript_path=str(transcript),
+            mission_id=mission_id,
+            project_root=tmp,
+            route_authority=route,
+        )
+    assert report["ok"] is True, report
+    assert report["render_surface_proof"]["source"] == "mission_bound_transcript_witness", report
+    assert "desktop_pre_final_text_probe_not_passed:unknown" not in report["missing_evidence"], report
     _pass(name)
 
 
@@ -303,6 +375,7 @@ def main():
         assert_verifier_passes_with_desktop_mission_evidence,
         assert_verifier_requires_adoption_or_recovery_probes,
         assert_verifier_accepts_explicit_zero_pending_adoption_ledger,
+        assert_verifier_accepts_transcript_witness_over_unknown_probe_with_bundle,
         assert_verifier_rejects_artifact_reconciled_candidate_as_desktop_gold,
         assert_verifier_rejects_generic_progress_without_event_identity,
     ]:

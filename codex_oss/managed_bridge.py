@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import time
+import traceback
 from dataclasses import dataclass
 from typing import Any, Callable, Dict
 
@@ -17,6 +18,11 @@ from codex_oss.fast_path import run_deterministic_fast_path
 from codex_oss.implementation import run_implementation_mission
 from codex_oss.ledger import EvidenceLedger
 from codex_oss.mission import InvalidHandoffError, _build_mission, extract_mission_v1_block
+from codex_oss.mission_authority_artifacts import (
+    write_adoption_or_recovery,
+    write_canonical_evidence_artifacts,
+    write_mission_authority_artifacts,
+)
 from codex_oss.claim_graph import refresh_claim_graph
 from codex_oss.answer_graph import build_investigation_plan, refresh_answer_graph
 from codex_oss.runtime.loop import run_loop
@@ -25,8 +31,8 @@ from codex_oss.runtime.policy import (
     build_deterministic_partial_report,
     release_mission_slot,
 )
-from codex_oss.validation import render_report
 from codex_oss.visible_commentary import VisibleCommentarySink
+from codex_oss.native_work_ux import native_final_report_text, native_work_contract_text
 
 JSON = Dict[str, Any]
 
@@ -122,6 +128,142 @@ def _extract_text_for_roles(body: JSON, roles: tuple[str, ...]) -> str:
     return text
 
 
+def _mission_v1_from_native_task_contract(text: str, raw_model_alias: str) -> JSON | None:
+    """Build a concrete MissionV1 object from a native-style task contract.
+
+    This keeps spawned Desktop prompts human-readable while preserving runtime
+    MissionV1 authority internally.
+    """
+    fields = _task_contract_fields(text)
+    goal = fields.get("GOAL") or fields.get("OBJECTIVE") or ""
+    if not goal:
+        return None
+    tier = _tier_for_runtime_alias(raw_model_alias, fields.get("TASK TYPE", ""))
+    read_only_paths = _split_contract_paths(fields.get("READ-ONLY PATHS", ""))
+    owned_paths = _split_contract_paths(fields.get("OWNED PATHS", ""))
+    if tier in {"A4", "A5", "A6"} and not owned_paths:
+        return None
+    allowed_paths = sorted({*read_only_paths, *owned_paths})
+    if tier in {"A2", "A3"} and not allowed_paths:
+        return None
+    mission_id = fields.get("MISSION ID") or f"native_task_{int(time.time())}"
+    write_allowed = tier in {"A5", "A6"}
+    mode_map = {
+        "A2": "guided_exploration",
+        "A3": "managed_investigation",
+        "A4": "patch_proposal",
+        "A5": "bounded_implementation",
+        "A6": "critical_implementation",
+    }
+    return {
+        "schema_version": "oss_agent_mission.v1",
+        "mission_id": mission_id,
+        "tier": tier,
+        "mode": mode_map[tier],
+        "objective": goal.rstrip("."),
+        "risk_tier": "low",
+        "write_allowed": write_allowed,
+        "allowed_roots": [],
+        "allowed_paths": allowed_paths,
+        "read_only_paths": read_only_paths or allowed_paths,
+        "owned_paths": owned_paths,
+        "forbidden_roots": [],
+        "allowed_tool_classes": ["read", "search", "list", "safe_git"],
+        "tool_budget": 8 if tier == "A2" else 14,
+        "time_budget_seconds": 90 if tier == "A2" else 150,
+        "stop_conditions": ["valid_report", "budget_exhausted", "deadline_reached"],
+        "objective_style": "open_investigation" if tier in {"A2", "A3"} else "implementation",
+        "evidence_collection_mode": "agenda_guided",
+        "exploration_policy": {
+            "after_required_floor": "allow_model_exploration",
+            "min_optional_actions_after_floor": 0,
+            "max_optional_actions_after_floor": 1,
+            "require_contradiction_search": False,
+        },
+        "answer_obligations": _answer_obligations_from_contract(fields),
+        "must_inspect": read_only_paths[:1] or allowed_paths[:1],
+        "report_schema": "managed_investigation_report.v1" if tier in {"A2", "A3"} else "implementation_report.v1",
+        "required_outputs": [
+            "files_inspected",
+            "commands_run",
+            "findings",
+            "uncertainties",
+            "confidence",
+            "caveats",
+            "escalation_recommendation",
+        ],
+    }
+
+
+def _task_contract_fields(text: str) -> dict[str, str]:
+    fields: dict[str, str] = {}
+    current = ""
+    for raw_line in str(text or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if ":" in line:
+            key, value = line.split(":", 1)
+            key = key.strip().upper()
+            if key in {
+                "ROLE",
+                "GOAL",
+                "OBJECTIVE",
+                "MISSION ID",
+                "TASK TYPE",
+                "OWNED PATHS",
+                "READ-ONLY PATHS",
+                "DO NOT TOUCH",
+                "VERIFICATION STEPS",
+                "DELIVERABLE",
+                "COMPLETION RULE",
+                "ESCALATION RULE",
+            }:
+                fields[key] = value.strip()
+                current = key
+                continue
+        if current:
+            fields[current] = (fields[current] + " " + line).strip()
+    return fields
+
+
+def _split_contract_paths(value: str) -> list[str]:
+    value = str(value or "").replace("Do not edit files.", "")
+    if not value or value.lower().startswith("none"):
+        return []
+    out: list[str] = []
+    for part in value.split(","):
+        cleaned = part.strip().strip(".;")
+        if cleaned and cleaned.lower() != "none":
+            out.append(cleaned)
+    return out
+
+
+def _answer_obligations_from_contract(fields: dict[str, str]) -> list[JSON]:
+    deliverable = fields.get("DELIVERABLE", "")
+    obligations = []
+    for idx, part in enumerate([p.strip().strip(".;") for p in deliverable.split(",") if p.strip()], start=1):
+        obligations.append({"id": f"deliverable_{idx}", "question": f"Provide {part}."})
+    return obligations or [
+        {"id": "files", "question": "Which files were inspected?"},
+        {"id": "evidence", "question": "What evidence supports the answer?"},
+        {"id": "caveats", "question": "What uncertainty remains?"},
+    ]
+
+
+def _tier_for_runtime_alias(raw_model_alias: str, task_type: str) -> str:
+    alias = str(raw_model_alias or "").lower()
+    task = str(task_type or "").lower()
+    for tier in ("a6", "a5", "a4", "a3", "a2"):
+        if f"mission-{tier}" in alias:
+            return tier.upper()
+    if "implementation" in task:
+        return "A5"
+    if "patch" in task:
+        return "A4"
+    return "A3"
+
+
 def should_handle_managed_mission_body(body: JSON, raw_model_alias: str) -> bool:
     """Return whether the runtime entrypoint will own this request.
 
@@ -160,8 +302,12 @@ def run_managed_mission_from_body(
     commentary_callback: Callable[[JSON], None] | None = None,
 ) -> ManagedMissionResult:
     """Run an A2/A3 MissionV1 if present; return handled=False otherwise."""
-    handoff = extract_handoff_from_body(body)
+    user_contract_text = _extract_text_for_roles(body, ("user",))
     runtime_alias = raw_model_alias in RUNTIME_MODEL_ALIASES
+    if runtime_alias and "OSS_HANDOFF_JSON" not in user_contract_text:
+        handoff = ""
+    else:
+        handoff = extract_handoff_from_body(body)
     try:
         mission_block = extract_mission_v1_block(handoff) if handoff else None
     except InvalidHandoffError as exc:
@@ -169,28 +315,34 @@ def run_managed_mission_from_body(
         return ManagedMissionResult(
             handled=True,
             status="FAILED",
-            report_text=render_report(_failure_report("unknown", f"invalid entrypoint: {exc}")),
+            report_text=native_final_report_text(_failure_report("unknown", f"invalid entrypoint: {exc}")),
         )
 
-    if not mission_block or "oss_agent_mission.v1" not in mission_block:
+    synthesized_raw: JSON | None = None
+    if (not mission_block or "oss_agent_mission.v1" not in mission_block) and runtime_alias:
+        synthesized_raw = _mission_v1_from_native_task_contract(user_contract_text, raw_model_alias)
+
+    if (not mission_block and not synthesized_raw) or (mission_block and "oss_agent_mission.v1" not in mission_block):
         if runtime_alias:
             return ManagedMissionResult(
                 handled=True,
                 status="FAILED",
-                report_text=render_report(_failure_report(
+                report_text=native_final_report_text(_failure_report(
                     "unknown",
-                    "runtime-controlled OSS agent requires exactly one OSS_HANDOFF_JSON MissionV1 block",
+                    "runtime-controlled OSS agent requires a MissionV1 handoff or native task contract",
                 )),
             )
         return ManagedMissionResult(handled=False)
 
     mission_id = "unknown"
     try:
-        raw = json.loads(mission_block)
+        raw = synthesized_raw if synthesized_raw is not None else json.loads(mission_block)
         mission = _build_mission(raw)
         mission_id = mission.mission_id
         mission.decision_trace = []
         mission.runtime_model_alias = raw_model_alias
+        mission.runtime_handoff_raw = "" if synthesized_raw is not None else handoff
+        mission.runtime_task_contract_raw = user_contract_text if synthesized_raw is not None else ""
         append_decision(
             mission,
             decision_type="entry_validation",
@@ -281,7 +433,7 @@ def run_managed_mission_from_body(
                     handled=True,
                     status="FAILED",
                     mission_id=mission.mission_id,
-                    report_text=render_report(report),
+                    report_text=native_final_report_text(report),
                 )
             append_decision(
                 mission,
@@ -351,9 +503,10 @@ def run_managed_mission_from_body(
                 commentary.emit(
                     "mission_started",
                     "Mission accepted",
-                    "I'm loading the compiled MissionV1 contract and checking for deterministic answers first.",
+                    native_work_contract_text(mission),
                     phase="PLAN",
                     source="runtime",
+                    metadata={"ux_shape": "native_work_contract.v1"},
                 )
                 commentary.emit(
                     "deterministic_fast_path_used",
@@ -379,7 +532,7 @@ def run_managed_mission_from_body(
                 handled=True,
                 status=final_status,
                 mission_id=mission.mission_id,
-                report_text=render_report(report),
+                report_text=native_final_report_text(report),
             )
 
         artifact_dir = os.path.join(os.getcwd(), ".codex-oss", "missions", mission.mission_id)
@@ -410,7 +563,7 @@ def run_managed_mission_from_body(
             final_status = _write_readonly_mission_artifacts(mission, ledger, report, str(result.get("status", "PARTIAL")))
         else:
             final_status = str(result.get("status", "PARTIAL"))
-        report_text = render_report(report) if isinstance(report, dict) else str(report)
+        report_text = native_final_report_text(report) if isinstance(report, dict) else str(report)
         return ManagedMissionResult(
             handled=True,
             status=final_status,
@@ -423,10 +576,10 @@ def run_managed_mission_from_body(
             handled=True,
             status="FAILED",
             mission_id=mission_id,
-            report_text=render_report(_failure_report(mission_id, f"invalid OSS handoff schema: {exc}")),
+            report_text=native_final_report_text(_failure_report(mission_id, f"invalid OSS handoff schema: {exc}")),
         )
     except Exception as exc:
-        log_fn("mission_crash", error=str(exc), mission_id=mission_id)
+        log_fn("mission_crash", error=str(exc), mission_id=mission_id, trace=traceback.format_exc(limit=12))
         report = build_deterministic_partial_report(_MissionStub(mission_id), None, f"runtime_crash:{exc}")
         report["status"] = "FAILED"
         report["caveats"].append("Runtime returned a terminal report instead of falling through to legacy continuation.")
@@ -434,7 +587,7 @@ def run_managed_mission_from_body(
             handled=True,
             status="FAILED",
             mission_id=mission_id,
-            report_text=render_report(report),
+            report_text=native_final_report_text(report),
         )
 
 
@@ -616,6 +769,16 @@ def _write_readonly_mission_artifacts(mission: Any, ledger: Any, report: dict, s
         summary_lines.append(f"- {reason}")
 
     _write_json(os.path.join(artifact_dir, "mission.json"), mission_payload)
+    write_mission_authority_artifacts(
+        artifact_dir=artifact_dir,
+        mission=mission,
+        summary_payload=mission_payload,
+        validation={
+            "tier": getattr(mission, "tier", ""),
+            "mode": getattr(mission, "mode", ""),
+            "runtime_model_alias": getattr(mission, "runtime_model_alias", ""),
+        },
+    )
     _write_json(os.path.join(artifact_dir, "ledger.json"), ledger_payload)
     _write_json(os.path.join(artifact_dir, "report.json"), report)
     _write_json(os.path.join(artifact_dir, "claim_graph.json"), claim_graph)
@@ -624,6 +787,23 @@ def _write_readonly_mission_artifacts(mission: Any, ledger: Any, report: dict, s
     _write_json(os.path.join(artifact_dir, "coverage_graph.json"), coverage_graph)
     _write_json(os.path.join(artifact_dir, "evidence_agenda.json"), evidence_agenda)
     _write_json(os.path.join(artifact_dir, "trace_grading.json"), trace_grading)
+    write_canonical_evidence_artifacts(
+        artifact_dir=artifact_dir,
+        mission_id=mission_id,
+        task_class="read_only",
+        answer_graph=answer_graph,
+        coverage_graph=coverage_graph,
+        claim_graph=claim_graph,
+        ledger_payload=ledger_payload,
+        report=report,
+    )
+    write_adoption_or_recovery(
+        artifact_dir=artifact_dir,
+        mission_id=mission_id,
+        route_class="managed_read_only",
+        pending_tool_calls_emitted=0,
+        runtime_recovery_used=False,
+    )
     _write_text(os.path.join(artifact_dir, "trace.jsonl"), _readonly_trace_jsonl(ledger, report))
     visible_trace_path = os.path.join(artifact_dir, "visible_commentary.jsonl")
     if not os.path.exists(visible_trace_path):
@@ -665,6 +845,14 @@ def _reconcile_readonly_runtime_entitlement(report: dict, status: str, answer_gr
         decision["reason"] = "answer_graph_can_complete_without_runtime_insufficiency"
         report.setdefault("caveats", []).append(
             "Runtime promoted model PARTIAL to COMPLETE because required evidence and answer coverage were complete."
+        )
+    elif proposed == "COMPLETE" and (not can_complete or reasons):
+        proposed = "PARTIAL"
+        report["status"] = "PARTIAL"
+        decision["decision"] = "demoted_complete_to_partial"
+        decision["reason"] = "answer_graph_cannot_complete_with_runtime_insufficiency"
+        report.setdefault("caveats", []).append(
+            "Runtime demoted COMPLETE to PARTIAL because required evidence or source coverage was incomplete."
         )
     elif proposed == "PARTIAL" and not reasons:
         decision["decision"] = "partial_supported_by_runtime_unknown_insufficiency"

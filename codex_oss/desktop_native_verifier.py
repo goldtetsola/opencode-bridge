@@ -43,12 +43,18 @@ def verify_desktop_native_ux(
         "visible_commentary_jsonl": artifact_dir / "visible_commentary.jsonl",
         "commentary_delivery": artifact_dir / "commentary_delivery.json",
         "summary_md": artifact_dir / "summary.md",
+        "canonical_evidence_bundle": artifact_dir / "canonical_evidence_bundle.json",
         "canonical_read_evidence": artifact_dir / "canonical_read_evidence.json",
         "canonical_patch_evidence": artifact_dir / "canonical_patch_evidence.json",
         "report_json": artifact_dir / "report.json",
+        "adoption_or_recovery": artifact_dir / "adoption_or_recovery.json",
         "adoption_probes": artifact_dir / "tool_call_adoption_probes.json",
+        "consumer_observation_witness": artifact_dir / "consumer_observation_witness.json",
+        "spawned_transcript_authority": artifact_dir / "spawned_transcript_authority.json",
+        "commentary_delivery_reconciliation": artifact_dir / "commentary_delivery_reconciliation.json",
         "state_machine_ledger": artifact_dir / "tool_state_machine_ledger.json",
         "mission_json": artifact_dir / "mission.json",
+        "mission_canonical": artifact_dir / "mission_canonical.json",
     }
     artifact_payloads = {name: _read_json(file_path) for name, file_path in artifact_path_map.items()}
     desktop_render_surface = _desktop_render_surface(
@@ -67,14 +73,14 @@ def verify_desktop_native_ux(
         "visible_commentary_jsonl": artifact_path_map["visible_commentary_jsonl"].exists(),
         "commentary_delivery": artifact_path_map["commentary_delivery"].exists(),
         "summary_md": artifact_path_map["summary_md"].exists(),
-        "canonical_evidence": artifact_path_map["canonical_read_evidence"].exists()
-        or artifact_path_map["canonical_patch_evidence"].exists(),
+        "canonical_evidence": _canonical_evidence_present(artifact_payloads),
         "report_json": artifact_path_map["report_json"].exists(),
-        "adoption_probes": artifact_path_map["adoption_probes"].exists(),
+        "adoption_or_recovery": _adoption_or_recovery_proven(artifact_payloads.get("adoption_or_recovery"), artifact_payloads.get("adoption_probes")),
+        "spawned_transcript_authority": _spawned_transcript_authority_proven(artifact_payloads.get("spawned_transcript_authority")),
     }
     route_ok = route_allows_desktop_gold(route_authority)
     mission_identity_ok = _mission_identity_matches(mission_id, artifact_payloads, transcript_meta)
-    adoption_ok = _adoption_or_recovery_proven(artifact_payloads.get("adoption_probes"))
+    adoption_ok = bool(artifacts["adoption_or_recovery"])
     final_gate = evaluate_final_claim_gate(
         claim_type="desktop_gold",
         requested_status="DESKTOP_GOLD",
@@ -101,14 +107,20 @@ def verify_desktop_native_ux(
             "expected_event_count": len(expected_event_ids),
         },
         {"name": "consumer_observation_witness", "ok": consumer_observation_witness.get("ok"), "witness": consumer_observation_witness},
+        {
+            "name": "spawned_transcript_authority",
+            "ok": artifacts["spawned_transcript_authority"],
+            "authority": artifact_payloads.get("spawned_transcript_authority", {}),
+        },
         {"name": "final_present", "ok": final_present},
         {"name": "artifacts_reconcile", "ok": all(artifacts.values()), "artifacts": artifacts},
         {"name": "mission_identity", "ok": mission_identity_ok},
         {"name": "adoption_or_recovery", "ok": adoption_ok},
         {
-            "name": "desktop_pre_final_text_probe",
-            "ok": str(desktop_render_surface.get("probe_status") or "unknown").lower() == "pass",
+            "name": "render_surface_proof",
+            "ok": bool((final_gate.get("render_surface_proof") or {}).get("ok")),
             "desktop_render_surface": desktop_render_surface,
+            "render_surface_proof": final_gate.get("render_surface_proof", {}),
         },
         {"name": "artifact_hashes_present", "ok": all(final_gate.get("artifact_hashes", {}).values())},
         {"name": "oss_final_claim_gate", "ok": final_gate.get("ok"), "reasons": final_gate.get("reasons", [])},
@@ -133,8 +145,9 @@ def verify_desktop_native_ux(
         missing.append("mission_identity_mismatch")
     if not adoption_ok:
         missing.append("adoption_or_recovery_missing")
-    probe_status = str(desktop_render_surface.get("probe_status") or "unknown").lower()
-    if probe_status != "pass":
+    render_surface_proof = final_gate.get("render_surface_proof") if isinstance(final_gate.get("render_surface_proof"), dict) else {}
+    if not render_surface_proof.get("ok"):
+        probe_status = str(desktop_render_surface.get("probe_status") or "unknown").lower()
         missing.append(f"desktop_pre_final_text_probe_not_passed:{probe_status or 'unknown'}")
     if not all(final_gate.get("artifact_hashes", {}).values()):
         missing.append("artifact_hash_missing")
@@ -149,6 +162,7 @@ def verify_desktop_native_ux(
     report["consumer_observation_witness"] = consumer_observation_witness
     report["final_claim_gate"] = final_gate
     report["desktop_render_surface"] = desktop_render_surface
+    report["render_surface_proof"] = final_gate.get("render_surface_proof", {})
     return report
 
 
@@ -245,7 +259,9 @@ def _mission_identity_matches(mission_id: str, artifacts: dict[str, JSON | None]
     candidates = [
         transcript_meta.get("mission_id"),
         (artifacts.get("mission_json") or {}).get("mission_id"),
+        (artifacts.get("mission_canonical") or {}).get("mission_id"),
         (artifacts.get("report_json") or {}).get("mission_id"),
+        (artifacts.get("canonical_evidence_bundle") or {}).get("mission_id"),
         (artifacts.get("canonical_read_evidence") or {}).get("mission_id"),
         (artifacts.get("canonical_patch_evidence") or {}).get("mission_id"),
     ]
@@ -253,7 +269,18 @@ def _mission_identity_matches(mission_id: str, artifacts: dict[str, JSON | None]
     return bool(present) and all(item == expected for item in present)
 
 
-def _adoption_or_recovery_proven(adoption_payload: JSON | None) -> bool:
+def _canonical_evidence_present(artifact_payloads: dict[str, JSON | None]) -> bool:
+    bundle = artifact_payloads.get("canonical_evidence_bundle")
+    if isinstance(bundle, dict) and bundle.get("schema_version") == "canonical_evidence_bundle.v1":
+        return True
+    return bool(artifact_payloads.get("canonical_read_evidence") or artifact_payloads.get("canonical_patch_evidence"))
+
+
+def _adoption_or_recovery_proven(adoption_or_recovery_payload: JSON | None, adoption_payload: JSON | None = None) -> bool:
+    if isinstance(adoption_or_recovery_payload, dict):
+        status = str(adoption_or_recovery_payload.get("status") or "").upper()
+        if status in {"PASS", "RECOVERED", "NOT_APPLICABLE"}:
+            return True
     if not isinstance(adoption_payload, dict):
         return False
     probes = adoption_payload.get("probes")
@@ -269,6 +296,24 @@ def _adoption_or_recovery_proven(adoption_payload: JSON | None) -> bool:
             return False
         if not (probe.get("consumer_adopted") or probe.get("recovery_used")):
             return False
+    return True
+
+
+def _spawned_transcript_authority_proven(authority_payload: JSON | None) -> bool:
+    if not isinstance(authority_payload, dict):
+        return False
+    if authority_payload.get("schema_version") != "spawned_transcript_authority.v1":
+        return False
+    if not authority_payload.get("ok"):
+        return False
+    if authority_payload.get("consumer_kind") != "codex_desktop_spawned":
+        return False
+    if str(authority_payload.get("basis") or "") != "raw_desktop_child_transcript":
+        return False
+    if int(authority_payload.get("pre_final_progress_count", 0) or 0) < 3:
+        return False
+    if not authority_payload.get("final_present"):
+        return False
     return True
 
 
@@ -300,7 +345,14 @@ def _is_progress_message(message: JSON) -> bool:
         return False
     phase = str(message.get("phase", "") or "").lower()
     text = str(message.get("text", "") or "").lower()
-    return phase in {"commentary", "read_floor", "plan", "verify", "report"} or "[oss progress]" in text
+    metadata = message.get("metadata") if isinstance(message, dict) else {}
+    visible = metadata.get("oss_visible_event") if isinstance(metadata, dict) else None
+    return (
+        phase in {"commentary", "read_floor", "plan", "verify", "report"}
+        or "[oss progress]" in text
+        or "oss-progress" in text
+        or isinstance(visible, dict)
+    )
 
 
 def _progress_before_final(messages: list[JSON]) -> int:

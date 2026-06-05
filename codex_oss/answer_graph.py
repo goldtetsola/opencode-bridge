@@ -48,7 +48,7 @@ def refresh_answer_graph(
     claims = list((claim_graph or getattr(ledger, "claim_graph", {}) or {}).get("claims", []) or getattr(ledger, "claims", []) or [])
     command_refs = _command_refs(ledger)
     file_entries = getattr(ledger, "files_inspected", {}) or {}
-    inspected_paths = set(file_entries.keys())
+    inspected_paths = _successful_file_read_paths(file_entries)
     obligation_views = []
     agenda_items = []
     declared_requirement_paths: set[str] = set()
@@ -79,14 +79,15 @@ def refresh_answer_graph(
     for path in list(plan.get("must_inspect", []) or []):
         if not path or path in declared_requirement_paths:
             continue
+        source_state = _global_must_inspect_source_state(path, file_entries, command_refs)
         agenda_items.append({
             "id": f"agenda_global_{_slug(path)}",
             "kind": "required_read",
             "path": path,
             "obligation_id": "global_must_inspect",
             "priority": "high",
-            "status": "done" if path in inspected_paths else "pending",
-            "source_state": "read_satisfied" if path in inspected_paths else "missing",
+            "status": "done" if source_state == "read_satisfied" else "pending",
+            "source_state": source_state,
             "reason": "Mission declared this path as must_inspect.",
             "prefetch": True,
         })
@@ -255,7 +256,7 @@ def evaluate_answer_sufficiency(
         for item in agenda_items
         if item.get("kind") == "required_read"
         and item.get("status") == "pending"
-        and str(item.get("source_state", "") or "") == "missing"
+        and str(item.get("source_state", "") or "") in {"missing", "blocked", "read_failed"}
     ]
     partial_extracts = any(
         not bool(getattr(entry, "complete", False))
@@ -611,6 +612,42 @@ def _source_requirement_view(requirement: dict[str, Any], inspected_paths: set[s
     }
 
 
+def _successful_file_read_paths(file_entries: dict[str, Any] | None) -> set[str]:
+    paths: set[str] = set()
+    for path, entry in (file_entries or {}).items():
+        if _file_entry_has_successful_content(entry):
+            paths.add(str(path))
+    return paths
+
+
+def _file_entry_has_successful_content(entry: Any) -> bool:
+    return bool(
+        entry is not None
+        and getattr(entry, "complete", False)
+        and (getattr(entry, "cached_text", "") or getattr(entry, "sha256", ""))
+    )
+
+
+def _global_must_inspect_source_state(path: str, file_entries: dict[str, Any] | None, command_refs: list[dict[str, Any]]) -> str:
+    file_entry = (file_entries or {}).get(path)
+    if _file_entry_has_successful_content(file_entry):
+        return "read_satisfied"
+
+    saw_failed_read = False
+    for item in command_refs:
+        if path and path != item.get("path"):
+            continue
+        tool_name = str(item.get("tool_name", "") or "")
+        if tool_name not in ("rtk_read", "read"):
+            continue
+        if int(item.get("exit_code", 0) or 0) == 0:
+            return "read_satisfied"
+        saw_failed_read = True
+    if saw_failed_read:
+        return "blocked"
+    return "missing"
+
+
 def _evidence_plane(requirement: dict[str, Any]) -> str:
     return str(requirement.get("evidence_plane", "") or "") or "file_content"
 
@@ -853,12 +890,20 @@ def _coverage_status(obligations: list[dict[str, Any]], agenda_items: list[dict[
     contradicted = [item.get("id", "") for item in required if item.get("status") == "contradicted"]
     blocked = [item.get("id", "") for item in required if item.get("status") == "blocked_source"]
     insufficient = [item.get("id", "") for item in required if item.get("status") == "insufficient_evidence"]
+    blocked_sources = [
+        str(item.get("path", "") or "")
+        for item in agenda_items
+        if str(item.get("kind", "") or "").startswith("required_")
+        and item.get("status") == "pending"
+        and str(item.get("source_state", "") or "") in {"blocked", "read_failed"}
+    ]
+    blocked.extend(f"source:{path}" for path in blocked_sources)
     missing_sources = [
         str(item.get("path", "") or "")
         for item in agenda_items
         if str(item.get("kind", "") or "").startswith("required_")
         and item.get("status") == "pending"
-        and str(item.get("source_state", "") or "") == "missing"
+        and str(item.get("source_state", "") or "") in {"missing", "blocked", "read_failed"}
     ]
     coverage_complete = len(answered) == len(required) and not missing_sources and not contradicted and not blocked and not insufficient
     if contradicted or blocked:

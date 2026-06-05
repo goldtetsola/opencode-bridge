@@ -102,6 +102,11 @@ def synthesize_objective_finding(mission: Any, ledger: Any) -> Optional[dict]:
         return _synthesize_function_location(spec, ledger)
     if spec.objective_type == "zero_match_evidence":
         return _synthesize_zero_match(spec, ledger)
+    if spec.objective_type == "generic_evidence":
+        obligations = list(getattr(mission, "answer_obligations", []) or [])
+        if obligations and not _obligations_are_deliverable_labels(obligations):
+            return None
+        return _synthesize_generic_evidence_fact(mission, ledger)
     return None
 
 
@@ -257,6 +262,80 @@ def _synthesize_zero_match(spec: ObjectiveSpec, ledger: Any) -> Optional[dict]:
                 "confidence": "LOW",
             }
     return None
+
+
+def _synthesize_generic_evidence_fact(mission: Any, ledger: Any) -> Optional[dict]:
+    objective = str(getattr(mission, "objective", "") or "")
+    terms = _objective_terms(objective)
+    best: tuple[int, EvidenceHit, str] | None = None
+    for evidence in _all_evidence(ledger):
+        if not evidence.path:
+            continue
+        for line in evidence.text.splitlines():
+            fact = _clean_fact_line(line)
+            if not fact:
+                continue
+            score = sum(1 for term in terms if term in fact.lower())
+            if score <= 0:
+                continue
+            # Prefer substantive markdown prose over headings that merely name a section.
+            if line.lstrip().startswith("#"):
+                score -= 1
+            if "must not" in fact.lower() or "requires" in fact.lower() or "use " in fact.lower():
+                score += 1
+            candidate = (score, evidence, fact)
+            if best is None or candidate[0] > best[0]:
+                best = candidate
+    if best is None:
+        return None
+    _score, evidence, fact = best
+    return {
+        "claim": f"{evidence.path} says: {fact}",
+        "evidence_refs": [evidence.ref],
+        "confidence": "LOW",
+    }
+
+
+def _objective_terms(objective: str) -> set[str]:
+    stop = {
+        "about", "after", "answer", "caveats", "clear", "concrete", "context",
+        "deliverable", "evidence", "fact", "final", "finding", "findings",
+        "from", "goal", "human", "inspect", "native", "only", "outcome",
+        "paths", "produce", "produces", "read", "readable", "report",
+        "result", "style", "task", "used", "verify", "whether", "with",
+    }
+    return {
+        token.lower()
+        for token in re.findall(r"[A-Za-z][A-Za-z0-9_-]{2,}", objective)
+        if token.lower() not in stop
+    }
+
+
+def _obligations_are_deliverable_labels(obligations: list[Any]) -> bool:
+    if not obligations:
+        return False
+    for obligation in obligations:
+        if not isinstance(obligation, dict):
+            return False
+        question = str(obligation.get("question", "") or "").strip()
+        if not question.startswith("Provide ") or len(question.split()) > 8:
+            return False
+    return True
+
+
+def _clean_fact_line(line: str) -> str:
+    text = str(line or "").strip()
+    if not text:
+        return ""
+    text = re.sub(r"^\s{0,3}#{1,6}\s*", "", text)
+    text = re.sub(r"^\s*[-*]\s+", "", text)
+    text = re.sub(r"`([^`]+)`", r"\1", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text.split()) < 5:
+        return ""
+    if len(text) > 260:
+        text = text[:257].rstrip() + "..."
+    return text
 
 
 def _find_mapping_value(target: str, ledger: Any) -> Optional[tuple[str, EvidenceHit]]:

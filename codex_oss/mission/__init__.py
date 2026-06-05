@@ -110,6 +110,7 @@ class MissionV1:
     closer_model: str = ""
     fallback_closer_model: str = ""
     completion_contract: dict = field(default_factory=dict)
+    desktop_tool_loop_probe: dict = field(default_factory=dict)
 
     # AdaptiveAutonomyBudgetV1
     max_model_calls: int = 25
@@ -181,7 +182,11 @@ def extract_mission_v1_block(text: str) -> Optional[str]:
             raw = json.loads(candidate)
         except json.JSONDecodeError:
             continue
-        if isinstance(raw, dict) and raw.get("schema_version") == "oss_agent_mission.v1":
+        if (
+            isinstance(raw, dict)
+            and raw.get("schema_version") == "oss_agent_mission.v1"
+            and not is_placeholder_mission_v1_example(raw)
+        ):
             mission_blocks.append(candidate)
 
     if len(mission_blocks) == 1:
@@ -192,7 +197,32 @@ def extract_mission_v1_block(text: str) -> Optional[str]:
     if len(blocks) > 1:
         raise InvalidHandoffError("No valid MissionV1 OSS_HANDOFF_JSON block found among multiple candidates")
 
-    return blocks[0].strip()
+    return None
+
+
+def is_placeholder_mission_v1_example(raw: Any) -> bool:
+    """Return whether a MissionV1-looking object is a documentation template.
+
+    Repo instructions can contain canonical-looking examples. Those examples
+    should not become active handoff authority when the Desktop request also
+    contains a real MissionV1 block.
+    """
+    if not isinstance(raw, dict):
+        return False
+    if raw.get("schema_version") != "oss_agent_mission.v1":
+        return False
+    return _contains_placeholder_token(raw)
+
+
+def _contains_placeholder_token(value: Any) -> bool:
+    if isinstance(value, str):
+        stripped = value.strip()
+        return stripped.startswith("<") and stripped.endswith(">")
+    if isinstance(value, list):
+        return any(_contains_placeholder_token(item) for item in value)
+    if isinstance(value, dict):
+        return any(_contains_placeholder_token(item) for item in value.values())
+    return False
 
 
 def _extract_handoff_json_block(text: str) -> Optional[str]:
@@ -236,6 +266,11 @@ def _build_mission(raw: dict) -> MissionV1:
     must_inspect = _validate_must_inspect(raw.get("must_inspect"))
     evidence_collection_mode = _validate_evidence_collection_mode(raw.get("evidence_collection_mode"), objective_style)
     exploration_policy = _validate_exploration_policy(raw.get("exploration_policy"), objective_style)
+    desktop_tool_loop_probe = _validate_desktop_tool_loop_probe(
+        raw.get("desktop_tool_loop_probe", {}),
+        tier=tier,
+        write_allowed=write_allowed,
+    )
 
     risk_tier = str(raw.get("risk_tier", "low")).lower()
     if risk_tier not in ("low", "medium", "critical"):
@@ -371,6 +406,7 @@ def _build_mission(raw: dict) -> MissionV1:
         must_inspect=must_inspect,
         evidence_collection_mode=evidence_collection_mode,
         exploration_policy=exploration_policy,
+        desktop_tool_loop_probe=desktop_tool_loop_probe,
         max_model_calls=max_model_calls,
         max_duplicate_actions=max_duplicate_actions,
         max_broad_searches=max_broad_searches,
@@ -565,6 +601,43 @@ def _validate_exploration_policy(raw: Any, objective_style: str) -> dict:
         "min_optional_actions_after_floor": min_optional,
         "max_optional_actions_after_floor": max_optional,
         "require_contradiction_search": bool(policy.get("require_contradiction_search", mode != "close_immediately")),
+    }
+
+
+def _validate_desktop_tool_loop_probe(raw: Any, *, tier: str, write_allowed: bool) -> dict:
+    if raw in (None, "", False):
+        return {"enabled": False}
+    if not isinstance(raw, dict):
+        raise InvalidHandoffError("desktop_tool_loop_probe must be an object")
+    enabled = bool(raw.get("enabled", False))
+    if not enabled:
+        return {"enabled": False}
+    if tier not in {TIER_A2, TIER_A3, TIER_A4, TIER_A5}:
+        raise InvalidHandoffError("desktop_tool_loop_probe is only valid for A2/A3/A4/A5 missions")
+    if write_allowed and tier != TIER_A5:
+        raise InvalidHandoffError("desktop_tool_loop_probe requires write_allowed=false except for A5 pre-action implementation probes")
+    tool_intent = str(raw.get("tool_intent", "safe_read") or "safe_read").strip().lower()
+    if tool_intent not in {"safe_read", "safe_search", "safe_list", "safe_git"}:
+        raise InvalidHandoffError("desktop_tool_loop_probe.tool_intent must be safe_read, safe_search, safe_list, or safe_git")
+    target_path = str(raw.get("target_path", "") or "").strip()
+    if not target_path:
+        raise InvalidHandoffError("desktop_tool_loop_probe.target_path is required")
+    expected_resolution = str(raw.get("expected_resolution", "adopt_or_recover") or "adopt_or_recover").strip().lower()
+    if expected_resolution not in {"adopt_or_recover", "recover_after_tool_failure"}:
+        raise InvalidHandoffError("desktop_tool_loop_probe.expected_resolution must be adopt_or_recover or recover_after_tool_failure")
+    try:
+        max_pending_calls = int(raw.get("max_pending_calls", 1))
+    except (TypeError, ValueError):
+        raise InvalidHandoffError("desktop_tool_loop_probe.max_pending_calls must be 1")
+    if max_pending_calls != 1:
+        raise InvalidHandoffError("desktop_tool_loop_probe.max_pending_calls must be 1")
+    return {
+        "schema_version": "desktop_tool_loop_probe.v1",
+        "enabled": True,
+        "tool_intent": tool_intent,
+        "target_path": target_path,
+        "expected_resolution": expected_resolution,
+        "max_pending_calls": max_pending_calls,
     }
 
 

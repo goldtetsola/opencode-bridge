@@ -74,6 +74,9 @@ def main():
     vh = sub.add_parser("validate-handoff", help="Validate an OSS_HANDOFF_JSON handoff file")
     vh.add_argument("file", help="Markdown or text file containing OSS_HANDOFF_JSON")
 
+    vmh = sub.add_parser("validate-mission-handoff", help="Validate a canonical MissionV1 OSS_HANDOFF_JSON handoff file")
+    vmh.add_argument("file", help="Markdown or text file containing canonical MissionV1 OSS_HANDOFF_JSON")
+
     # mission — explicit runtime-backed delegation surface
     mission = sub.add_parser("mission", help="Create or run MissionV1 runtime-backed OSS tasks")
     mission_sub = mission.add_subparsers(dest="mission_command", help="Mission commands")
@@ -252,7 +255,11 @@ def main():
 
     certify = sub.add_parser("certify", help="Run explicit certification gates and write certification artifacts")
     certify.add_argument("--project", type=str, default=None, help="Project root path")
-    certify.add_argument("--target", choices=["runtime_backed", "open_investigation", "repo_hygiene", "raw_free_editing_smoke", "raw_free_editing", "all"], default="all")
+    certify.add_argument("--target", choices=["runtime_backed", "open_investigation", "repo_hygiene", "raw_free_editing_smoke", "raw_free_editing", "native-like", "desktop-gold", "oss-native-parity", "all"], default="all")
+    certify.add_argument("--mission-id", default="", help="Mission ID for native-like/desktop-gold/oss-native-parity targets; defaults to latest mission artifact")
+    certify.add_argument("--handoff", default="", help="Canonical MissionV1 handoff file for --target native-like")
+    certify.add_argument("--transcript", default="", help="Captured Codex Desktop transcript for native-like/desktop-gold targets")
+    certify.add_argument("--route-authority", default="", help="RouteAuthorityV1 JSON file for native-like/desktop-gold targets")
     certify.add_argument("--no-refresh", action="store_true", help="Do not regenerate proof/operational evidence before certification")
     certify.add_argument("--json", action="store_true", help="Machine-readable output")
 
@@ -289,6 +296,33 @@ def main():
     route_authority.add_argument("--consumer-kind", choices=["direct_bridge_harness", "codex_desktop_spawned"], default="direct_bridge_harness")
     route_authority.add_argument("--output", default=None, help="Optional file path to write JSON")
 
+    spawn_lifecycle = sub.add_parser("spawn-lifecycle", help="Persist SpawnLifecycleProofV1 artifacts for Desktop MissionV1 child runs")
+    spawn_lifecycle_sub = spawn_lifecycle.add_subparsers(dest="spawn_lifecycle_command", help="Spawn lifecycle commands")
+    spawn_finalize = spawn_lifecycle_sub.add_parser("finalize", help="Finalize a spawned Desktop child transcript proof")
+    spawn_finalize.add_argument("--project", required=True, help="Project root containing .codex-oss/missions")
+    spawn_finalize.add_argument("--mission-id", required=True, help="Mission ID")
+    spawn_finalize.add_argument("--agent-id", default="", help="spawn_agent returned agent_id; canonical transcript identity")
+    spawn_finalize.add_argument("--agent-role", default="", help="Spawned agent role, e.g. oss_deepseek_implementer")
+    spawn_finalize.add_argument("--parent-thread-id", default="", help="Parent Codex Desktop thread ID if available")
+    spawn_finalize.add_argument("--model-alias", default="", help="Mission model alias, e.g. mission-a5-deepseek")
+    spawn_finalize.add_argument("--model-provider", default="", help="Provider/route hint if available")
+    spawn_finalize.add_argument("--thread-export", default="", help="JSON output from codex_app.read_thread(threadId=agent_id)")
+    spawn_finalize.add_argument("--read-thread-error", default="", help="Failure detail when codex_app.read_thread(threadId=agent_id) failed")
+    spawn_finalize.add_argument("--json", action="store_true", help="Machine-readable output")
+
+    tool_loop_proof = sub.add_parser("tool-loop-proof", help="Record Desktop-observed tool-loop/recovery proof artifacts")
+    tool_loop_sub = tool_loop_proof.add_subparsers(dest="tool_loop_command", help="Tool-loop proof commands")
+    tool_loop_record = tool_loop_sub.add_parser("record", help="Record one Desktop pending tool call as adopted/recovered/fail-closed")
+    tool_loop_record.add_argument("--project", required=True, help="Project root containing .codex-oss/missions")
+    tool_loop_record.add_argument("--mission-id", required=True, help="Mission ID")
+    tool_loop_record.add_argument("--call-id", required=True, help="Responses tool call ID")
+    tool_loop_record.add_argument("--tool-name", required=True, help="Tool/function name")
+    tool_loop_record.add_argument("--status", choices=["adopted", "recovered", "fail-closed"], required=True, help="Observed Desktop tool-loop outcome")
+    tool_loop_record.add_argument("--response-id", default="response_desktop_observed", help="Responses response ID")
+    tool_loop_record.add_argument("--item-id", default="", help="Responses item ID")
+    tool_loop_record.add_argument("--evidence-source", default="", help="Pointer to raw Desktop transcript, SSE, or harness observation")
+    tool_loop_record.add_argument("--json", action="store_true", help="Machine-readable output")
+
     desktop_observation = sub.add_parser("desktop-observation", help="Build or classify DesktopObservationV1 transcript evidence")
     desktop_observation_sub = desktop_observation.add_subparsers(dest="desktop_observation_command", help="Desktop observation commands")
 
@@ -315,6 +349,14 @@ def main():
     desktop_observation_reconcile.add_argument("--mission-dir", required=True, help="Mission artifact directory")
     desktop_observation_reconcile.add_argument("--transcript", required=True, help="Desktop transcript JSON file")
     desktop_observation_reconcile.add_argument("--json", action="store_true", help="Machine-readable output")
+
+    desktop_observation_capture = desktop_observation_sub.add_parser("capture-thread", help="Persist a Desktop thread transcript witness and reconciliation")
+    desktop_observation_capture.add_argument("--mission-id", required=True, help="Mission ID")
+    desktop_observation_capture.add_argument("--thread-id", default="", help="Codex Desktop spawned-agent thread ID")
+    desktop_observation_capture.add_argument("--spawned-agent-id", default="", help="Codex Desktop spawned-agent ID")
+    desktop_observation_capture.add_argument("--project", required=True, help="Project root containing .codex-oss/missions")
+    desktop_observation_capture.add_argument("--transcript", default="", help="Raw exported transcript JSON; defaults to mission desktop_thread_transcript.json")
+    desktop_observation_capture.add_argument("--json", action="store_true", help="Machine-readable output")
 
     desktop_observation_consume_sse = desktop_observation_sub.add_parser(
         "consume-sse",
@@ -447,6 +489,9 @@ def main():
 
     elif args.command == "validate-handoff":
         sys.exit(_validate_handoff(args.file))
+
+    elif args.command == "validate-mission-handoff":
+        sys.exit(_validate_mission_handoff(args.file))
 
     elif args.command == "show-trace":
         project_root = args.project or os.getcwd()
@@ -649,7 +694,31 @@ def main():
 
     elif args.command == "certify":
         project_root = args.project or os.getcwd()
-        report = certify_project(project_root, target=args.target, refresh=not bool(args.no_refresh))
+        if args.target == "native-like":
+            from codex_oss.native_certification import certify_native_like_project
+            report = certify_native_like_project(
+                project_root,
+                mission_id=args.mission_id,
+                handoff_path=args.handoff,
+                transcript_path=args.transcript,
+                route_authority_path=args.route_authority,
+            )
+        elif args.target == "desktop-gold":
+            from codex_oss.native_certification import certify_desktop_gold_project
+            report = certify_desktop_gold_project(
+                project_root,
+                mission_id=args.mission_id,
+                transcript_path=args.transcript,
+                route_authority_path=args.route_authority,
+            )
+        elif args.target == "oss-native-parity":
+            from codex_oss.native_certification import certify_oss_native_parity_project
+            report = certify_oss_native_parity_project(
+                project_root,
+                mission_id=args.mission_id,
+            )
+        else:
+            report = certify_project(project_root, target=args.target, refresh=not bool(args.no_refresh))
         if args.json:
             print(json_dumps_safe(report))
         else:
@@ -757,6 +826,64 @@ def main():
             Path(args.output).write_text(payload + "\n", encoding="utf-8")
         print(payload)
         sys.exit(0 if record.get("native_claim_allowed") else 1)
+
+    elif args.command == "spawn-lifecycle":
+        from codex_oss.spawn_lifecycle import finalize_spawn_lifecycle
+
+        if args.spawn_lifecycle_command != "finalize":
+            parser.print_help()
+            sys.exit(1)
+        report = finalize_spawn_lifecycle(
+            project_root=args.project,
+            mission_id=args.mission_id,
+            agent_id=args.agent_id,
+            agent_role=args.agent_role,
+            parent_thread_id=args.parent_thread_id,
+            model_alias=args.model_alias,
+            model_provider=args.model_provider,
+            thread_export_path=args.thread_export,
+            read_thread_error=args.read_thread_error,
+        )
+        if args.json:
+            print(json_dumps_safe(report))
+        else:
+            print(f"Spawn lifecycle: {'PASS' if report.get('ok') else 'FAIL'}")
+            print(f"  mission: {report.get('mission_id', '')}")
+            print(f"  agent_id: {report.get('agent_id', '')}")
+            print(f"  transcript: {report.get('desktop_thread_transcript_path', '')}")
+            print(f"  route_authority: {report.get('route_authority_path', '')}")
+            print(f"  certification: {report.get('certification_result_path', '')}")
+            for reason in report.get("reasons", []):
+                print(f"  reason: {reason}")
+        sys.exit(0 if report.get("ok") else 1)
+
+    elif args.command == "tool-loop-proof":
+        from codex_oss.tool_loop_proof import record_tool_loop_proof
+
+        if args.tool_loop_command != "record":
+            parser.print_help()
+            sys.exit(1)
+        report = record_tool_loop_proof(
+            project_root=args.project,
+            mission_id=args.mission_id,
+            call_id=args.call_id,
+            tool_name=args.tool_name,
+            status=args.status,
+            response_id=args.response_id,
+            item_id=args.item_id,
+            evidence_source=args.evidence_source,
+        )
+        if args.json:
+            print(json_dumps_safe(report))
+        else:
+            print(f"Tool-loop proof: {'PASS' if report.get('ok') else 'FAIL'}")
+            print(f"  mission: {report.get('mission_id', '')}")
+            print(f"  status: {report.get('status', '')}")
+            print(f"  recovery: {report.get('recovery_status', '')}")
+            print(f"  probes: {report.get('tool_call_adoption_probes_path', '')}")
+            for reason in report.get("reasons", []):
+                print(f"  reason: {reason}")
+        sys.exit(0 if report.get("ok") else 1)
 
     elif args.command == "desktop-observation":
         sys.exit(_desktop_observation(args))
@@ -878,6 +1005,30 @@ def _desktop_observation(args) -> int:
                 print(f"  missing: {reason}")
         return 0 if report.get("ok") else 1
 
+    if args.desktop_observation_command == "capture-thread":
+        from codex_oss.desktop_observation import capture_thread_observation
+
+        mission_dir = Path(args.project) / ".codex-oss" / "missions" / args.mission_id
+        transcript_path = args.transcript or str(mission_dir / "desktop_thread_transcript.json")
+        report = capture_thread_observation(
+            project_root=args.project,
+            mission_id=args.mission_id,
+            thread_id=args.thread_id,
+            spawned_agent_id=args.spawned_agent_id,
+            transcript_path=transcript_path,
+        )
+        if args.json:
+            print(json_dumps_safe(report))
+        else:
+            print(f"Desktop thread capture: {'PASS' if report.get('ok') else 'FAIL'}")
+            print(f"  transcript: {report.get('transcript_path', '')}")
+            print(f"  witness: {report.get('consumer_observation_witness_path', '')}")
+            print(f"  authority: {report.get('spawned_transcript_authority_path', '')}")
+            print(f"  reconciliation: {report.get('commentary_delivery_reconciliation_path', '')}")
+            for reason in report.get("reasons", []):
+                print(f"  missing: {reason}")
+        return 0 if report.get("ok") else 1
+
     if args.desktop_observation_command == "consume-sse":
         try:
             sse_text = Path(args.sse).read_text(encoding="utf-8", errors="replace")
@@ -910,7 +1061,7 @@ def _desktop_observation(args) -> int:
                 print(f"  missing: {reason}")
         return 0 if report.get("ok") else 1
 
-    print("Usage: codex-oss desktop-observation <classify|wrap|from-sse|reconcile|consume-sse>", file=sys.stderr)
+    print("Usage: codex-oss desktop-observation <classify|wrap|from-sse|reconcile|capture-thread|consume-sse>", file=sys.stderr)
     return 1
 
 
@@ -1075,6 +1226,32 @@ def _validate_handoff(path: str) -> int:
         "write_allowed": envelope["write_allowed"],
     }, indent=2))
     return 0
+
+
+def _validate_mission_handoff(path: str) -> int:
+    import json
+    from pathlib import Path
+
+    from codex_oss.native_certification import evaluate_handoff_authority
+
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except OSError as exc:
+        print(json.dumps({"valid": False, "error": str(exc)}, indent=2))
+        return 1
+
+    gate = evaluate_handoff_authority(handoff_text=text)
+    payload = {
+        "valid": bool(gate.get("ok")),
+        "handoff_type": gate.get("handoff_type", ""),
+        "schema_version": gate.get("schema_checked", ""),
+        "active_blocks": gate.get("active_blocks", 0),
+        "ignored_examples": gate.get("ignored_examples", 0),
+        "mission_id": gate.get("mission_id", ""),
+        "reasons": gate.get("reasons", []),
+    }
+    print(json.dumps(payload, indent=2))
+    return 0 if payload["valid"] else 1
 
 
 def _mission(args) -> int:
@@ -1390,6 +1567,7 @@ def _mission_compile(args) -> int:
         "workspace",
         "workspace_explicit",
         "workspace_low_risk",
+        "critical_workspace_certified",
     }
     if args.tier in ("A4", "A5", "A6") and apply_mode not in valid_apply_modes:
         print(

@@ -366,6 +366,7 @@ def assert_audit_mission_reports_runtime_artifacts():
         }
         report = apply_patch_in_isolated_worktree(proposal, mission, root)
         assert report["status"] == "VERIFIED", report
+        assert report["implementation_status"] == "verified", report
         audited = run_cmd(["audit-mission", "mission_cli_audit", "--json"], cwd=root)
         assert audited.returncode == 0, audited.stdout + audited.stderr
         payload = json.loads(audited.stdout)

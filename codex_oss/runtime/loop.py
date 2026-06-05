@@ -9,6 +9,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Any, Tuple
 
+from codex_oss.native_work_ux import native_work_contract_text
 from codex_oss.visible_commentary import model_action_public_message, safe_tool_target_text
 
 JSON = Dict[str, Any]
@@ -219,11 +220,12 @@ def run_loop(mission: Any, ledger: Any, call_model_fn, tools, emitter,
         commentary.emit(
             "mission_started",
             "Mission accepted",
-            "I'm loading the compiled MissionV1 contract and running the runtime preflight checks.",
+            native_work_contract_text(mission),
             phase="PLAN",
             source="runtime",
             model=str(getattr(mission, "runtime_model_alias", "") or ""),
             metadata={
+                "ux_shape": "native_work_contract.v1",
                 "tier": str(getattr(mission, "tier", "") or ""),
                 "risk_tier": str(getattr(mission, "risk_tier", "") or ""),
             },
@@ -339,7 +341,7 @@ def run_loop(mission: Any, ledger: Any, call_model_fn, tools, emitter,
                     commentary.emit(
                         "runtime_closure_started",
                         "Required source floor covered",
-                        "The runtime covered the required source floor, so I'm closing from the evidence graph without a final model turn.",
+                        "The runtime covered the required source floor and is closing from the evidence graph without a final model turn.",
                         phase=str(initial_answer_graph.get("investigation_state", {}).get("phase", "") or "REPORT"),
                         source="runtime",
                         metadata={"evidence_refs": _evidence_ref_summary(ledger), "model_closer_skipped": True},
@@ -351,10 +353,10 @@ def run_loop(mission: Any, ledger: Any, call_model_fn, tools, emitter,
                 f"using only the available evidence refs: {_evidence_ref_summary(ledger)}. Do not call another tool."
             )})
             if commentary is not None:
-                commentary.emit(
-                    "runtime_closure_started",
-                    "Required source floor covered",
-                    "The runtime covered the required source floor, so I'm asking only for final synthesis now.",
+                    commentary.emit(
+                        "runtime_closure_started",
+                        "Required source floor covered",
+                        "The runtime covered the required source floor and is requesting final synthesis only.",
                     phase=str(initial_answer_graph.get("investigation_state", {}).get("phase", "") or "REPORT"),
                     source="runtime",
                     metadata={"evidence_refs": _evidence_ref_summary(ledger)},
@@ -398,7 +400,7 @@ def run_loop(mission: Any, ledger: Any, call_model_fn, tools, emitter,
             model_timeout = max(1, deadline.remaining() - 2)
             model_alias_override = None
             if forced_final_requested:
-                final_timeout = float(os.getenv("RUNTIME_FINAL_REPORT_MODEL_TIMEOUT_SECONDS", "20"))
+                final_timeout = float(os.getenv("RUNTIME_FINAL_REPORT_MODEL_TIMEOUT_SECONDS", "75"))
                 model_timeout = max(1, min(model_timeout, final_timeout))
                 model_alias_override = os.getenv("RUNTIME_FINAL_REPORT_MODEL_ALIAS", "mission-a2-flash").strip() or None
                 # CloserDraftV1 flow: runtime builds skeleton, model narrates
@@ -438,9 +440,9 @@ def run_loop(mission: Any, ledger: Any, call_model_fn, tools, emitter,
                     commentary.emit(
                         "model_action_requested",
                         "Requesting final narration" if forced_final_requested else "Requesting next action",
-                        "I'm asking the OSS model for a bounded no-tool final narration."
+                        "Requesting a bounded no-tool final narration from the OSS model."
                         if forced_final_requested else
-                        "I'm asking the OSS model for the next safe investigation action.",
+                        "Requesting the next safe investigation action from the OSS model.",
                         phase=_mission_phase(ledger),
                         source="runtime",
                         model=str(getattr(mission, "last_reasoning_model", "") or getattr(mission, "runtime_model_alias", "") or ""),
@@ -511,7 +513,7 @@ def run_loop(mission: Any, ledger: Any, call_model_fn, tools, emitter,
                     commentary.emit(
                         "model_action_invalid",
                         "Model action invalid",
-                        "The OSS model response did not contain one valid ManagedInvestigationActionV1 object, so I'm asking for a repair.",
+                        "The OSS model response did not contain one valid ManagedInvestigationActionV1 object; requesting a repair.",
                         phase=_mission_phase(ledger),
                         source="runtime",
                         severity="warning",
@@ -1116,7 +1118,7 @@ def run_loop(mission: Any, ledger: Any, call_model_fn, tools, emitter,
                     commentary.emit(
                         "tool_action_started",
                         "Tool running",
-                        f"I'm running {_tool_target_text(tool_name, action.arguments)}.",
+                        f"Running {_tool_target_text(tool_name, action.arguments)}.",
                         phase=_mission_phase(ledger),
                         source="tool",
                         metadata={
@@ -1189,7 +1191,7 @@ def run_loop(mission: Any, ledger: Any, call_model_fn, tools, emitter,
                     commentary.emit(
                         "tool_result_summary",
                         "Tool result received",
-                        f"I finished {tool_name}; exit_code={exit_code}. The runtime refreshed coverage from the new evidence.",
+                        f"{tool_name} finished with exit_code={exit_code}. The runtime refreshed coverage from the new evidence.",
                         phase=phase_after,
                         source="tool",
                         evidence_refs=[f"command:{turn}"],
@@ -1283,7 +1285,7 @@ def run_loop(mission: Any, ledger: Any, call_model_fn, tools, emitter,
             try:
                 commentary.emit(
                     "mission_completed", "Mission ended",
-                    "The investigation is complete. Final report and evidence artifacts have been persisted.",
+                    "The runtime has persisted the final report and evidence artifacts for review.",
                     phase="REPORT", source="runtime",
                 )
                 commentary.close()
@@ -1469,7 +1471,7 @@ def _runtime_prefetch_required_sources(
             commentary.emit(
                 "tool_result_summary",
                 "Required source inspected",
-                f"I finished {tool_name} on {resolved}; exit_code={exit_code}. Coverage will be recomputed from this evidence.",
+                f"{tool_name} on {resolved} finished with exit_code={exit_code}. Coverage will be recomputed from this evidence.",
                 phase=str((answer_graph.get("investigation_state", {}) or {}).get("phase", "") or _mission_phase(ledger)),
                 source="tool",
                 evidence_refs=[f"command:{turn}"],

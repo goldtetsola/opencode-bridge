@@ -251,12 +251,25 @@ def _check_semantic_claim_support(finding: dict, ledger: Any, errors: List[str])
 
 def _claim_requires_definition_support(claim: str, symbol: str) -> bool:
     lower = claim.lower()
+    if _symbol_is_only_filename_stem(claim, symbol):
+        return False
     return symbol in claim and (
         "defined in" in lower
         or "definition" in lower
         or "dictionary" in lower
         or "contains" in lower
     )
+
+
+def _symbol_is_only_filename_stem(claim: str, symbol: str) -> bool:
+    matches = list(re.finditer(rf"\b{re.escape(symbol)}\b", claim))
+    if not matches:
+        return False
+    for match in matches:
+        suffix = claim[match.end():match.end() + 8].lower()
+        if not re.match(r"\.(?:md|mdx|txt|rst|adoc|json|ya?ml)\b", suffix):
+            return False
+    return True
 
 
 def _evidence_texts(refs: list[str], ledger: Any) -> Dict[str, str]:

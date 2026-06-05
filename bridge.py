@@ -224,24 +224,15 @@ def _visible_event_stream_identity(event: JSON) -> JSON:
 
 
 def _visible_event_stream_text(event: JSON) -> str:
-    """Render a durable Desktop-visible marker without relying on metadata support."""
-    mission_id = str(event.get("mission_id") or "").strip()
-    event_id = str(event.get("event_id") or "").strip()
-    event_type = str(event.get("event_type") or "progress").strip() or "progress"
-    seq = event.get("seq")
-    seq_text = str(seq).strip() if seq not in (None, "") else "?"
-    title = str(event.get("title") or "").strip()
-    message = str(event.get("message") or "").strip()
-    body = f"{title}: {message}" if title and message else (message or title)
-    if not body:
-        body = event_type.replace("_", " ")
-    if mission_id and event_id:
-        marker = f"[OSS progress mission={mission_id} event={event_id} seq={seq_text} type={event_type}]"
-    elif mission_id:
-        marker = f"[OSS progress {mission_id}#{seq_text} {event_type}]"
-    else:
-        marker = f"[OSS progress #{seq_text} {event_type}]"
-    return f"{marker} {body}".strip()
+    """Render Desktop-visible work notes; event identity stays in metadata/artifacts."""
+    try:
+        from codex_oss.native_work_ux import native_work_note
+        text = native_work_note(event)
+    except Exception:
+        title = str(event.get("title") or "").strip()
+        message = str(event.get("message") or "").strip()
+        text = f"{title}: {message}" if title and message else (message or title)
+    return str(text or "").strip()
 
 
 def _emit_visible_commentary_event(emitter: Any, event: JSON) -> None:
@@ -1719,6 +1710,39 @@ def build_legacy_write_demoted_report(mode: str, envelope: Optional[dict] = None
     )
 
 
+def build_outside_owned_write_refusal_report(target_path: str, envelope: Optional[dict] = None) -> str:
+    """Terminal report for explicit raw write requests outside owned_paths."""
+    envelope = envelope or {}
+    owned = ", ".join(str(path) for path in envelope.get("owned_paths", []) if str(path).strip()) or "none"
+    return (
+        "FAILED\n"
+        "Synthesis status: DETERMINISTIC_OUTSIDE_SCOPE_WRITE_REFUSED\n"
+        f"Reason: requested write target is outside owned_paths: {target_path}\n"
+        f"Owned paths: {owned}\n"
+        "Terminal authority: bridge_runtime\n"
+        "No files were written.\n"
+        "Confidence: HIGH\n"
+        "Caveats: Raw bounded-write requests must stay inside the declared owned path scope."
+    )
+
+
+def explicit_outside_owned_write_target(prompt_text: str, envelope: dict, project_root: str) -> str:
+    """Return the first explicit path-like write target outside owned_paths."""
+    lowered = (prompt_text or "").lower()
+    if not any(token in lowered for token in ("write", "edit", "modify", "append", "create")):
+        return ""
+    owned_paths = list(envelope.get("owned_paths") or [])
+    for match in re.finditer(r"(?<![A-Za-z0-9_./-])([A-Za-z0-9_./-]+\.[A-Za-z0-9_]+)(?![A-Za-z0-9_./-])", prompt_text or ""):
+        candidate = match.group(1).strip()
+        if not candidate or candidate.startswith(".codex-oss/"):
+            continue
+        if not _path_is_within_project(candidate, project_root):
+            continue
+        if not _path_is_within_owned_paths(candidate, owned_paths, project_root):
+            return _repo_relative_path(candidate, project_root)
+    return ""
+
+
 def raw_write_handoff_demoted_report(handoff_text: str, legacy_enabled: Optional[bool] = None) -> str:
     """Return a deterministic fail-closed report for raw write/implementation handoffs."""
     if legacy_enabled is None:
@@ -2782,6 +2806,61 @@ def _persist_read_evidence_artifacts(
         pass  # Artifact persistence is best-effort
 
 
+def _persist_pending_tool_recovery_artifacts(
+    *,
+    mission_dir: str,
+    mission_id: str,
+    child_state: StoredResponse,
+    pending_items: list,
+    reason: str,
+) -> None:
+    """Persist recovered pending-call probes for MissionV1 recovery evidence."""
+    try:
+        if not pending_items:
+            return
+        from codex_oss.mission_authority_artifacts import write_adoption_or_recovery
+        from codex_oss.tool_call_adoption import persist_adoption_probes
+
+        sm = adoption_state_machine_from_response(child_state)
+        for item in pending_items:
+            if not isinstance(item, dict):
+                continue
+            call_id = str(item.get("call_id") or "")
+            if not call_id:
+                continue
+            if call_id not in sm.calls:
+                sm.register_tool_call(
+                    call_id=call_id,
+                    tool_name=str(item.get("name") or "tool"),
+                    arguments={"raw": item.get("arguments", "{}")},
+                    output_item_id=str(item.get("id") or f"fc_{call_id}"),
+                )
+            sm.mark_replayed(call_id)
+            sm.mark_recovered(call_id, reason)
+        probes = sm.to_probes()
+        write_adoption_or_recovery(
+            artifact_dir=mission_dir,
+            mission_id=mission_id,
+            route_class="managed_read_only",
+            pending_tool_calls_emitted=len(probes),
+            runtime_recovery_used=bool(probes),
+            artifacts=["tool_call_adoption_probes.json", "tool_state_machine_ledger.json"],
+        )
+        persist_adoption_probes(mission_dir, probes, sm)
+        recovery_path = os.path.join(mission_dir, "recovery_proof.json")
+        with open(recovery_path, "w", encoding="utf-8") as handle:
+            json.dump({
+                "schema_version": "recovery_proof.v1",
+                "mission_id": mission_id,
+                "status": "RECOVERED",
+                "injected_failure": False,
+                "reason": reason,
+                "pending_tool_calls_recovered": len(probes),
+            }, handle, indent=2, sort_keys=True)
+    except Exception:
+        pass  # Artifact persistence is best-effort
+
+
 def complete_pending_reads_from_bridge(
     *,
     parent_response_id: str,
@@ -2997,6 +3076,13 @@ def complete_pending_reads_from_bridge(
         replay_count=child_state.pending_replay_count,
         reason="pending_tool_call_not_adopted_recovered_by_bridge",
     )
+    _persist_pending_tool_recovery_artifacts(
+        mission_dir=mission_dir,
+        mission_id=mission_id,
+        child_state=child_state,
+        pending_items=pending_items,
+        reason="pending_tool_call_not_adopted_recovered_by_bridge",
+    )
 
     # Attempt model-authored narration
     if callable(finalizer_call) and not failures:
@@ -3081,16 +3167,6 @@ def complete_pending_reads_from_bridge(
         source="runtime",
         artifact_refs=["canonical_read_evidence.json", "visible_commentary.jsonl", "summary.md"],
     )
-    # ── v11: Persist adoption probes from child state ──
-    if child_state.adoption_probes_json:
-        try:
-            from codex_oss.tool_call_adoption import persist_adoption_probes
-            sm = adoption_state_machine_from_response(child_state)
-            probes = sm.to_probes()
-            persist_adoption_probes(mission_dir, probes, sm)
-        except Exception:
-            pass
-
     commentary.close({"status": status, "mission_id": mission_id, "confidence": "HIGH" if status == "COMPLETE" else "MEDIUM", "closure_source": "deterministic_server_side_read_completion"})
 
     return build_server_side_read_completion_report(
@@ -5371,6 +5447,44 @@ class Handler(BaseHTTPRequestHandler):
                     self._send_raw(status, data, ctype)
                 return
 
+            request_kind = classify_request_kind(body)
+            if request_kind in ("tool_result_continuation", "orphan_tool_result_continuation"):
+                self._handle_continuation(body)
+                return
+
+            from codex_oss.desktop_tool_loop_probe import (
+                build_desktop_tool_loop_probe_response,
+                mission_requests_desktop_tool_loop_probe,
+            )
+            if mission_requests_desktop_tool_loop_probe(body):
+                base_messages, _ = extract_request_messages_and_tool_outputs(body)
+                response_id = new_id("resp")
+                created_at = now()
+                probe = build_desktop_tool_loop_probe_response(
+                    body=body,
+                    raw_model_alias=raw_model_alias,
+                    base_messages=base_messages,
+                    project_root=os.getcwd(),
+                    state_put=APP.state.put,
+                    stored_response_factory=StoredResponse,
+                    response_id=response_id,
+                    created_at=created_at,
+                    new_call_id=new_id,
+                    json_dumps=json_dumps,
+                )
+                if probe.handled:
+                    APP.log(
+                        "desktop_tool_loop_probe_route",
+                        mission_id=probe.mission_id,
+                        status=probe.status,
+                        reason=probe.reason,
+                    )
+                    if body.get("stream"):
+                        self._send_sse(probe.response_obj or APP.build_response_shell(body, raw_model_alias, response_id, created_at=created_at))
+                    else:
+                        self._send_json(200, probe.response_obj or APP.build_response_shell(body, raw_model_alias, response_id, created_at=created_at))
+                    return
+
             # ── v1 spec: A2/A3 managed investigation via runtime loop ──
             from codex_oss.managed_bridge import run_managed_mission_from_body, should_handle_managed_mission_body
             managed_emitter = None
@@ -5416,7 +5530,6 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
             # ── v8: Check for continuation BEFORE prepare_chat_payload ──
-            request_kind = classify_request_kind(body)
             if request_kind in ("tool_result_continuation", "orphan_tool_result_continuation"):
                 self._handle_continuation(body)
                 return
@@ -5569,6 +5682,44 @@ class Handler(BaseHTTPRequestHandler):
                     sm.mark_completed(tool_call_id, tool_output_text)
                     adoption_state_machine_to_response(sm, prev_state)
                     APP.state.put(prev_state)
+                    try:
+                        from codex_oss.desktop_tool_loop_probe import persist_desktop_tool_loop_adoption
+                        probe_adoption = persist_desktop_tool_loop_adoption(
+                            project_root=os.getcwd(),
+                            stored=prev_state,
+                            call_id=tool_call_id,
+                            tool_output_text=tool_output_text,
+                        )
+                        if probe_adoption.get("handled"):
+                            APP.log(
+                                "desktop_tool_loop_probe_adopted",
+                                mission_id=probe_adoption.get("mission_id"),
+                                call_id=tool_call_id,
+                            )
+                            emitter = ResponseEmitter(self, new_id("resp"), model_alias, bool(body.get("stream")))
+                            report_text = str(probe_adoption.get("report_text") or "")
+                            if report_text:
+                                emitter.emit_text_message(report_text, phase="final_answer")
+                            else:
+                                outcome = str(probe_adoption.get("status") or "PASS").upper()
+                                if outcome == "RECOVERED":
+                                    summary = "Desktop recovery probe complete."
+                                    detail = "Outcome: recovered after Desktop returned the tool result."
+                                else:
+                                    summary = "Desktop tool-loop probe complete."
+                                    detail = "Outcome: Desktop adopted and returned the tool result."
+                                emitter.emit_text_message(
+                                    f"{summary}\n"
+                                    f"Mission: {probe_adoption.get('mission_id')}\n"
+                                    f"Tool call adopted: {tool_call_id}\n"
+                                    f"{detail}\n"
+                                    "Confidence: high",
+                                    phase="final_answer",
+                                )
+                            emitter.complete()
+                            return
+                    except Exception as exc:
+                        APP.log("desktop_tool_loop_probe_adoption_persist_failed", error=str(exc))
             # Try to find the tool name from the stored messages
             for msg in prev_state.messages:
                 tool_calls = msg.get("tool_calls") or []
@@ -6162,6 +6313,15 @@ class Handler(BaseHTTPRequestHandler):
             APP.log("legacy_direct_write_fresh_demoted", mode=handoff_mode)
             return
         envelope = parse_task_envelope(handoff_text) if handoff_text else {}
+        if handoff_mode in {"bounded_write_exact", "bounded_write_patch"}:
+            prompt_text = "\n".join(as_text(message.get("content")) for message in base_messages if message.get("role") == "user")
+            outside_target = explicit_outside_owned_write_target(prompt_text, envelope, os.getcwd())
+            if outside_target:
+                emitter = ResponseEmitter(self, new_id("resp"), model_alias, bool(body.get("stream")))
+                emitter.emit_text_message(build_outside_owned_write_refusal_report(outside_target, envelope), phase="final_answer")
+                emitter.complete()
+                APP.log("outside_owned_write_refused", target_path=outside_target, mode=handoff_mode)
+                return
         if (
             os.getenv("OSS_FRESH_SERVER_SIDE_READ_FLOOR", "1") != "0"
             and handoff_mode in ("context_pack", "context_pack_report")
