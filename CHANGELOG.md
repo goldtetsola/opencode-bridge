@@ -1,5 +1,20 @@
 # Changelog
 
+## v14 - June 2026
+
+### Event-backed native OSS runtime
+
+OpenCode Bridge now treats native OSS subagent behavior as an event-backed runtime contract instead of scattered artifact interpretation.
+
+- **MissionEventLog authority**: claim-bearing runs write append-only, hash-chained events under `.codex-oss/runs/<run_id>/events.jsonl`; `RunRecord` is reduced from those events.
+- **Projection-only artifacts**: summaries, native views, and compatibility JSON are generated from `RunRecord` and are no longer independent sources of truth.
+- **Desktop witness gates**: native-like and Desktop Gold claims require trusted Desktop observation with pre-final progress and final messages.
+- **Model-agnostic MissionV1 lanes**: DeepSeek, Kimi, Flash, Qwen, and future OpenCode-backed profiles use the same admission, downgrade, scheduler, sandbox, and review contracts.
+- **Implementation escrow**: A4/A5 missions keep writes runtime-owned, apply A5 patches in isolated worktrees, run allowlisted verification, build review packets, and require explicit promotion before main workspace mutation.
+- **Usage displacement tracking**: delegation value, useful partials, GPT-5.5 displacement, review burden, and capability scorecards now influence routing and promotion.
+- **Operational safety**: doctor, data exposure, tool-turn transaction, fallback, scheduler, and sandbox policies fail closed instead of converting missing proof into success.
+- **Proof canary**: `canaries/oss_real_code_canary_005/` records a small real-code patch produced by `mission-a5-deepseek`, verified in isolation, reviewed, and promoted.
+
 ## v13 - May 2026
 
 ### Runtime-backed OSS subagent UX

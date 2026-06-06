@@ -18,6 +18,7 @@ from codex_oss.fast_path import run_deterministic_fast_path
 from codex_oss.implementation import run_implementation_mission
 from codex_oss.ledger import EvidenceLedger
 from codex_oss.mission import InvalidHandoffError, _build_mission, extract_mission_v1_block
+from codex_oss.model_registry import AdmissionError, ModelRegistry
 from codex_oss.mission_authority_artifacts import (
     write_adoption_or_recovery,
     write_canonical_evidence_artifacts,
@@ -33,6 +34,17 @@ from codex_oss.runtime.policy import (
 )
 from codex_oss.visible_commentary import VisibleCommentarySink
 from codex_oss.native_work_ux import native_final_report_text, native_work_contract_text
+from codex_oss.native_runtime_contracts import (
+    assess_sandbox_backend,
+    build_native_authority_packet,
+    build_gpt55_usage_displacement_record,
+    compile_p0_phase_graph,
+    create_worktree_plan,
+    derive_resume_cursor,
+    evaluate_review_economics,
+    open_implementation_escrow,
+    record_capability_route,
+)
 
 JSON = Dict[str, Any]
 
@@ -71,6 +83,11 @@ RUNTIME_MODEL_FALLBACKS = {
     "mission-a6-deepseek": ["ocg-kimi-k2.6"],
     "mission-a6-flash": ["ocg-kimi-k2.6"],
 }
+
+RUNTIME_MODEL_REGISTRY = ModelRegistry.from_runtime_aliases(
+    RUNTIME_MODEL_ALIASES,
+    fallbacks=RUNTIME_MODEL_FALLBACKS,
+)
 
 RUNTIME_AUTONOMY_PROFILES = {
     "mission-a2-flash": {"max_tool_budget": 8, "max_time_seconds": 90},
@@ -264,6 +281,13 @@ def _tier_for_runtime_alias(raw_model_alias: str, task_type: str) -> str:
     return "A3"
 
 
+def _lane_for_mission_tier(tier: str) -> str:
+    normalized = str(tier or "").upper()
+    if normalized in {"A4", "A5", "A6"}:
+        return "implementation"
+    return "scout"
+
+
 def should_handle_managed_mission_body(body: JSON, raw_model_alias: str) -> bool:
     """Return whether the runtime entrypoint will own this request.
 
@@ -339,8 +363,76 @@ def run_managed_mission_from_body(
         raw = synthesized_raw if synthesized_raw is not None else json.loads(mission_block)
         mission = _build_mission(raw)
         mission_id = mission.mission_id
+        try:
+            admission = RUNTIME_MODEL_REGISTRY.admit(raw_model_alias, lane=_lane_for_mission_tier(mission.tier))
+        except AdmissionError as exc:
+            log_fn("mission_entrypoint_model_admission_failed", model_alias=raw_model_alias, error=str(exc))
+            return ManagedMissionResult(
+                handled=True,
+                status="FAILED",
+                report_text=native_final_report_text(_failure_report(mission_id, f"model admission failed: {exc}")),
+            )
         mission.decision_trace = []
         mission.runtime_model_alias = raw_model_alias
+        mission.runtime_model_admission = admission.to_record()
+        mission.phase_graph = compile_p0_phase_graph()
+        mission.resume_cursor = derive_resume_cursor(mission.phase_graph, "admit")
+        sandbox_required = ["path", "process", "network"]
+        sandbox_enforced = ["path"] if mission.tier in ("A2", "A3") else ["path", "process"]
+        mission.sandbox_backend = assess_sandbox_backend(
+            sandbox_required,
+            sandbox_enforced,
+            risk_tier=mission.risk_tier,
+            residual_approval=mission.tier in ("A2", "A3"),
+        )
+        worktree_plan = create_worktree_plan(
+            target_branch=str(getattr(mission, "mission_id", "mission")),
+            worktree_path=os.path.join(".codex-oss", "worktrees", str(getattr(mission, "mission_id", "mission"))),
+        )
+        mission.implementation_escrow = open_implementation_escrow(
+            owned_paths=list(getattr(mission, "owned_paths", []) or []),
+            worktree=worktree_plan,
+        )
+        mission.native_authority_packet = build_native_authority_packet(
+            mission_id=mission.mission_id,
+            model_alias=raw_model_alias,
+            lane=_lane_for_mission_tier(mission.tier),
+            objective=str(getattr(mission, "objective", "") or ""),
+            allowed_paths=list(getattr(mission, "allowed_paths", []) or []),
+            owned_paths=list(getattr(mission, "owned_paths", []) or []),
+            tier=str(getattr(mission, "tier", "") or ""),
+            risk_tier=str(getattr(mission, "risk_tier", "") or ""),
+        )
+        if not bool(mission.native_authority_packet.get("ok")):
+            log_fn(
+                "mission_entrypoint_native_authority_packet_blocked",
+                mission_id=mission.mission_id,
+                checks=mission.native_authority_packet.get("checks", {}),
+            )
+            return ManagedMissionResult(
+                handled=True,
+                status="FAILED",
+                mission_id=mission.mission_id,
+                report_text=native_final_report_text(_failure_report(
+                    mission.mission_id,
+                    f"native_authority_packet insufficient: {mission.native_authority_packet}",
+                )),
+            )
+        if bool(mission.sandbox_backend.get("promotion_blocked")) and mission.tier in ("A4", "A5", "A6"):
+            log_fn(
+                "mission_entrypoint_sandbox_backend_blocked",
+                mission_id=mission.mission_id,
+                sandbox_backend=mission.sandbox_backend,
+            )
+            return ManagedMissionResult(
+                handled=True,
+                status="FAILED",
+                mission_id=mission.mission_id,
+                report_text=native_final_report_text(_failure_report(
+                    mission.mission_id,
+                    f"sandbox_backend insufficient for implementation lane: {mission.sandbox_backend}",
+                )),
+            )
         mission.runtime_handoff_raw = "" if synthesized_raw is not None else handoff
         mission.runtime_task_contract_raw = user_contract_text if synthesized_raw is not None else ""
         append_decision(
@@ -350,7 +442,16 @@ def run_managed_mission_from_body(
             policy="EntryPointExtractionPolicyV1",
             reason="MissionV1 handoff parsed and validated",
             source_module="codex_oss/managed_bridge.py",
-            input_payload={"tier": mission.tier, "mode": mission.mode, "runtime_alias": raw_model_alias},
+            input_payload={
+                "tier": mission.tier,
+                "mode": mission.mode,
+                "runtime_alias": raw_model_alias,
+                "model_admission": admission.to_record(),
+                "phase_graph_hash": mission.phase_graph.get("graph_hash"),
+                "sandbox_backend": mission.sandbox_backend,
+                "implementation_escrow": mission.implementation_escrow,
+                "native_authority_packet": mission.native_authority_packet,
+            },
         )
         effective_deadline = _managed_runtime_deadline(mission, request_deadline)
         _apply_runtime_autonomy_profile(mission, raw_model_alias, effective_deadline)
@@ -689,6 +790,13 @@ def _write_readonly_mission_artifacts(mission: Any, ledger: Any, report: dict, s
         "closure_policy": dict(getattr(mission, "closure_policy", {}) or {}),
         "closer_model": str(getattr(mission, "closer_model", "") or ""),
         "fallback_closer_model": str(getattr(mission, "fallback_closer_model", "") or ""),
+        "runtime_model_alias": str(getattr(mission, "runtime_model_alias", "") or ""),
+        "runtime_model_admission": dict(getattr(mission, "runtime_model_admission", {}) or {}),
+        "phase_graph": dict(getattr(mission, "phase_graph", {}) or {}),
+        "resume_cursor": dict(getattr(mission, "resume_cursor", {}) or {}),
+        "sandbox_backend": dict(getattr(mission, "sandbox_backend", {}) or {}),
+        "implementation_escrow": dict(getattr(mission, "implementation_escrow", {}) or {}),
+        "native_authority_packet": dict(getattr(mission, "native_authority_packet", {}) or {}),
     }
     ledger_payload = {
         "mission_id": mission_id,
@@ -726,6 +834,37 @@ def _write_readonly_mission_artifacts(mission: Any, ledger: Any, report: dict, s
     claim_graph = refresh_claim_graph(mission, ledger, report=report, reason="artifact_write", persist=False)
     answer_graph = refresh_answer_graph(mission, ledger, claim_graph=claim_graph, report=report, reason="artifact_write", persist=False)
     status = _reconcile_readonly_runtime_entitlement(report, status, answer_graph)
+    routing_decision = record_capability_route(
+        store_path=os.path.join(root, ".codex-oss", "capability_scorecards.json"),
+        model_alias=str(getattr(mission, "runtime_model_alias", "") or ""),
+        lane=str((getattr(mission, "runtime_model_admission", {}) or {}).get("lane") or _lane_for_mission_tier(getattr(mission, "tier", ""))),
+        status=status,
+        review_burden=0.0,
+        unsafe=bool(getattr(ledger, "risk_flags", []) or []),
+    )
+    mission.routing_decision = routing_decision
+    report["routing_decision"] = routing_decision
+    mission_payload["routing_decision"] = routing_decision
+    usage_displacement = build_gpt55_usage_displacement_record(
+        task_id=mission_id,
+        mode=str(getattr(mission, "mode", "") or ""),
+        model=str(getattr(mission, "runtime_model_alias", "") or ""),
+        status=status,
+        gpt55_direct_units=float(os.getenv("OSS_GPT55_DIRECT_BASELINE_UNITS", "2.0")),
+        oss_units=float(os.getenv("OSS_RUN_USAGE_UNITS", "0.5")),
+        gpt_review_units=float(os.getenv("OSS_GPT55_REVIEW_UNITS", "0.5")),
+    )
+    review_economics = evaluate_review_economics(
+        status=status,
+        review_units=float(os.getenv("OSS_GPT55_REVIEW_UNITS", "0.5")),
+        direct_units=float(os.getenv("OSS_GPT55_DIRECT_BASELINE_UNITS", "2.0")),
+        repair_units=0.0,
+    )
+    mission_payload["usage_displacement"] = usage_displacement
+    mission_payload["review_economics"] = review_economics
+    report["usage_displacement"] = usage_displacement
+    report["review_economics"] = review_economics
+    report["native_authority_packet"] = dict(getattr(mission, "native_authority_packet", {}) or {})
     coverage_graph = dict(answer_graph.get("coverage_graph", {}) or getattr(ledger, "coverage_graph", {}) or {})
     evidence_agenda = dict(answer_graph.get("evidence_agenda", {}) or getattr(ledger, "evidence_agenda", {}) or {})
     investigation_plan = build_investigation_plan(mission)

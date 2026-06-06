@@ -1,15 +1,18 @@
 # OpenCode Bridge
 
-OpenCode Bridge lets Codex use open-source models as governed subagents. It routes OSS workers through a local Responses-compatible bridge, gives them scoped runtime tools, records what they did, and returns evidence-backed reports for GPT review.
+OpenCode Bridge lets Codex use open-source models as governed subagents. It routes OSS workers through a local Responses-compatible bridge, gives them scoped runtime tools, records their work in an append-only MissionEventLog, reduces that log into a RunRecord, and returns evidence-backed reports for GPT review.
 
 Use it when you want cheaper or parallel OSS help without handing an OSS model the keys to your repo.
 
 ## What You Get
 
 - **Runtime-controlled investigations**: OSS agents can read and search only the paths their mission allows.
+- **Model-agnostic delegation**: DeepSeek, Kimi, Flash, Qwen, and other configured OpenCode-backed profiles use the same MissionV1 runtime contracts.
 - **Evidence-backed reports**: final answers include files inspected, commands run, findings, caveats, and confidence.
 - **Visible progress**: spawned OSS agents stream safe working commentary such as planned actions, tool runs, coverage updates, and closure decisions.
-- **Patch safety rails**: bounded implementation missions validate patches, apply them in an isolated worktree, verify them, and record rollback data.
+- **Patch safety rails**: bounded implementation missions validate patch intent, build/apply patches in an isolated worktree, verify them, review them, and record rollback data.
+- **Review compression**: implementation runs produce review packets so GPT reviews evidence and diffs instead of rediscovering the whole task.
+- **Usage displacement accounting**: canaries track whether OSS work preserves GPT-5.5 usage while keeping review burden acceptable.
 - **Auditable artifacts**: every runtime mission writes JSON reports, traces, summaries, ledgers, and decision logs under `.codex-oss/missions/`.
 - **Fail-closed behavior**: missing evidence, invalid reports, blocked paths, contradictions, and provider failures downgrade or escalate instead of pretending success.
 
@@ -22,6 +25,7 @@ Good uses:
 - Ask an OSS investigator to inspect a few files and summarize what it found.
 - Run a low-risk repo scout in parallel while GPT continues the main task.
 - Generate or validate a small patch in an isolated worktree.
+- Let an OSS implementation profile do bounded grunt work while GPT handles planning, review, and final judgment.
 - Burn in runtime behavior with deterministic proof packs.
 
 Avoid it for:
@@ -45,18 +49,20 @@ Mission runtime
   |
   | owns tools, paths, evidence, validation, audit, and closure
   v
-OSS model: Kimi, DeepSeek, or Flash
+OSS model: DeepSeek, Kimi, Flash, Qwen, or another configured profile
   |
   | returns actions or narrative under runtime control
   v
-Evidence-backed report for GPT review
+RunRecord, review packet, and evidence-backed report for GPT review
 ```
 
 The important split is simple:
 
-- **Runtime owns execution.** It decides which tools may run, checks scope, records evidence, validates reports, and closes safely.
+- **Runtime owns execution.** It decides which tools may run, checks scope, records events, validates reports, writes compatibility projections, and closes safely.
 - **OSS model owns reasoning.** It proposes the next action, explains why it wants that action, and drafts findings.
 - **GPT owns judgment.** Treat OSS output as evidence, not final authority.
+
+The append-only event log is the authority. `RunRecord` is derived from that log. Files such as summaries, native views, and reports are projections for humans and tooling; they must not become a second source of truth.
 
 ## Quick Start
 
@@ -147,6 +153,8 @@ After installation, your Codex project can use these agents.
 
 Use these for normal work.
 
+The installed agents below are defaults, not an architectural limit. Runtime model aliases follow `mission-a<tier>-<profile>`; any configured profile can be admitted when its lane capability, downgrade policy, sandbox policy, scorecard, and review requirements pass.
+
 | Agent | Model alias | Best for |
 |---|---|---|
 | `oss_kimi_investigator` | `mission-a3-kimi` | General read-only investigations |
@@ -177,7 +185,7 @@ These are useful for experiments and low-stakes support work, but they do not ge
 | `oss_flash_support` | `ocg-deepseek-v4-flash` |
 
 For serious read-only investigations, prefer the runtime-controlled agents.
-For higher-assurance implementation, runtime owns patch construction, apply, verification, rollback, and final status. The model owns narrative, patch intent, and rationale only.
+For higher-assurance implementation, runtime owns patch construction, apply, verification, rollback, review packets, promotion state, and final status. The model owns narrative, patch intent, and rationale only.
 
 Raw workers cannot prove their own routing from inside the task. Treat their files inspected, findings, and caveats as their deliverable. Treat bridge routing and live OSS inference as bridge-owned facts, proven by:
 
@@ -204,6 +212,18 @@ The runtime has internal labels because different tasks need different safety ru
 | Isolated implementation | A5 | Apply and verify a bounded patch in an isolated worktree | Use for bounded low-risk work |
 | Critical-path rehearsal | A6 | Simulate high-risk work without trusting OSS to change critical paths | Proof/simulation only |
 | Raw OSS worker | Raw OSS | Prompt-only worker behavior without the full runtime control plane | Research lane |
+
+## Implementation Escrow
+
+Implementation is allowed through escrow, not blind trust.
+
+For A4/A5 work, the model proposes intent and rationale. The runtime validates scope, builds or checks the patch, applies it in an isolated worktree for A5, runs allowlisted verification, records repair/review state, and returns a structured result. The main workspace is unchanged until GPT or a human explicitly promotes the patch.
+
+Useful partial work counts. A run can be valuable even when it does not fully land a patch if it produces a requirement graph, localized root cause, failing test, partial patch, verified reproduction, or evidence-backed blocker list that reduces GPT work.
+
+GPT review should receive a compact review packet: task, requirements, changed paths, diff summary, verification, denials, caveats, model claims, evidence references, and review questions. If GPT has to redo the whole implementation to review it, the run is marked as poor delegation value.
+
+Current real-code canary: `canaries/oss_real_code_canary_005/` was produced by `mission-a5-deepseek`, verified in an isolated worktree, GPT-reviewed, and then promoted into the repo.
 
 ## A Minimal MissionV1 Example
 
@@ -317,6 +337,9 @@ Common files:
 | `answer_graph.json` | Open-investigation obligation state, when applicable |
 | `implementation_report.json` | Patch/apply/verify result for A4/A5 |
 | `semantic_review.json` | Patch review result for implementation missions |
+| `.codex-oss/runs/<run_id>/events.jsonl` | Append-only MissionEventLog authority |
+| `run_record.json` | Compatibility projection derived from the event log |
+| `mission_summary.json` | Compatibility projection derived from the event log |
 
 Audit a mission:
 
@@ -355,6 +378,9 @@ For implementation:
 - A5 applies in an isolated worktree by default
 - verification commands must be allowlisted
 - rollback artifacts are recorded
+- review packet adequacy, usage displacement, and capability scorecards influence promotion and future routing
+
+Sandbox policy protects execution. Data exposure policy protects what the model sees. Secret paths, `.env` files, raw logs, state DBs, and high-risk data are redacted or denied unless policy explicitly allows them.
 
 ## CLI Reference
 
@@ -382,6 +408,14 @@ bin/codex-oss show-trace MISSION_ID
 bin/codex-oss show-summary MISSION_ID
 bin/codex-oss audit-mission MISSION_ID --project . --json
 bin/codex-oss explain MISSION_ID --project . --json
+```
+
+For bounded implementation canaries:
+
+```bash
+bin/codex-oss mission compile mission.json --handoff
+bin/codex-oss mission run --project . --model mission-a5-deepseek --timeout 300 --json handoff.md
+bin/codex-oss audit-mission MISSION_ID --project . --json
 ```
 
 ### Proof and Certification
@@ -429,6 +463,11 @@ python3 tests/test_runtime_contracts.py
 python3 tests/test_burnin_harness.py
 python3 tests/test_patch_pipeline.py
 python3 tests/test_mission_cli.py
+python3 tests/test_mission_event_log.py
+python3 tests/test_run_record_reducer.py
+python3 tests/test_model_registry_admission.py
+python3 tests/test_model_agnostic_runtime_remaining.py
+python3 tests/test_original_spec_integrated_runtime.py
 ```
 
 Run the bridge in the foreground:
@@ -462,7 +501,8 @@ agents/                 Codex agent TOMLs for runtime and raw OSS workers
 bin/codex-oss           Main CLI entry point
 bridge.py               Responses-compatible bridge server
 codex_oss/              Runtime, policy, mission, audit, and implementation code
-docs/                   Optional local notes and generated docs (ignored by git)
+canaries/               Small committed canaries that prove promoted runtime behavior
+docs/                   Optional local notes and generated docs (ignored by git unless force-added)
 examples/               Example inputs and handoffs
 orchestration/          Supporting orchestration files
 tests/                  Runtime, bridge, mission, and burn-in tests
@@ -475,9 +515,16 @@ Key modules:
 | Module | Role |
 |---|---|
 | `codex_oss/managed_bridge.py` | Turns Responses requests into MissionV1 runtime runs |
+| `codex_oss/mission_event_log.py` | Append-only event authority for runtime claims |
+| `codex_oss/run_record.py` | Reducer from event log to RunRecord |
+| `codex_oss/projections.py` | Compatibility views derived from RunRecord |
+| `codex_oss/model_registry.py` | Model/profile admission and lane identity |
 | `codex_oss/runtime/loop.py` | A2/A3 plan-act-observe loop and visible commentary |
 | `codex_oss/answer_graph.py` | Open-investigation obligations and sufficiency |
 | `codex_oss/implementation.py` | A4/A5 patch proposal, validation, apply, verify |
+| `codex_oss/native_subagent.py` | Native-result packaging, review packets, and delegation value |
+| `codex_oss/native_runtime_contracts.py` | Sandbox, data exposure, review packet, scorecard, usage displacement, phase, and promotion contract helpers |
+| `codex_oss/tool_turn_transaction.py` | Tool-call lifecycle and fail-closed continuation rules |
 | `codex_oss/visible_commentary.py` | Safe user-facing progress events |
 | `codex_oss/audit.py` | Mission artifact checks |
 | `codex_oss/transport/emitter.py` | Responses JSON/SSE output |

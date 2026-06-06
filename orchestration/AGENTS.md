@@ -72,7 +72,8 @@ Direct OSS subagents are not guaranteed to know local command wrappers or platfo
 - Do not paste full file contents or raw tool output into the final answer; summarize and cite paths/lines.
 - The requested output format is mandatory. If the worker cannot satisfy it, it must return LOW confidence with caveats instead of dumping evidence.
 - For A2/A3 read-only investigation, prefer MissionV1 through the bridge runtime over broad shell access.
-- For higher-assurance implementation, prefer `oss_deepseek_implementer` with MissionV1 A4/A5; runtime owns patch construction, apply, verification, rollback, and final status.
+- For higher-assurance implementation, prefer MissionV1 A4/A5 through the runtime. `oss_deepseek_implementer` is the default strong implementation profile today; other configured profiles may be used when capability, downgrade, sandbox, scorecard, and review gates pass.
+- Runtime owns patch construction, isolated apply, verification, rollback, review packets, promotion state, and final status.
 - `oss_deepseek_pro` may perform bounded low-risk implementation when the handoff declares owned paths and verification. Other raw workers remain read-only support/scout lanes.
 
 ---
@@ -104,7 +105,7 @@ Write changelog, summarize changes, test inventory, format code.
 
 **Bounded implementation**
 Single file/module change. Tests exist for target code. Requirements clear.
-→ Delegate to `oss_deepseek_implementer` (runtime-controlled MissionV1 A4/A5, fork_turns: "none", handoff required)
+→ Delegate to a runtime-controlled MissionV1 A4/A5 implementation profile (default: `oss_deepseek_implementer`, fork_turns: "none", handoff required)
 
 **Raw implementation research**
 Use only for controlled baselines or patch-intent drafting.
@@ -117,7 +118,7 @@ Use only for controlled baselines or patch-intent drafting.
 
 - Verify confidence marker (HIGH/MEDIUM/LOW). Reject results without one.
 - Verify files inspected and changed are listed.
-- For implementation, verify the runtime artifact owns patch/apply/verify/status before accepting the report.
+- For implementation, verify the runtime artifact owns patch/apply/verify/review packet/status before accepting the report. Main workspace mutation requires explicit promotion after GPT/human review.
 - LOW confidence → escalate to GPT-5.4 immediately.
 - MEDIUM + correctness-critical → escalate.
 - Never accept OSS output touching safety-critical paths.
@@ -142,7 +143,7 @@ Use only for controlled baselines or patch-intent drafting.
 | `oss_kimi_rapid` | kimi-k2.6 (raw experimental) | Manual repo nav baseline | read-only |
 | `oss_flash_support` | deepseek-v4-flash (raw experimental) | Manual docs/support baseline | read-only |
 
-Runtime-controlled agents require: `fork_turns: "none"`, explicit MissionV1 handoff, `model_provider = "opencode_bridge"`.
+Runtime-controlled agents require: `fork_turns: "none"`, explicit MissionV1 handoff, `model_provider = "opencode_bridge"`. Runtime aliases are model-agnostic (`mission-a<tier>-<profile>`); explicit user model choices must not be silently replaced by weaker fallback.
 
 ---
 

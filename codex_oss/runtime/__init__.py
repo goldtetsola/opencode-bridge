@@ -82,17 +82,29 @@ def resolve_path(raw: str, allowed_roots: list, allowed_paths: list) -> Tuple[Op
 
     # Check exact paths first
     for allowed in allowed_paths:
-        if path == allowed or path == allowed.rstrip("/"):
+        allowed_path = _normalize_allowed_scope_path(str(allowed or ""))
+        if path == allowed_path or path == allowed_path.rstrip("/"):
             return path, None
 
     # Check roots
     for root in allowed_roots:
-        root_clean = root.rstrip("/") + "/"
+        root_path = _normalize_allowed_scope_path(str(root or ""))
+        root_clean = root_path.rstrip("/") + "/"
         path_check = path if path.endswith("/") else path + "/"
-        if path_check.startswith(root_clean) or path == root.rstrip("/"):
+        if path_check.startswith(root_clean) or path == root_path.rstrip("/"):
             return path, None
 
     return None, f"path not in allowed roots/paths: {path}"
+
+
+def _normalize_allowed_scope_path(raw: str) -> str:
+    path = raw.strip().strip("'\"")
+    if path.startswith("/"):
+        real = os.path.realpath(path)
+        cwd = os.path.realpath(PROJECT_ROOT)
+        if real.startswith(cwd + os.sep) or real == cwd:
+            return os.path.relpath(real, PROJECT_ROOT)
+    return path
 
 
 def _deny_match(path: str) -> Optional[str]:

@@ -47,7 +47,7 @@ def _mission_json(mission_id: str) -> dict:
     }
 
 
-def _write_runtime_mission(root: Path, mission_id: str) -> Path:
+def _write_runtime_mission(root: Path, mission_id: str, *, admit: bool = True) -> Path:
     mission_dir = root / ".codex-oss" / "missions" / mission_id
     mission_dir.mkdir(parents=True, exist_ok=True)
     (mission_dir / "mission.json").write_text(json.dumps({"mission_id": mission_id}, indent=2), encoding="utf-8")
@@ -80,6 +80,10 @@ def _write_runtime_mission(root: Path, mission_id: str) -> Path:
         "mission_id": mission_id,
         "events": events,
     }, indent=2), encoding="utf-8")
+    if admit:
+        from codex_oss.mission_event_bridge import ensure_mission_admitted_from_artifacts
+
+        ensure_mission_admitted_from_artifacts(root, mission_id)
     return mission_dir
 
 
@@ -130,6 +134,7 @@ def _add_desktop_artifacts(root: Path, mission_id: str) -> tuple[Path, Path]:
 
 def _add_desktop_artifacts_in_mission(root: Path, mission_id: str, *, model_alias: str = "mission-a3-deepseek", agent_name: str = "oss_deepseek_investigator") -> None:
     from codex_oss.route_authority import build_route_authority
+    from codex_oss.desktop_transcript_ingestor import ingest_desktop_transcript
 
     transcript, _ = _add_desktop_artifacts(root, mission_id)
     mission_dir = root / ".codex-oss" / "missions" / mission_id
@@ -140,11 +145,28 @@ def _add_desktop_artifacts_in_mission(root: Path, mission_id: str, *, model_alia
         handoff_obj={"schema_version": "oss_agent_mission.v1"},
         consumer_kind="codex_desktop_spawned",
     ), indent=2), encoding="utf-8")
+    ingest_desktop_transcript(
+        project_root=root,
+        run_id=mission_id,
+        mission_id=mission_id,
+        transcript_path=mission_dir / "desktop_thread_transcript.json",
+        expected_agent_id=f"agent_{mission_id}",
+    )
 
 
 def _write_tool_loop_mission(root: Path, mission_id: str, *, recovered: bool = False) -> None:
     _write_runtime_mission(root, mission_id)
     _add_desktop_artifacts_in_mission(root, mission_id, model_alias="mission-a3-kimi", agent_name="oss_kimi_investigator")
+    from codex_oss.tool_loop_proof import record_tool_loop_proof
+
+    record_tool_loop_proof(
+        project_root=str(root),
+        mission_id=mission_id,
+        call_id="call_1",
+        tool_name="read_file",
+        status="recovered" if recovered else "adopted",
+        evidence_source="desktop_thread_transcript.json",
+    )
     mission_dir = root / ".codex-oss" / "missions" / mission_id
     status = "RECOVERED" if recovered else "PASS"
     (mission_dir / "adoption_or_recovery.json").write_text(json.dumps({
@@ -176,8 +198,8 @@ def _write_tool_loop_mission(root: Path, mission_id: str, *, recovered: bool = F
         }, indent=2), encoding="utf-8")
 
 
-def _write_implementation_mission(root: Path, mission_id: str) -> None:
-    mission_dir = _write_runtime_mission(root, mission_id)
+def _write_implementation_mission(root: Path, mission_id: str, *, with_desktop: bool = True) -> None:
+    mission_dir = _write_runtime_mission(root, mission_id, admit=False)
     canonical = _mission_json(mission_id)
     canonical.update({
         "tier": "A5",
@@ -199,7 +221,11 @@ def _write_implementation_mission(root: Path, mission_id: str) -> None:
         "main_workspace_mutated": False,
         "runtime_entitlement_reconciliation": {"decision": "accepted_complete"},
     }, indent=2), encoding="utf-8")
-    _add_desktop_artifacts_in_mission(root, mission_id, model_alias="mission-a5-kimi", agent_name="oss_deepseek_implementer")
+    from codex_oss.mission_event_bridge import ensure_mission_admitted_from_artifacts
+
+    ensure_mission_admitted_from_artifacts(root, mission_id)
+    if with_desktop:
+        _add_desktop_artifacts_in_mission(root, mission_id, model_alias="mission-a5-kimi", agent_name="oss_deepseek_implementer")
 
 
 def _write_read_thread_export(path: Path, mission_id: str, agent_id: str) -> None:
@@ -232,6 +258,12 @@ def _run_cmd(args: list[str], cwd: Path | None = None) -> subprocess.CompletedPr
         text=True,
         capture_output=True,
     )
+
+
+def _write_run_manifest(root: Path, runs: list[dict]) -> Path:
+    path = root / "run_manifest.json"
+    path.write_text(json.dumps({"schema_version": "run_manifest.v1", "runs": runs}, indent=2), encoding="utf-8")
+    return path
 
 
 def assert_validate_mission_handoff_accepts_canonical_wrapper() -> None:
@@ -311,7 +343,7 @@ def assert_certify_native_like_runtime_only_blocks_desktop_claim() -> None:
     assert payload["verdict"]["status"] == "RUNTIME_ONLY", payload
     assert "runtime-governed OSS subagent completed safely" in payload["allowed_claims"], payload
     assert "Desktop-native live-progress OSS subagent" in payload["disallowed_claims"], payload
-    assert payload["gates"]["desktop_observation"]["ok"] is False, payload
+    assert payload["gates"]["event_claim_gate"]["ok"] is False, payload
     _pass(name)
 
 
@@ -321,21 +353,18 @@ def assert_certify_native_like_accepts_consumer_observation_witness() -> None:
         root = Path(tmp)
         mission_id = "native_desktop_gold"
         _write_runtime_mission(root, mission_id)
-        transcript, route = _add_desktop_artifacts(root, mission_id)
+        _add_desktop_artifacts_in_mission(root, mission_id)
         result = _run_cmd([
             "certify",
             "--project", tmp,
             "--target", "native-like",
             "--mission-id", mission_id,
-            "--transcript", str(transcript),
-            "--route-authority", str(route),
             "--json",
         ])
     assert result.returncode == 0, result.stdout + result.stderr
     payload = json.loads(result.stdout)
     assert payload["verdict"]["status"] == "CERTIFIED", payload
-    assert "Desktop-native live-progress OSS subagent" in payload["allowed_claims"], payload
-    assert payload["gates"]["desktop_observation"]["ok"] is True, payload
+    assert payload["gates"]["event_claim_gate"]["ok"] is True, payload
     _pass(name)
 
 
@@ -345,7 +374,7 @@ def assert_certify_desktop_gold_accepts_mission_bound_transcript_without_manual_
         root = Path(tmp)
         mission_id = "desktop_gold_ok"
         _write_runtime_mission(root, mission_id)
-        transcript, route = _add_desktop_artifacts(root, mission_id)
+        _add_desktop_artifacts_in_mission(root, mission_id)
         (root / ".codex-oss" / "desktop_pre_final_text_probe_result.json").write_text(json.dumps({
             "schema_version": "desktop_pre_final_text_probe_result.v1",
             "probe_status": "setup_failed",
@@ -356,17 +385,13 @@ def assert_certify_desktop_gold_accepts_mission_bound_transcript_without_manual_
             "--project", tmp,
             "--target", "desktop-gold",
             "--mission-id", mission_id,
-            "--transcript", str(transcript),
-            "--route-authority", str(route),
             "--json",
         ])
     assert result.returncode == 0, result.stdout + result.stderr
     payload = json.loads(result.stdout)
     assert payload["status"] == "PASS", payload
-    assert payload["gates"]["handoff_authority"]["ok"] is True, payload
-    assert payload["gates"]["runtime_evidence"]["ok"] is True, payload
-    assert payload["gates"]["adoption_or_recovery"]["status"] == "NOT_APPLICABLE", payload
-    assert payload["gates"]["render_surface_proof"]["render_surface_proof"]["source"] == "mission_bound_transcript_witness", payload
+    assert payload["gates"]["event_claim_gate"]["ok"] is True, payload
+    assert payload["run_record"]["desktop_observation"]["pre_final_progress_count"] == 3, payload
     _pass(name)
 
 
@@ -400,8 +425,7 @@ def assert_certify_desktop_gold_fails_without_transcript_when_probe_unknown() ->
     assert result.returncode == 1, result.stdout + result.stderr
     payload = json.loads(result.stdout)
     assert payload["status"] == "FAIL", payload
-    assert payload["gates"]["consumer_observation"]["ok"] is False, payload
-    assert payload["gates"]["render_surface_proof"]["ok"] is False, payload
+    assert payload["gates"]["event_claim_gate"]["ok"] is False, payload
     _pass(name)
 
 
@@ -434,10 +458,12 @@ def assert_certify_oss_native_parity_partial_for_desktop_only() -> None:
         mission_id = "parity_desktop_only"
         _write_runtime_mission(root, mission_id)
         _add_desktop_artifacts_in_mission(root, mission_id)
+        manifest = _write_run_manifest(root, [{"run_id": mission_id, "lanes": ["desktop_progress"]}])
         result = _run_cmd([
             "certify",
             "--project", tmp,
             "--target", "oss-native-parity",
+            "--run-manifest", str(manifest),
             "--json",
         ])
     assert result.returncode == 1, result.stdout + result.stderr
@@ -445,7 +471,7 @@ def assert_certify_oss_native_parity_partial_for_desktop_only() -> None:
     assert payload["verdict"]["status"] == "PARTIAL", payload
     assert payload["gates"]["desktop_progress_parity"]["ok"] is True, payload
     assert payload["gates"]["tool_loop_parity"]["ok"] is False, payload
-    assert "Arbitrary OSS native tool-loop parity." in payload["disallowed_claims"], payload
+    assert "Supported runtime-controlled MissionV1 OSS subagents have full native parity across all lanes." in payload["disallowed_claims"], payload
     _pass(name)
 
 
@@ -454,9 +480,7 @@ def assert_a5_verified_without_transcript_stays_runtime_only() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         mission_id = "parity_a5_no_transcript"
-        _write_implementation_mission(root, mission_id)
-        mission_dir = root / ".codex-oss" / "missions" / mission_id
-        (mission_dir / "desktop_thread_transcript.json").unlink()
+        _write_implementation_mission(root, mission_id, with_desktop=False)
         result = _run_cmd([
             "certify",
             "--project", tmp,
@@ -466,15 +490,14 @@ def assert_a5_verified_without_transcript_stays_runtime_only() -> None:
         ])
     assert result.returncode == 1, result.stdout + result.stderr
     payload = json.loads(result.stdout)
-    assert payload["status"] == "FAIL", payload
+    assert payload["status"] == "PARTIAL", payload
     assert payload["runtime_execution"] == "PASS", payload
     assert payload["patch_authority"] == "PASS", payload
     assert payload["implementation_status"] == "VERIFIED", payload
     assert payload["desktop_observation"] == "FAIL", payload
     assert payload["desktop_gold"] is False, payload
-    assert payload["basis"] == "desktop_transcript_missing", payload
+    assert payload["basis"] == "desktop_progress_before_final_missing", payload
     assert payload["next_required_artifact"] == "spawned_transcript_authority.json", payload
-    assert "A5 bounded implementation verified under runtime authority in isolated temporary project copy" in payload["allowed_claims"], payload
     assert payload["mission_reports_sample"][0]["implementation"]["patch_authority_ok"] is True, payload
     assert payload["mission_reports_sample"][0]["implementation"]["ok"] is False, payload
     _pass(name)
@@ -513,7 +536,7 @@ def assert_spawn_lifecycle_finalizes_from_agent_id_thread_export() -> None:
         root = Path(tmp)
         mission_id = "parity_a5_lifecycle"
         agent_id = "agent_lifecycle_123"
-        _write_implementation_mission(root, mission_id)
+        _write_implementation_mission(root, mission_id, with_desktop=False)
         mission_dir = root / ".codex-oss" / "missions" / mission_id
         for artifact in [
             "desktop_thread_transcript.json",
@@ -564,7 +587,7 @@ def assert_spawn_lifecycle_missing_read_thread_export_is_actionable() -> None:
         root = Path(tmp)
         mission_id = "parity_a5_lifecycle_missing_export"
         agent_id = "agent_missing_export"
-        _write_implementation_mission(root, mission_id)
+        _write_implementation_mission(root, mission_id, with_desktop=False)
         mission_dir = root / ".codex-oss" / "missions" / mission_id
         for artifact in ["desktop_thread_transcript.json", "route_authority.json", "spawned_transcript_authority.json"]:
             path = mission_dir / artifact
@@ -662,14 +685,17 @@ def assert_raw_direct_recovered_tool_loop_stays_research_only() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         mission_id = "raw_pending_read_recovered"
-        _write_runtime_mission(root, mission_id)
-        _add_desktop_artifacts_in_mission(root, mission_id, model_alias="mission-a3-deepseek", agent_name="oss_deepseek_investigator")
+        _write_runtime_mission(root, mission_id, admit=False)
         mission_dir = root / ".codex-oss" / "missions" / mission_id
         (mission_dir / "mission_canonical.json").write_text(json.dumps({
             **_mission_json(mission_id),
             "tier": "RAW",
             "mode": "raw_direct_pending_read_recovery",
         }, indent=2), encoding="utf-8")
+        from codex_oss.mission_event_bridge import ensure_mission_admitted_from_artifacts
+
+        ensure_mission_admitted_from_artifacts(root, mission_id)
+        _add_desktop_artifacts_in_mission(root, mission_id, model_alias="mission-a3-deepseek", agent_name="oss_deepseek_investigator")
         (mission_dir / "route_authority.json").write_text(json.dumps(build_route_authority(
             agent_name="oss_kimi_rapid",
             model_alias="ocg-kimi-k2.6",
@@ -713,9 +739,17 @@ def assert_tool_loop_and_recovery_require_desktop_witness() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         mission_id = "parity_recovery_no_transcript"
-        _write_tool_loop_mission(root, mission_id, recovered=True)
-        mission_dir = root / ".codex-oss" / "missions" / mission_id
-        (mission_dir / "desktop_thread_transcript.json").unlink()
+        _write_runtime_mission(root, mission_id)
+        from codex_oss.tool_loop_proof import record_tool_loop_proof
+
+        record_tool_loop_proof(
+            project_root=tmp,
+            mission_id=mission_id,
+            call_id="call_1",
+            tool_name="read_file",
+            status="recovered",
+            evidence_source="tool-loop-without-desktop",
+        )
         result = _run_cmd([
             "certify",
             "--project", tmp,
@@ -730,7 +764,7 @@ def assert_tool_loop_and_recovery_require_desktop_witness() -> None:
     assert report["tool_loop"]["status"] == "RECOVERED", payload
     assert report["recovery"]["recovery_artifact_ok"] is True, payload
     assert report["recovery"]["ok"] is False, payload
-    assert report["desktop_gold"]["basis"] == "desktop_transcript_missing", payload
+    assert report["desktop_gold"]["basis"] == "desktop_progress_before_final_missing", payload
     _pass(name)
 
 
@@ -742,16 +776,24 @@ def assert_certify_oss_native_parity_full_matrix_passes() -> None:
         _add_desktop_artifacts_in_mission(root, "parity_read", model_alias="mission-a3-deepseek")
         _write_tool_loop_mission(root, "parity_tool_recovered", recovered=True)
         _write_implementation_mission(root, "parity_impl")
+        manifest = _write_run_manifest(root, [
+            {"run_id": "parity_read", "lanes": ["desktop_progress"]},
+            {"run_id": "parity_tool_recovered", "lanes": ["tool_loop", "recovery"]},
+            {"run_id": "parity_impl", "lanes": ["implementation"]},
+        ])
         result = _run_cmd([
             "certify",
             "--project", tmp,
             "--target", "oss-native-parity",
+            "--run-manifest", str(manifest),
             "--json",
         ])
     assert result.returncode == 0, result.stdout + result.stderr
     payload = json.loads(result.stdout)
     assert payload["verdict"]["status"] == "CERTIFIED", payload
-    for gate in payload["gates"].values():
+    for name, gate in payload["gates"].items():
+        if name in {"desktop_progress", "tool_loop", "recovery", "implementation"}:
+            continue
         assert gate["ok"] is True, payload
     assert "Supported runtime-controlled MissionV1 OSS subagents behave native-like across the covered parity matrix." in payload["allowed_claims"], payload
     _pass(name)

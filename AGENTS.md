@@ -2,13 +2,14 @@
 <!-- codex-oss:start -->
 ## OSS delegation
 
-Use OSS agents for bounded low/medium-risk work only. Use runtime-controlled MissionV1 OSS agents for native-feeling A2/A3 read-only investigation and higher-assurance A4/A5 implementation. Raw direct OSS agents are support/research lanes only; they must not be treated as Codex Desktop-native candidates.
+Use OSS agents for bounded low/medium-risk work only. Use runtime-controlled MissionV1 OSS agents for native-feeling A2/A3 read-only investigation and higher-assurance A4/A5 implementation. The runtime is model-agnostic: DeepSeek, Kimi, Flash, Qwen, or another configured OpenCode-backed profile may be used when its lane capability, downgrade policy, sandbox policy, scorecard, and review requirements pass. Raw direct OSS agents are support/research lanes only; they must not be treated as Codex Desktop-native candidates.
 
 For implementation work:
-- Prefer `oss_deepseek_implementer` with a MissionV1 A4/A5 handoff when you need runtime-owned patch control.
+- Prefer a MissionV1 A4/A5 runtime handoff when you need runtime-owned patch control. `oss_deepseek_implementer` / `mission-a5-deepseek` is the default strong implementation profile today, not an architecture-exclusive path.
 - Use `oss_deepseek_pro` only as a raw direct bounded implementation/drafting lane when the scope is low-risk, owned paths are explicit, and external verification is clear.
-- Runtime owns patch construction, apply, verification, rollback, and final status.
+- Runtime owns patch construction, isolated apply, verification, rollback, review packet construction, promotion state, and final status.
 - The model owns narrative, patch intent, and rationale only.
+- Main workspace mutation requires explicit promotion after runtime verification and GPT/human review.
 - Native-feeling product claims require MissionV1 runtime authority. Raw direct agents (`oss_deepseek_pro`, `oss_kimi_rapid`, `oss_flash_support`) are `raw_research_only` for public claims and cannot certify Desktop-native behavior.
 - Desktop Gold requires `ConsumerObservationWitnessV1` from a raw Codex Desktop spawned-agent transcript with observed progress before final; bridge/runtime artifacts, transcript hashes, artifact-reconciled candidates, and terminal-only notifications are not Desktop-native proof.
 
@@ -100,5 +101,5 @@ After the JSON block, add any human-readable context needed for the worker. For 
 - Do not paste full file contents or raw tool output into the final answer; summarize and cite paths/lines.
 - The requested output format is mandatory. If you cannot satisfy it, return LOW confidence with caveats instead of dumping evidence.
 - For A2/A3 read-only investigation, prefer MissionV1 through the bridge runtime over broad shell access.
-- For higher-assurance implementation, compile a MissionV1 A4/A5 handoff with `codex-oss mission compile`.
+- For higher-assurance implementation, compile a MissionV1 A4/A5 handoff with `codex-oss mission compile`; use A4 for patch proposal and A5 for isolated implementation/verification.
 <!-- codex-oss:end -->

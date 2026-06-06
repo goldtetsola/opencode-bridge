@@ -307,6 +307,13 @@ def assert_path_policy_blocks_empty_scope_and_denied_symlink():
             pass
 
 
+def assert_absolute_allowed_paths_resolve_to_project_relative_tool_paths():
+    absolute = os.path.join(ROOT, "codex_oss", "mission_event_log.py")
+    resolved, error = resolve_path(absolute, [], [absolute])
+    assert error is None, error
+    assert resolved == "codex_oss/mission_event_log.py", resolved
+
+
 def assert_broad_roots_are_exactly_broad():
     for root in (".", "/", "src/", "scripts/", "docs/", "src", "scripts", "docs"):
         assert is_broad_root(root), root
@@ -3653,6 +3660,46 @@ def assert_source_floor_only_prefetch_closes_without_final_model_timeout():
         assert target_rel in ledger.files_inspected, ledger.files_inspected
 
 
+def assert_absolute_source_floor_closes_from_relative_runtime_evidence():
+    with tempfile.TemporaryDirectory(dir=ROOT) as td:
+        from pathlib import Path
+
+        target = Path(td) / "absolute_source_floor.py"
+        target.write_text("VALUE = 'covered by absolute mission path'\n", encoding="utf-8")
+        target_abs = str(target)
+        target_rel = os.path.relpath(target, ROOT)
+        m = mission(
+            mission_id="mission_absolute_source_floor",
+            objective="Inspect the absolute required source floor.",
+            objective_style="open_investigation",
+            evidence_collection_mode="prefetch_floor",
+            allowed_roots=[],
+            allowed_paths=[target_abs],
+            allowed_tool_classes=["read"],
+            tool_budget=3,
+            must_inspect=[target_abs],
+            answer_obligations=[
+                {
+                    "id": "q1",
+                    "question": "Was the required absolute source inspected?",
+                    "required": True,
+                    "source_hints": [target_abs],
+                    "source_requirements": [{"path": target_abs, "evidence_kind": "source_read", "required": True}],
+                }
+            ],
+            exploration_policy={"after_required_floor": "close_immediately", "min_optional_actions_after_floor": 0, "max_optional_actions_after_floor": 0, "require_contradiction_search": False},
+        )
+        ledger = EvidenceLedger(mission_id=m.mission_id, tool_budget_remaining=m.tool_budget)
+
+        def fake_model(messages, tools, timeout, model_alias_override=None):
+            raise AssertionError("absolute source-floor prefetch should not call final model closer")
+
+        result = run_loop(m, ledger, fake_model, [], None, m.allowed_roots, m.allowed_paths, request_deadline=30)
+        assert result["status"] == "COMPLETE", result
+        assert result["report"]["missing_required_sources"] == [], result
+        assert target_rel in ledger.files_inspected, ledger.files_inspected
+
+
 def assert_runtime_final_synthesis_uses_fast_bounded_closer_alias():
     with tempfile.TemporaryDirectory(dir=ROOT) as td:
         from pathlib import Path
@@ -5445,6 +5492,7 @@ def main():
     assert_agenda_guided_redirects_then_prefetches_after_model_ignores_required_source()
     assert_agenda_guided_does_not_prefetch_upfront_lets_model_cooperate()
     assert_exploration_policy_close_immediately_blocks_further_tool_calls()
+    assert_absolute_source_floor_closes_from_relative_runtime_evidence()
     assert_exploration_policy_min_optional_redirects_early_complete()
     assert_exploration_policy_contradiction_blocks_closure()
     assert_exploration_partial_dict_caps_complete_when_exploration_unmet()
@@ -5463,6 +5511,7 @@ def main():
     assert_unknown_required_shape_fails_early_without_pattern()
     assert_custom_required_shape_with_pattern_is_allowed_and_detected()
     assert_missing_global_must_inspect_read_cannot_complete()
+    assert_absolute_allowed_paths_resolve_to_project_relative_tool_paths()
     print("PASS: runtime contract suite")
 
 

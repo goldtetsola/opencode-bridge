@@ -28,6 +28,11 @@ from codex_oss.runtime.loop import _extract_model_text
 from codex_oss.runtime.policy import is_critical_path, scan_secrets
 from codex_oss.native_certification import classify_implementation_status
 from codex_oss.native_work_ux import native_work_contract_text
+from codex_oss.native_runtime_contracts import (
+    create_worktree_plan,
+    open_implementation_escrow,
+    promotion_decision,
+)
 
 from codex_oss.read_evidence import (
     build_canonical_patch_evidence,
@@ -608,6 +613,10 @@ def _persist_implementation_runtime_artifacts(
     model_narrative = report.get("model_narrative") if isinstance(report.get("model_narrative"), dict) else validation.get("model_narrative")
     if isinstance(model_narrative, dict):
         _write_json(os.path.join(artifact_dir, "model_narrative.json"), model_narrative)
+    if isinstance(report.get("implementation_escrow"), dict):
+        _write_json(os.path.join(artifact_dir, "implementation_escrow.json"), report["implementation_escrow"])
+    if isinstance(report.get("promotion_transaction"), dict):
+        _write_json(os.path.join(artifact_dir, "promotion_transaction.json"), report["promotion_transaction"])
     source_payloads = [
         ("patch_intent.json", proposal.get("patch_intent")),
         ("patch_recipe.json", proposal.get("patch_recipe")),
@@ -3166,6 +3175,21 @@ def _implementation_report(
     )
     model_narrative = _implementation_model_narrative(proposal)
     authority = _implementation_authority(proposal, model_narrative)
+    mission_id = str(getattr(mission, "mission_id", "mission_unknown"))
+    artifact_dir = os.path.dirname(patch_path)
+    worktree_plan = create_worktree_plan(
+        target_branch=mission_id,
+        worktree_path=os.path.join(".codex-oss", "worktrees", mission_id),
+    )
+    implementation_escrow = open_implementation_escrow(
+        owned_paths=list(getattr(mission, "owned_paths", []) or []),
+        worktree=worktree_plan,
+    )
+    promotion_transaction = promotion_decision(
+        review_status="accepted" if bool(main_workspace_mutated) and status in {"VERIFIED", "APPLIED_TO_WORKSPACE"} else "pending",
+        verification_ok=status == "VERIFIED",
+        conflict=False,
+    )
 
     # ── v11: Build canonical patch evidence and validate implementation narrative ──
     canonical_patch = build_canonical_patch_evidence(
@@ -3260,6 +3284,8 @@ def _implementation_report(
         "proposal_source": proposal_source,
         "runtime_built_diff": runtime_built_diff,
         "implementation_authority": authority,
+        "implementation_escrow": implementation_escrow,
+        "promotion_transaction": promotion_transaction,
         "model_narrative": model_narrative,
         "model_repair_count": int(getattr(mission, "model_repair_count", 0) or 0),
         "workspace_policy": workspace_policy,
@@ -3274,9 +3300,9 @@ def _implementation_report(
         "final_claim_gate": final_claim_gate,
         "changed_files": changed,
         "patch_artifact": patch_path,
-        "report_artifact": os.path.join(os.path.dirname(patch_path), "report.json"),
+        "report_artifact": os.path.join(artifact_dir, "report.json"),
         "certification_artifact": (
-            os.path.join(os.path.dirname(patch_path), "certification.json")
+            os.path.join(artifact_dir, "certification.json")
             if certification is not None
             else ""
         ),
@@ -3289,8 +3315,8 @@ def _implementation_report(
             "artifact": rollback_path,
             "method": "git apply -R rollback.diff",
         },
-        "visible_commentary_path": os.path.join(os.path.dirname(patch_path), "visible_commentary.jsonl"),
-        "summary_path": os.path.join(os.path.dirname(patch_path), "summary.md"),
+        "visible_commentary_path": os.path.join(artifact_dir, "visible_commentary.jsonl"),
+        "summary_path": os.path.join(artifact_dir, "summary.md"),
         "confidence": "MEDIUM" if status == "VERIFIED" else "LOW",
         "caveats": caveats,
         "gpt_review_required": True,

@@ -8,7 +8,7 @@ Parent session:  GPT-5.5 (native openai provider)  ← orchestrator
 OSS subagents:   opencode_bridge provider            ← only used in agent TOMLs
                    → bridge.py (v6)
                    → OpenCode Go
-                   → DeepSeek V4 Pro / Kimi K2.6 / Flash
+                   → DeepSeek / Kimi / Flash / Qwen / other configured profiles
 ```
 
 **Bridge is a subagent-only provider.** Do NOT set `model_provider = "opencode_bridge"` as your session-wide provider. Codex will route GPT-5.5 orchestrator requests through the bridge, which cannot serve GPT models. The bridge v6 detects and rejects GPT requests immediately (`GPT_MODEL_STRATEGY=error`).
@@ -27,10 +27,10 @@ You: "Add a test for parseHeader() in src/parser.ts"
          │  Scope: single file, tests exist → Bounded implementation
          │
          ▼
-  GPT-5.5 spawns oss_deepseek_implementer with fork_turns: "none"
+  GPT-5.5 spawns a runtime implementation agent with fork_turns: "none"
         │  Handoff: MissionV1 A4/A5 task, risk tier, allowed/forbidden paths, verification policy
         ▼
-  Runtime owns patch/apply/verify/status; DeepSeek provides patch intent and rationale
+  Runtime owns patch/apply/verify/review-packet/status; OSS model provides patch intent and rationale
          │
          ▼
    GPT-5.5 validates result. Accepts. Done.
@@ -54,8 +54,8 @@ Task received by GPT-5.5
     │       → oss_flash_context (runtime-controlled read-only, fork_turns: "none", cheapest)
     │
     ├─ Bounded implementation? (single file/module, tests exist, clear spec)
-    │       → oss_deepseek_implementer (MissionV1 A4/A5, fork_turns: "none")
-    │       → Accept only if runtime artifacts show patch/apply/verify/status and GPT review agrees
+    │       → runtime MissionV1 A4/A5 implementation profile (default: oss_deepseek_implementer / mission-a5-deepseek)
+    │       → Accept only if runtime artifacts show patch/apply/verify/review packet/status and GPT review agrees
     │
     └─ Ambiguous? (unclear scope, unknown blast radius)
             → oss_kimi_investigator first (runtime-controlled scout, fork_turns: "none")
@@ -74,7 +74,7 @@ Task received by GPT-5.5
 | `oss_kimi_rapid` | kimi-k2.6 (raw) | medium | read-only | Manual repo nav baseline | Auth, critical paths |
 | `oss_flash_support` | deepseek-v4-flash (raw) | medium | read-only | Manual docs/support baseline | Correctness-critical work |
 
-**Runtime-controlled agents** use MissionV1 contracts with governed tool access, evidence tracking, patch validation, and audit artifacts. This is the recommended path for all OSS work, including implementation.
+**Runtime-controlled agents** use MissionV1 contracts with governed tool access, event-log authority, evidence tracking, patch validation, isolated worktrees, review packets, and audit artifacts. This is the recommended path for all OSS work, including implementation. DeepSeek is the default high-reasoning implementation profile today, but the runtime contract is intentionally model-agnostic.
 
 **Raw experimental agents** use prompt-only discipline without the full runtime control plane. `oss_deepseek_pro` may do bounded low-risk edits inside explicit owned paths; other raw agents remain read-only support/scout lanes.
 
@@ -140,6 +140,7 @@ Create a new `.toml` in `.codex/agents/` following the existing format. Ensure:
 - `model = "mission-a<tier>-<model>"` for runtime agents, especially MissionV1 A4/A5 implementation agents
 - `model_reasoning_effort = "high" | "medium" | "low"`
 - Spawn with `fork_turns: "none"`
+- Do not silently downgrade an explicit user-selected model across capability tiers; weaker fallback requires explicit orchestrator approval.
 
 ## Handoff pattern examples
 
@@ -164,7 +165,7 @@ Spawn oss_deepseek_implementer with fork_turns: "none".
 </OSS_HANDOFF_JSON>
 
 Human context:
-Risk tier: medium because this touches an auth-adjacent file; runtime owns patch construction, apply, verification, rollback, and final status. The model owns narrative, patch intent, and rationale only. GPT review remains required before acceptance.
+Risk tier: medium because this touches an auth-adjacent file; runtime owns patch construction, isolated apply, verification, rollback, review packet, promotion state, and final status. The model owns narrative, patch intent, and rationale only. GPT review remains required before acceptance.
 ```
 
 ### Example 2: Ambiguous → Scout → Escalate

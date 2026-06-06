@@ -9,7 +9,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from codex_oss.desktop_transcript_ingestor import ingest_desktop_transcript
 from codex_oss.desktop_observation import build_raw_desktop_transcript, capture_thread_observation
+from codex_oss.mission_event_bridge import ensure_mission_admitted_from_artifacts
 from codex_oss.native_certification import certify_oss_native_parity_project
 from codex_oss.route_authority import build_route_authority
 
@@ -72,6 +74,7 @@ def finalize_spawn_lifecycle(
     root = Path(project_root).resolve()
     mission_dir = root / ".codex-oss" / "missions" / mission_id
     mission_dir.mkdir(parents=True, exist_ok=True)
+    ensure_mission_admitted_from_artifacts(root, mission_id)
 
     existing_receipt = _read_json(mission_dir / "spawn_receipt.json")
     receipt = _merge_receipt(
@@ -118,6 +121,13 @@ def finalize_spawn_lifecycle(
             thread_id=str(transcript.get("thread_id", "") or ""),
             spawned_agent_id=str(receipt.get("agent_id", "") or ""),
             transcript_path=str(transcript_path),
+        )
+        ingest_desktop_transcript(
+            project_root=root,
+            run_id=mission_id,
+            mission_id=mission_id,
+            transcript_path=transcript_path,
+            expected_agent_id=str(receipt.get("agent_id", "") or ""),
         )
         _remove_if_exists(mission_dir / "capture_failure.json")
     elif not transcript_path.exists():
@@ -237,6 +247,7 @@ def _write_capture_failure(*, mission_dir: Path, receipt: JSON, reason: str, det
         "next_action": "check app surface / verify agent_id / rerun capture",
     }
     _write_json(mission_dir / "capture_failure.json", failure)
+    _append_capture_failure_event(mission_dir, receipt, reason)
     return {
         "schema_version": "desktop_observation_capture.v1",
         "ok": False,
@@ -244,6 +255,31 @@ def _write_capture_failure(*, mission_dir: Path, receipt: JSON, reason: str, det
         "reasons": [reason],
         "capture_failure": failure,
     }
+
+
+def _append_capture_failure_event(mission_dir: Path, receipt: JSON, reason: str) -> None:
+    try:
+        from codex_oss.mission_event_log import MissionEventLog
+
+        project_root = mission_dir.parents[2]
+        mission_id = str(receipt.get("mission_id") or mission_dir.name)
+        log = MissionEventLog.for_project(project_root, mission_id, mission_id=mission_id)
+        if any(event.get("event_type") == "DesktopTranscriptCaptured" for event in log.read_events(verify=True)):
+            return
+        log.append(
+            "DesktopTranscriptCaptured",
+            {
+                "agent_id": str(receipt.get("agent_id") or ""),
+                "thread_id": str(receipt.get("agent_id") or ""),
+                "transcript_kind": "missing",
+                "consumer_kind": "codex_desktop_spawned",
+                "capture_method": f"codex_app.read_thread:{reason}",
+            },
+            source_kind="desktop_app",
+            authority="diagnostic_only",
+        )
+    except Exception:
+        return
 
 
 def _write_lifecycle_failure(*, mission_dir: Path, mission_id: str, reason: str, receipt: JSON) -> JSON:
