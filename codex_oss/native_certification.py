@@ -1,7 +1,7 @@
 """Native Runtime Certification Kernel.
 
-This module is deliberately artifact-first: it certifies only what runtime and
-consumer evidence can prove, and it fails closed for Desktop-native claims.
+Claim-bearing certification is event-log first: current mission claims reduce
+MissionEventLog history into RunRecord state, then evaluate pure claim gates.
 """
 
 from __future__ import annotations
@@ -12,11 +12,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from codex_oss.desktop_native_verifier import verify_desktop_native_ux
-from codex_oss.desktop_observation import capture_thread_observation
+from codex_oss.event_claim_gate import evaluate_event_claim_gate
 from codex_oss.mission import InvalidHandoffError, extract_mission_v1_block, parse_mission_v1
-from codex_oss.mission_authority_artifacts import ensure_derived_desktop_gold_artifacts
-from codex_oss.route_authority import route_allows_desktop_gold
+from codex_oss.mission_event_log import MissionEventError, MissionEventLog, event_log_exists
+from codex_oss.run_manifest import load_run_manifest
+from codex_oss.run_record import build_run_record
 
 JSON = dict[str, Any]
 
@@ -64,47 +64,6 @@ def evaluate_handoff_authority(*, handoff_text: str = "", mission_json: JSON | N
         "mission_id": mission_id,
         "reasons": reasons,
         "basis": "exactly_one_canonical_mission_v1" if ok else "; ".join(reasons),
-    }
-
-
-def evaluate_runtime_truth(*, report: JSON | None = None, canonical_evidence: JSON | None = None) -> JSON:
-    """RuntimeTruthGate: terminal status cannot exceed canonical evidence."""
-    report = report if isinstance(report, dict) else {}
-    canonical_evidence = canonical_evidence if isinstance(canonical_evidence, dict) else {}
-    status = str(report.get("status", "") or "").upper()
-    reasons: list[str] = []
-
-    entitlement = canonical_evidence.get("status_entitlement") if isinstance(canonical_evidence.get("status_entitlement"), dict) else {}
-    coverage = canonical_evidence.get("coverage_status") if isinstance(canonical_evidence.get("coverage_status"), dict) else {}
-    missing_required = _listish(canonical_evidence.get("missing_required_sources"))
-    blocked = _listish(coverage.get("blocked_obligations"))
-    sufficiency = report.get("sufficiency") if isinstance(report.get("sufficiency"), dict) else {}
-    reconciliation = report.get("runtime_entitlement_reconciliation") if isinstance(report.get("runtime_entitlement_reconciliation"), dict) else {}
-
-    if status == "COMPLETE":
-        if entitlement and not bool(entitlement.get("can_complete", False)):
-            reasons.append("complete_without_canonical_status_entitlement")
-        if missing_required:
-            reasons.append("complete_with_missing_required_sources")
-        if blocked:
-            reasons.append("complete_with_blocked_obligations")
-        if sufficiency and not bool(sufficiency.get("enough_evidence_to_report", True)):
-            reasons.append("complete_with_insufficient_answer_graph")
-        if reconciliation.get("decision") == "demoted_complete_to_partial":
-            reasons.append("complete_after_runtime_reconciliation_demoted")
-
-    ok = not reasons
-    return {
-        "schema_version": "runtime_truth_gate.v1",
-        "ok": ok,
-        "gate": "RuntimeTruthGate",
-        "terminal_status": status or "UNKNOWN",
-        "can_complete": bool(entitlement.get("can_complete", status == "COMPLETE" and not reasons)),
-        "missing_required_sources": missing_required,
-        "blocked_obligations": blocked,
-        "reconciliation_decision": str(reconciliation.get("decision", "") or ""),
-        "reasons": reasons,
-        "basis": "terminal_status_matches_canonical_evidence" if ok else "; ".join(reasons),
     }
 
 
@@ -197,136 +156,20 @@ def evaluate_patch_authority(*, report: JSON | None = None, mission_json: JSON |
     }
 
 
-def evaluate_desktop_observation(
-    *,
-    project_root: str,
-    mission_id: str,
-    transcript_path: str = "",
-    route_authority: JSON | None = None,
-) -> JSON:
-    """DesktopObservationGate: Desktop Gold requires actual consumer witness."""
-    reasons: list[str] = []
-    if not transcript_path:
-        reasons.append("desktop_transcript_missing")
-        return {
-            "schema_version": "desktop_observation_gate.v1",
-            "ok": False,
-            "gate": "DesktopObservationGate",
-            "mission_id": mission_id,
-            "transcript_path": transcript_path,
-            "desktop_gold_pass": False,
-            "runtime_progress_emission": _runtime_progress_emission(project_root, mission_id),
-            "missing_evidence": ["desktop_native_unproven", *reasons],
-            "basis": "; ".join(reasons),
-        }
-    transcript_payload = _read_json(Path(transcript_path))
-    if transcript_payload:
-        capture_thread_observation(
-            project_root=project_root,
-            mission_id=mission_id,
-            transcript_path=transcript_path,
-            thread_id=str(transcript_payload.get("thread_id", "") or ""),
-            spawned_agent_id=str(transcript_payload.get("spawned_agent_id", "") or transcript_payload.get("agent_id", "") or ""),
-        )
-
-    report = verify_desktop_native_ux(
-        transcript_path=transcript_path,
-        mission_id=mission_id,
-        project_root=project_root,
-        route_authority=route_authority,
-    )
-    missing = list(report.get("missing_evidence", []) or [])
-    return {
-        "schema_version": "desktop_observation_gate.v1",
-        "ok": bool(report.get("ok")) and bool(report.get("desktop_gold_pass")),
-        "gate": "DesktopObservationGate",
-        "mission_id": mission_id,
-        "transcript_path": transcript_path,
-        "desktop_gold_pass": bool(report.get("desktop_gold_pass")),
-        "runtime_progress_emission": _runtime_progress_emission(project_root, mission_id),
-        "consumer_observation_witness": report.get("consumer_observation_witness", {}),
-        "desktop_verifier": report,
-        "missing_evidence": missing,
-        "basis": "desktop_consumer_observation_witness_passed" if report.get("ok") else "; ".join(missing),
-    }
-
-
 def certify_native_like_project(
     project_root: str,
     *,
     mission_id: str = "",
-    handoff_path: str = "",
-    transcript_path: str = "",
-    route_authority_path: str = "",
+    run_id: str = "",
 ) -> JSON:
     """Build NativeLikeCertificationV1 and write JSON/Markdown artifacts."""
     project_root = os.path.abspath(project_root)
-    mission_id = mission_id or _latest_mission_id(project_root)
-    mission_dir = Path(project_root) / ".codex-oss" / "missions" / mission_id if mission_id else None
-    mission_json = _first_json(
-        [
-            mission_dir / "mission_canonical.json" if mission_dir else None,
-            mission_dir / "mission.json" if mission_dir else None,
-        ]
-    )
-    report = _read_json(mission_dir / "report.json") if mission_dir else {}
-    canonical_evidence = _first_json(
-        [
-            mission_dir / "canonical_evidence_bundle.json" if mission_dir else None,
-            mission_dir / "canonical_read_evidence.json" if mission_dir else None,
-            mission_dir / "canonical_patch_evidence.json" if mission_dir else None,
-        ]
-    )
-    handoff_text = _handoff_text_for_gate(mission_dir, handoff_path)
-    route_authority = _read_json(Path(route_authority_path)) if route_authority_path else _read_json(mission_dir / "route_authority.json") if mission_dir else None
-
-    handoff_gate = evaluate_handoff_authority(
-        handoff_text=handoff_text,
-        mission_json=mission_json if not handoff_text else None,
-    )
-    runtime_gate = evaluate_runtime_truth(report=report, canonical_evidence=canonical_evidence)
-    patch_gate = evaluate_patch_authority(report=report, mission_json=mission_json)
-    desktop_gate = evaluate_desktop_observation(
-        project_root=project_root,
-        mission_id=mission_id,
-        transcript_path=transcript_path,
-        route_authority=route_authority,
-    )
-
-    gates = {
-        "handoff_authority": handoff_gate,
-        "runtime_truth": runtime_gate,
-        "patch_authority": patch_gate,
-        "desktop_observation": desktop_gate,
-    }
-    runtime_safe = all(bool(gates[name].get("ok")) for name in ("handoff_authority", "runtime_truth", "patch_authority"))
-    desktop_native = runtime_safe and bool(desktop_gate.get("ok"))
-    allowed_claims: list[str] = []
-    disallowed_claims: list[str] = []
-    if runtime_safe:
-        allowed_claims.append("runtime-governed OSS subagent completed safely")
-    else:
-        disallowed_claims.append("runtime-governed OSS subagent completed safely")
-    if desktop_native:
-        allowed_claims.append("Desktop-native live-progress OSS subagent")
-    else:
-        disallowed_claims.append("Desktop-native live-progress OSS subagent")
-
-    certification = {
-        "schema_version": NATIVE_CERTIFICATION_SCHEMA_VERSION,
-        "project_root": project_root,
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-        "target": "native-like",
-        "mission_id": mission_id,
-        "verdict": {
-            "status": "CERTIFIED" if desktop_native else ("RUNTIME_ONLY" if runtime_safe else "UNCONFIRMED"),
-            "runtime_safe": runtime_safe,
-            "desktop_native": desktop_native,
-        },
-        "allowed_claims": allowed_claims,
-        "disallowed_claims": disallowed_claims,
-        "gates": gates,
-    }
+    run_id = run_id or mission_id
+    if run_id and event_log_exists(project_root, run_id):
+        certification = _event_backed_native_like_certification(project_root, run_id, target="native-like")
+        _write_native_certification(project_root, certification)
+        return certification
+    certification = _claim_selector_required(project_root, "native-like")
     _write_native_certification(project_root, certification)
     return certification
 
@@ -335,132 +178,15 @@ def certify_desktop_gold_project(
     project_root: str,
     *,
     mission_id: str = "",
-    transcript_path: str = "",
-    route_authority_path: str = "",
+    run_id: str = "",
 ) -> JSON:
     project_root = os.path.abspath(project_root)
-    mission_id = mission_id or _latest_mission_id(project_root)
-    mission_dir = Path(project_root) / ".codex-oss" / "missions" / mission_id if mission_id else None
-    if mission_dir:
-        ensure_derived_desktop_gold_artifacts(mission_dir)
-    mission_json = _first_json(
-        [
-            mission_dir / "mission_canonical.json" if mission_dir else None,
-            mission_dir / "mission.json" if mission_dir else None,
-        ]
-    )
-    report = _read_json(mission_dir / "report.json") if mission_dir else {}
-    canonical_evidence = _first_json(
-        [
-            mission_dir / "canonical_evidence_bundle.json" if mission_dir else None,
-            mission_dir / "canonical_read_evidence.json" if mission_dir else None,
-            mission_dir / "canonical_patch_evidence.json" if mission_dir else None,
-        ]
-    )
-    handoff_gate = evaluate_handoff_authority(
-        handoff_text=_handoff_text_for_gate(mission_dir, ""),
-        mission_json=mission_json if not _has_handoff_text(mission_dir) else None,
-    )
-    runtime_gate = evaluate_runtime_truth(report=report, canonical_evidence=canonical_evidence)
-    route_authority = _read_json(Path(route_authority_path)) if route_authority_path else _read_json(mission_dir / "route_authority.json") if mission_dir else {}
-    route_ok = route_allows_desktop_gold(route_authority)
-    route_gate = {
-        "schema_version": "route_authority_gate.v1",
-        "ok": route_ok,
-        "gate": "RouteAuthorityGate",
-        "basis": "mission_route_allows_desktop_gold" if route_ok else "desktop_route_authority_missing",
-        "route_authority": route_authority or {},
-    }
-    transcript_path = transcript_path or str(mission_dir / "desktop_thread_transcript.json") if mission_dir else ""
-    if transcript_path and mission_dir and Path(transcript_path).exists():
-        capture_thread_observation(
-            project_root=project_root,
-            mission_id=mission_id,
-            transcript_path=transcript_path,
-            thread_id=str((_read_json(Path(transcript_path))).get("thread_id", "") or ""),
-        )
-    desktop_report = verify_desktop_native_ux(
-        transcript_path=transcript_path,
-        mission_id=mission_id,
-        project_root=project_root,
-        route_authority=route_authority,
-    ) if transcript_path else {
-        "ok": False,
-        "consumer_observation_witness": {},
-        "missing_evidence": ["desktop_transcript_missing"],
-        "final_claim_gate": {},
-    }
-    consumer_gate = {
-        "schema_version": "consumer_observation_gate.v1",
-        "ok": bool((desktop_report.get("consumer_observation_witness") or {}).get("ok")),
-        "gate": "ConsumerObservationGate",
-        "basis": "consumer_observation_witness_passed" if bool((desktop_report.get("consumer_observation_witness") or {}).get("ok")) else "consumer_observation_witness_missing_or_failed",
-        "witness": desktop_report.get("consumer_observation_witness", {}),
-    }
-    reconciliation = _read_json(mission_dir / "commentary_delivery_reconciliation.json") if mission_dir else {}
-    reconciliation_gate = {
-        "schema_version": "commentary_reconciliation_gate.v1",
-        "ok": bool(reconciliation.get("pass") or reconciliation.get("ok")),
-        "gate": "CommentaryReconciliationGate",
-        "basis": "commentary_event_ids_reconciled" if bool(reconciliation.get("pass") or reconciliation.get("ok")) else "commentary_delivery_reconciliation_missing_or_failed",
-        "reconciliation": reconciliation,
-    }
-    adoption = _read_json(mission_dir / "adoption_or_recovery.json") if mission_dir else {}
-    adoption_status = str(adoption.get("status") or "").upper()
-    adoption_gate = {
-        "schema_version": "adoption_or_recovery_gate.v1",
-        "ok": adoption_status in {"PASS", "RECOVERED", "NOT_APPLICABLE"},
-        "gate": "AdoptionOrRecoveryGate",
-        "status": adoption_status or "MISSING",
-        "basis": f"adoption_or_recovery_{adoption_status.lower()}" if adoption_status in {"PASS", "RECOVERED", "NOT_APPLICABLE"} else "adoption_or_recovery_missing_or_failed",
-        "adoption_or_recovery": adoption,
-    }
-    render_proof = (desktop_report.get("final_claim_gate") or {}).get("render_surface_proof") if isinstance(desktop_report.get("final_claim_gate"), dict) else {}
-    render_gate = {
-        "schema_version": "render_surface_proof_gate.v1",
-        "ok": bool((render_proof or {}).get("ok")),
-        "gate": "RenderSurfaceProofGate",
-        "basis": str((render_proof or {}).get("basis") or "no_render_surface_proof"),
-        "render_surface_proof": render_proof or {},
-    }
-    gates = {
-        "route_authority": route_gate,
-        "handoff_authority": handoff_gate,
-        "runtime_evidence": runtime_gate,
-        "consumer_observation": consumer_gate,
-        "commentary_reconciliation": reconciliation_gate,
-        "adoption_or_recovery": adoption_gate,
-        "render_surface_proof": render_gate,
-    }
-    certified = all(bool(gate.get("ok")) for gate in gates.values())
-    allowed_claims: list[str] = []
-    disallowed_claims: list[str] = [
-        "Arbitrary OSS native tool-loop parity.",
-        "All OSS implementation agents are production-ready.",
-    ]
-    if certified:
-        allowed_claims.extend([
-            "MissionV1 OSS subagent produced Desktop-observed pre-final progress before final.",
-            "Runtime-owned evidence and report reconciled with Desktop transcript.",
-        ])
-    else:
-        disallowed_claims.insert(0, "MissionV1 OSS subagent produced certified Desktop Gold progress.")
-    certification = {
-        "schema_version": "desktop_gold_certification.v1",
-        "project_root": project_root,
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-        "target": "desktop-gold",
-        "mission_id": mission_id,
-        "status": "PASS" if certified else "FAIL",
-        "verdict": {
-            "status": "CERTIFIED" if certified else "UNCONFIRMED",
-            "desktop_gold": certified,
-        },
-        "gates": gates,
-        "allowed_claims": allowed_claims,
-        "disallowed_claims": disallowed_claims,
-        "desktop_verifier": desktop_report,
-    }
+    run_id = run_id or mission_id
+    if run_id and event_log_exists(project_root, run_id):
+        certification = _event_backed_desktop_gold_certification(project_root, run_id)
+        _write_desktop_gold_certification(project_root, certification)
+        return certification
+    certification = _claim_selector_required(project_root, "desktop-gold", schema_version="desktop_gold_certification.v1")
     _write_desktop_gold_certification(project_root, certification)
     return certification
 
@@ -469,6 +195,7 @@ def certify_oss_native_parity_project(
     project_root: str,
     *,
     mission_id: str = "",
+    run_manifest_path: str = "",
 ) -> JSON:
     """Certify broad OSS native-like parity across covered proof lanes.
 
@@ -477,108 +204,283 @@ def certify_oss_native_parity_project(
     each lane needs at least one mission with lane-specific authority artifacts.
     """
     project_root = os.path.abspath(project_root)
-    mission_dirs = _mission_dirs(project_root, mission_id)
-    mission_reports = [_mission_parity_report(project_root, mission_dir) for mission_dir in mission_dirs]
+    if run_manifest_path:
+        certification = _event_backed_aggregate_certification(project_root, run_manifest_path)
+        _write_named_certification(project_root, "oss-native-parity", certification)
+        return certification
+    if mission_id and event_log_exists(project_root, mission_id):
+        certification = _event_backed_single_parity_certification(project_root, mission_id)
+        _write_named_certification(project_root, "oss-native-parity", certification)
+        return certification
+    certification = _claim_selector_required(project_root, "oss-native-parity", schema_version="oss_native_parity_certification.v1")
+    _write_named_certification(project_root, "oss-native-parity", certification)
+    return certification
 
-    desktop_missions = [item for item in mission_reports if (item.get("desktop_gold") or {}).get("ok")]
-    tool_loop_missions = [item for item in mission_reports if (item.get("tool_loop") or {}).get("ok")]
-    implementation_missions = [item for item in mission_reports if (item.get("implementation") or {}).get("ok")]
-    recovery_missions = [item for item in mission_reports if (item.get("recovery") or {}).get("ok")]
-    model_names = sorted({model for item in mission_reports for model in _listish((item.get("coverage") or {}).get("models"))})
-    mission_classes = sorted({klass for item in mission_reports for klass in _listish((item.get("coverage") or {}).get("mission_classes"))})
 
-    gates = {
-        "desktop_progress_parity": _aggregate_gate(
-            "DesktopProgressParityGate",
-            desktop_missions,
-            "desktop_progress_parity_proven",
-            "desktop_progress_parity_missing",
-        ),
-        "tool_loop_parity": _aggregate_gate(
-            "ToolLoopParityGate",
-            tool_loop_missions,
-            "tool_loop_adoption_or_recovery_proven",
-            "tool_loop_parity_missing",
-        ),
-        "implementation_parity": _aggregate_gate(
-            "ImplementationParityGate",
-            implementation_missions,
-            "runtime_patch_implementation_with_desktop_witness_proven",
-            "implementation_parity_missing",
-        ),
-        "recovery_parity": _aggregate_gate(
-            "RecoveryParityGate",
-            recovery_missions,
-            "recovery_or_fail_closed_proven",
-            "recovery_parity_missing",
-        ),
-        "model_mission_coverage": {
-            "schema_version": "native_parity_gate.v1",
-            "ok": len(model_names) >= 2 and len(mission_classes) >= 2,
-            "gate": "ModelMissionCoverageGate",
-            "basis": "multi_model_multi_mission_coverage" if len(model_names) >= 2 and len(mission_classes) >= 2 else "model_mission_coverage_insufficient",
-            "models": model_names,
-            "mission_classes": mission_classes,
-            "min_models": 2,
-            "min_mission_classes": 2,
-        },
-    }
-
+def _event_backed_native_like_certification(project_root: str, run_id: str, *, target: str) -> JSON:
+    record = _run_record_dict(project_root, run_id)
+    gate = evaluate_event_claim_gate(record, target="desktop-gold")
+    runtime_safe = bool(record.get("final_status")) or bool(record.get("task_spec"))
+    desktop_native = runtime_safe and bool(gate.get("ok"))
     allowed_claims: list[str] = []
     disallowed_claims: list[str] = []
-    if gates["desktop_progress_parity"]["ok"]:
-        allowed_claims.append("Covered MissionV1 OSS subagents have certified Desktop pre-final progress parity.")
+    if runtime_safe:
+        allowed_claims.append("runtime-governed OSS subagent completed safely")
     else:
-        disallowed_claims.append("Desktop progress parity for covered MissionV1 OSS subagents.")
-    if gates["tool_loop_parity"]["ok"]:
-        allowed_claims.append("Covered MissionV1 OSS tool-loop calls are adopted or recovered with Desktop witness evidence.")
+        disallowed_claims.append("runtime-governed OSS subagent completed safely")
+    if desktop_native:
+        allowed_claims.extend(gate.get("allowed_claims", []) or ["Desktop-native live-progress OSS subagent"])
     else:
-        disallowed_claims.append("Arbitrary OSS native tool-loop parity.")
-    if gates["implementation_parity"]["ok"]:
-        allowed_claims.append("Covered runtime-controlled OSS implementation lanes have native-like patch/verify/rollback behavior.")
-    else:
-        disallowed_claims.append("All OSS implementation agents are production-ready.")
-    if gates["recovery_parity"]["ok"]:
-        allowed_claims.append("Covered OSS recovery paths recover or fail closed under injected/recorded failure.")
-    else:
-        disallowed_claims.append("OSS recovery paths behave native-like across failures.")
+        disallowed_claims.append("Desktop-native live-progress OSS subagent")
+    return {
+        "schema_version": NATIVE_CERTIFICATION_SCHEMA_VERSION,
+        "project_root": project_root,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "target": target,
+        "mission_id": str(record.get("mission_id") or run_id),
+        "run_id": run_id,
+        "verdict": {
+            "status": "CERTIFIED" if desktop_native else ("RUNTIME_ONLY" if runtime_safe else "UNCONFIRMED"),
+            "runtime_safe": runtime_safe,
+            "desktop_native": desktop_native,
+        },
+        "allowed_claims": allowed_claims,
+        "disallowed_claims": disallowed_claims,
+        "gates": {
+            "event_claim_gate": gate,
+            "run_record": {
+                "schema_version": "run_record_gate.v1",
+                "ok": True,
+                "basis": "event_log_reduced_without_projection_authority",
+                "source_event_hash": record.get("source_event_hash", ""),
+            },
+        },
+        "run_record": record,
+    }
 
-    native_allowed = bool(allowed_claims)
-    runtime_only_claims = _runtime_only_allowed_claims(mission_reports)
-    for claim in runtime_only_claims:
-        if claim not in allowed_claims:
-            allowed_claims.append(claim)
 
-    certified = all(bool(gate.get("ok")) for gate in gates.values())
+def _event_backed_desktop_gold_certification(project_root: str, run_id: str) -> JSON:
+    record = _run_record_dict(project_root, run_id)
+    gate = evaluate_event_claim_gate(record, target="desktop-gold")
+    certified = bool(gate.get("ok"))
+    return {
+        "schema_version": "desktop_gold_certification.v1",
+        "project_root": project_root,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "target": "desktop-gold",
+        "mission_id": str(record.get("mission_id") or run_id),
+        "run_id": run_id,
+        "status": "PASS" if certified else "FAIL",
+        "verdict": {"status": "CERTIFIED" if certified else "UNCONFIRMED", "desktop_gold": certified},
+        "gates": {
+            "event_claim_gate": gate,
+            "run_record": {
+                "schema_version": "run_record_gate.v1",
+                "ok": True,
+                "basis": "event_log_reduced_without_projection_authority",
+                "source_event_hash": record.get("source_event_hash", ""),
+            },
+        },
+        "allowed_claims": list(gate.get("allowed_claims", []) or []),
+        "disallowed_claims": list(gate.get("disallowed_claims", []) or []),
+        "run_record": record,
+    }
+
+
+def _event_backed_single_parity_certification(project_root: str, run_id: str) -> JSON:
+    manifest = {
+        "schema_version": "run_manifest.v1",
+        "runs": [{"run_id": run_id, "mission_id": run_id, "lanes": ["desktop_progress", "tool_loop", "recovery", "implementation"]}],
+    }
+    return _event_backed_aggregate_from_manifest(project_root, manifest)
+
+
+def _event_backed_aggregate_certification(project_root: str, run_manifest_path: str) -> JSON:
+    return _event_backed_aggregate_from_manifest(project_root, load_run_manifest(run_manifest_path))
+
+
+def _event_backed_aggregate_from_manifest(project_root: str, manifest: JSON) -> JSON:
+    runs = manifest.get("runs") if isinstance(manifest.get("runs"), list) else []
+    lane_basis: dict[str, list[JSON]] = {lane: [] for lane in ["desktop_progress", "tool_loop", "recovery", "implementation"]}
+    excluded: list[JSON] = []
+    reports: list[JSON] = []
+    for item in runs:
+        run_id = str(item.get("run_id") or "")
+        lanes = [str(lane) for lane in item.get("lanes", []) if str(lane)]
+        try:
+            record = _run_record_dict(project_root, run_id)
+        except (MissionEventError, ValueError) as exc:
+            excluded.append({"run_id": run_id, "reason": str(exc)})
+            continue
+        reports.append(_event_mission_parity_report(record))
+        for lane in lanes:
+            if lane == "desktop_progress":
+                gate = evaluate_event_claim_gate(record, target="desktop-gold")
+            elif lane == "tool_loop":
+                gate = evaluate_event_claim_gate(record, target="tool-loop")
+            elif lane == "recovery":
+                gate = evaluate_event_claim_gate(record, target="tool-loop")
+                if gate.get("ok") and not any((call.get("recovery_event_id") or call.get("fail_closed")) for call in (record.get("tool_calls") or {}).get("items", [])):
+                    gate = {**gate, "ok": False, "missing_evidence": ["recovery_event_missing"]}
+            elif lane == "implementation":
+                gate = evaluate_event_claim_gate(record, target="implementation")
+            else:
+                continue
+            if gate.get("ok"):
+                lane_basis.setdefault(lane, []).append({
+                    "run_id": run_id,
+                    "mission_id": record.get("mission_id", run_id),
+                    "basis_event_ids": gate.get("basis_event_ids", []),
+                })
+    required_lanes = ["desktop_progress", "tool_loop", "recovery", "implementation"]
+    gates = {
+        lane: {
+            "schema_version": "native_parity_gate.v1",
+            "ok": bool(lane_basis.get(lane)),
+            "gate": f"{lane}_event_gate",
+            "basis": "event_history_lane_proven" if lane_basis.get(lane) else f"{lane}_missing",
+            "runs": lane_basis.get(lane, []),
+        }
+        for lane in required_lanes
+    }
+    coverage_missing = (manifest.get("coverage") or {}).get("missing_lanes", []) if isinstance(manifest.get("coverage"), dict) else []
+    for lane in coverage_missing:
+        if lane in gates:
+            gates[lane]["ok"] = False
+            gates[lane]["basis"] = f"{lane}_missing_from_run_manifest"
+    gates = {
+        "desktop_progress_parity": gates["desktop_progress"],
+        "tool_loop_parity": gates["tool_loop"],
+        "recovery_parity": gates["recovery"],
+        "implementation_parity": gates["implementation"],
+        "model_mission_coverage": {
+            "schema_version": "native_parity_gate.v1",
+            "ok": True,
+            "gate": "ModelMissionCoverageGate",
+            "basis": "event_manifest_explicit_coverage",
+            "models": sorted({model for report in reports for model in _listish((report.get("coverage") or {}).get("models"))}),
+            "mission_classes": sorted({klass for report in reports for klass in _listish((report.get("coverage") or {}).get("mission_classes"))}),
+        },
+        "desktop_progress": gates["desktop_progress"],
+        "tool_loop": gates["tool_loop"],
+        "recovery": gates["recovery"],
+        "implementation": gates["implementation"],
+    }
+    certified = all(bool(gates[name].get("ok")) for name in ("desktop_progress_parity", "tool_loop_parity", "recovery_parity", "implementation_parity", "model_mission_coverage")) and not excluded
+    allowed_claims = []
+    disallowed_claims = []
     if certified:
         allowed_claims.append("Supported runtime-controlled MissionV1 OSS subagents behave native-like across the covered parity matrix.")
     else:
         disallowed_claims.append("Supported runtime-controlled MissionV1 OSS subagents have full native parity across all lanes.")
-
     certification = {
         "schema_version": "oss_native_parity_certification.v1",
         "project_root": project_root,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "target": "oss-native-parity",
-        "mission_id": mission_id,
-        "status": "PASS" if certified else ("PARTIAL" if native_allowed else "FAIL"),
-        "verdict": {
-            "status": "CERTIFIED" if certified else ("PARTIAL" if native_allowed else "UNCONFIRMED"),
-            "oss_native_parity": certified,
-        },
+        "mission_id": "",
+        "status": "PASS" if certified else "PARTIAL",
+        "verdict": {"status": "CERTIFIED" if certified else "PARTIAL", "oss_native_parity": certified},
         "gates": gates,
         "allowed_claims": allowed_claims,
         "disallowed_claims": disallowed_claims,
-        "mission_report_count": len(mission_reports),
-        "passing_mission_reports": [
-            item for item in mission_reports
-            if any(bool((item.get(key) or {}).get("ok")) for key in ("desktop_gold", "tool_loop", "implementation", "recovery"))
-        ],
-        "mission_reports_sample": mission_reports[:10],
+        "run_manifest": manifest,
+        "excluded_runs": excluded,
+        "mission_report_count": len(reports),
+        "mission_reports_sample": reports[:10],
     }
-    certification.update(_targeted_parity_summary(mission_reports, mission_id))
-    _write_named_certification(project_root, "oss-native-parity", certification)
+    certification.update(_targeted_parity_summary(reports, str(runs[0].get("run_id") or "") if len(runs) == 1 else ""))
     return certification
+
+
+def _event_mission_parity_report(record: JSON) -> JSON:
+    desktop_gate = evaluate_event_claim_gate(record, target="desktop-gold")
+    tool_gate = evaluate_event_claim_gate(record, target="tool-loop")
+    implementation_gate = evaluate_event_claim_gate(record, target="implementation")
+    route = record.get("route_authority") if isinstance(record.get("route_authority"), dict) else {}
+    task = record.get("task_spec") if isinstance(record.get("task_spec"), dict) else {}
+    implementation = record.get("implementation") if isinstance(record.get("implementation"), dict) else {}
+    desktop = record.get("desktop_observation") if isinstance(record.get("desktop_observation"), dict) else {}
+    tool_calls = record.get("tool_calls") if isinstance(record.get("tool_calls"), dict) else {}
+    tool_items = tool_calls.get("items") if isinstance(tool_calls.get("items"), list) else []
+    recovery_present = any(
+        isinstance(call, dict) and (call.get("recovery_event_id") or call.get("fail_closed"))
+        for call in tool_items
+    )
+    recovery_ok = bool(tool_gate.get("ok")) and recovery_present
+    tool_status = "RECOVERED" if recovery_present else ("PASS" if tool_gate.get("ok") else "MISSING")
+    mission_id = str(record.get("mission_id") or record.get("run_id") or "")
+    desktop_basis = "desktop_gold_passed" if desktop_gate.get("ok") else "; ".join(desktop_gate.get("missing_evidence", []) or [])
+    for method in desktop.get("diagnostic_capture_methods", []) or []:
+        if "read_thread_export_missing" in str(method):
+            desktop_basis = "read_thread_export_missing"
+    return {
+        "schema_version": "mission_native_parity_report.v1",
+        "mission_id": mission_id,
+        "desktop_gold": {"ok": bool(desktop_gate.get("ok")), "basis": desktop_basis},
+        "spawned_transcript_authority": {"ok": bool(desktop.get("ok")), "basis": "raw_desktop_child_transcript" if desktop.get("ok") else "desktop_transcript_missing"},
+        "tool_loop": {
+            "schema_version": "tool_loop_parity_lane.v1",
+            "ok": bool(tool_gate.get("ok")),
+            "status": tool_status,
+            "pending_tool_calls_emitted": len(tool_items),
+            "probe_total": len(tool_items),
+            "desktop_gold_required": True,
+            "basis": "tool_calls_adopted_or_recovered_with_desktop_witness" if tool_gate.get("ok") else "tool_loop_parity_not_proven",
+        },
+        "implementation": {
+            "schema_version": "implementation_parity_lane.v1",
+            "ok": bool(implementation_gate.get("ok")),
+            "tier": str(task.get("tier") or ""),
+            "implementation_status": "verified" if implementation.get("verification_passed") else "not_applicable",
+            "patch_authority_ok": bool(implementation.get("ok")),
+            "desktop_gold_required": True,
+            "basis": "implementation_patch_authority_with_desktop_witness" if implementation_gate.get("ok") else "implementation_parity_not_proven",
+        },
+        "recovery": {
+            "schema_version": "recovery_parity_lane.v1",
+            "ok": recovery_ok,
+            "adoption_status": "RECOVERED" if recovery_present else "MISSING",
+            "recovery_status": "RECOVERED" if recovery_present else "MISSING",
+            "desktop_gold_required": True,
+            "recovery_artifact_ok": recovery_present,
+            "basis": "recovery_or_fail_closed_with_desktop_witness" if recovery_ok else "recovery_parity_not_proven",
+        },
+        "coverage": {
+            "schema_version": "mission_parity_coverage.v1",
+            "models": [str(route.get("model_alias") or "")] if route.get("model_alias") else [],
+            "mission_classes": [str(task.get("tier") or task.get("mode") or "")] if task.get("tier") or task.get("mode") else [],
+        },
+        "run_record": record,
+    }
+
+
+def _run_record_dict(project_root: str, run_id: str) -> JSON:
+    events = MissionEventLog.for_project(project_root, run_id).read_events(verify=True)
+    return build_run_record(events).to_dict()
+
+
+def _claim_selector_required(project_root: str, target: str, *, schema_version: str = NATIVE_CERTIFICATION_SCHEMA_VERSION) -> JSON:
+    return {
+        "schema_version": schema_version,
+        "project_root": project_root,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "target": target,
+        "mission_id": "",
+        "status": "FAIL",
+        "verdict": {"status": "UNCONFIRMED"},
+        "allowed_claims": [],
+        "disallowed_claims": ["Claim-bearing certification requires an explicit run_id, mission_id, or run manifest."],
+        "gates": {
+            "claim_selector": {
+                "schema_version": "claim_selector_gate.v1",
+                "ok": False,
+                "gate": "ClaimSelectorGate",
+                "basis": "explicit_run_selector_required",
+                "missing_evidence": ["run_id_or_mission_id_or_run_manifest_required"],
+            }
+        },
+    }
 
 
 def _runtime_only_allowed_claims(mission_reports: list[JSON]) -> list[str]:
@@ -668,228 +570,6 @@ def _explicit_workspace_apply_policy(report: JSON) -> bool:
             or policy.get("certification_required")
         )
     return False
-
-
-def _runtime_progress_emission(project_root: str, mission_id: str) -> JSON:
-    path = Path(project_root) / ".codex-oss" / "missions" / mission_id / "commentary_delivery.json"
-    payload = _read_json(path)
-    events = payload.get("events") if isinstance(payload, dict) else {}
-    if not isinstance(events, dict):
-        events = {}
-    emitted = 0
-    for event in events.values():
-        if isinstance(event, dict):
-            states = event.get("states") if isinstance(event.get("states"), dict) else {}
-            if states.get("sse_emitted") or states.get("stream_enqueued"):
-                emitted += 1
-    return {
-        "schema_version": "runtime_progress_emission.v1",
-        "path": str(path),
-        "artifact_present": path.exists(),
-        "emitted_count": emitted,
-        "ok": emitted >= 1,
-    }
-
-
-def _read_json(path: Path | None) -> JSON:
-    if path is None:
-        return {}
-    try:
-        with path.open("r", encoding="utf-8") as handle:
-            data = json.load(handle)
-    except (OSError, json.JSONDecodeError):
-        return {}
-    return data if isinstance(data, dict) else {}
-
-
-def _handoff_text_for_gate(mission_dir: Path | None, handoff_path: str) -> str:
-    candidates: list[Path] = []
-    if handoff_path:
-        candidates.append(Path(handoff_path))
-    if mission_dir:
-        candidates.extend([mission_dir / "mission_handoff_raw.txt", mission_dir / "handoff.md"])
-    for path in candidates:
-        try:
-            text = path.read_text(encoding="utf-8")
-        except OSError:
-            continue
-        if text.strip():
-            return text
-    return ""
-
-
-def _has_handoff_text(mission_dir: Path | None) -> bool:
-    return bool(_handoff_text_for_gate(mission_dir, ""))
-
-
-def _mission_dirs(project_root: str, mission_id: str = "") -> list[Path]:
-    root = Path(project_root) / ".codex-oss" / "missions"
-    if mission_id:
-        path = root / mission_id
-        return [path] if path.exists() and path.is_dir() else []
-    if not root.exists():
-        return []
-    return sorted([path for path in root.iterdir() if path.is_dir()], key=lambda path: path.name)
-
-
-def _mission_parity_report(project_root: str, mission_dir: Path) -> JSON:
-    mission_id = mission_dir.name
-    ensure_derived_desktop_gold_artifacts(mission_dir)
-    mission_json = _first_json([mission_dir / "mission_canonical.json", mission_dir / "mission.json"])
-    report = _read_json(mission_dir / "report.json")
-    route_authority = _read_json(mission_dir / "route_authority.json")
-    transcript_path = mission_dir / "desktop_thread_transcript.json"
-    if transcript_path.exists():
-        capture_thread_observation(
-            project_root=project_root,
-            mission_id=mission_id,
-            transcript_path=str(transcript_path),
-            thread_id=str(_read_json(transcript_path).get("thread_id", "") or ""),
-            spawned_agent_id=str(_read_json(transcript_path).get("spawned_agent_id", "") or _read_json(transcript_path).get("agent_id", "") or ""),
-        )
-    desktop_report = verify_desktop_native_ux(
-        transcript_path=str(transcript_path),
-        mission_id=mission_id,
-        project_root=project_root,
-        route_authority=route_authority,
-    ) if transcript_path.exists() else _missing_desktop_transcript_report(mission_dir)
-    spawned_authority = _read_json(mission_dir / "spawned_transcript_authority.json")
-    adoption = _read_json(mission_dir / "adoption_or_recovery.json")
-    probes = _read_json(mission_dir / "tool_call_adoption_probes.json")
-    patch_gate = evaluate_patch_authority(report=report, mission_json=mission_json)
-    recovery = _read_json(mission_dir / "recovery_proof.json")
-    coverage = _mission_coverage(mission_json, report, route_authority)
-    return {
-        "schema_version": "mission_native_parity_report.v1",
-        "mission_id": mission_id,
-        "desktop_gold": {"ok": bool(desktop_report.get("ok")), "basis": "desktop_gold_passed" if desktop_report.get("ok") else "; ".join(desktop_report.get("missing_evidence", []) or [])},
-        "spawned_transcript_authority": spawned_authority,
-        "tool_loop": _tool_loop_gate(adoption, probes, desktop_report),
-        "implementation": _implementation_lane_gate(patch_gate, desktop_report, mission_json),
-        "recovery": _recovery_lane_gate(adoption, recovery, desktop_report),
-        "coverage": coverage,
-    }
-
-
-def _missing_desktop_transcript_report(mission_dir: Path) -> JSON:
-    capture_failure = _read_json(mission_dir / "capture_failure.json")
-    spawn_receipt = _read_json(mission_dir / "spawn_receipt.json")
-    missing = ["desktop_transcript_missing"]
-    if capture_failure:
-        reason = str(capture_failure.get("reason") or "")
-        if reason:
-            missing.append(reason)
-    elif spawn_receipt.get("agent_id"):
-        missing.append("read_thread_not_attempted")
-        capture_failure = {
-            "schema_version": "desktop_capture_failure.v1",
-            "desktop_observation": "FAIL",
-            "reason": "read_thread_not_attempted",
-            "agent_id": str(spawn_receipt.get("agent_id") or ""),
-            "attempted_read_method": "codex_app.read_thread(threadId=agent_id)",
-            "list_threads_used": False,
-            "next_action": "call codex_app.read_thread(threadId=agent_id) and rerun spawn-lifecycle finalize",
-        }
-    return {
-        "ok": False,
-        "missing_evidence": missing,
-        "desktop_capture_failure": capture_failure,
-        "spawn_receipt": spawn_receipt,
-    }
-
-
-def _tool_loop_gate(adoption: JSON, probes: JSON, desktop_report: JSON) -> JSON:
-    status = str(adoption.get("status") or "").upper()
-    stats = probes.get("adoption_stats") if isinstance(probes.get("adoption_stats"), dict) else {}
-    total = int(stats.get("total", 0) or 0)
-    probe_items = probes.get("probes") if isinstance(probes.get("probes"), list) else []
-    all_resolved = total > 0 and all(
-        isinstance(probe, dict) and (probe.get("consumer_adopted") or probe.get("recovery_used"))
-        for probe in probe_items
-    )
-    ok = bool(desktop_report.get("ok")) and status in {"PASS", "RECOVERED"} and all_resolved
-    return {
-        "schema_version": "tool_loop_parity_lane.v1",
-        "ok": ok,
-        "status": status or "MISSING",
-        "pending_tool_calls_emitted": int(adoption.get("pending_tool_calls_emitted", total) or 0),
-        "probe_total": total,
-        "desktop_gold_required": True,
-        "basis": "tool_calls_adopted_or_recovered_with_desktop_witness" if ok else "tool_loop_parity_not_proven",
-    }
-
-
-def _implementation_lane_gate(patch_gate: JSON, desktop_report: JSON, mission_json: JSON) -> JSON:
-    tier = str(mission_json.get("tier", "") or "").upper()
-    implementation_status = str(patch_gate.get("implementation_status", "") or "")
-    ok = tier in {"A4", "A5", "A6"} and bool(patch_gate.get("ok")) and bool(desktop_report.get("ok"))
-    return {
-        "schema_version": "implementation_parity_lane.v1",
-        "ok": ok,
-        "tier": tier,
-        "implementation_status": implementation_status,
-        "patch_authority_ok": bool(patch_gate.get("ok")),
-        "desktop_gold_required": True,
-        "basis": "implementation_patch_authority_with_desktop_witness" if ok else "implementation_parity_not_proven",
-    }
-
-
-def _recovery_lane_gate(adoption: JSON, recovery: JSON, desktop_report: JSON) -> JSON:
-    adoption_status = str(adoption.get("status") or "").upper()
-    recovery_status = str(recovery.get("status") or "").upper()
-    recovery_artifact_ok = adoption_status == "RECOVERED" or recovery_status in {"RECOVERED", "FAIL_CLOSED"}
-    ok = bool(desktop_report.get("ok")) and recovery_artifact_ok
-    return {
-        "schema_version": "recovery_parity_lane.v1",
-        "ok": ok,
-        "adoption_status": adoption_status or "MISSING",
-        "recovery_status": recovery_status or "MISSING",
-        "desktop_gold_required": True,
-        "recovery_artifact_ok": recovery_artifact_ok,
-        "basis": "recovery_or_fail_closed_with_desktop_witness" if ok else "recovery_parity_not_proven",
-        "recovery_proof": recovery,
-    }
-
-
-def _mission_coverage(mission_json: JSON, report: JSON, route_authority: JSON) -> JSON:
-    model = str(route_authority.get("model_alias") or report.get("runtime_model_alias") or report.get("explorer_model") or "")
-    tier = str(mission_json.get("tier") or report.get("tier") or "")
-    mode = str(mission_json.get("mode") or report.get("mode") or "")
-    mission_class = tier or mode or "unknown"
-    return {
-        "schema_version": "mission_parity_coverage.v1",
-        "models": [model] if model else [],
-        "mission_classes": [mission_class] if mission_class and mission_class != "unknown" else [],
-    }
-
-
-def _aggregate_gate(gate_name: str, passing_missions: list[JSON], pass_basis: str, fail_basis: str) -> JSON:
-    return {
-        "schema_version": "native_parity_gate.v1",
-        "ok": bool(passing_missions),
-        "gate": gate_name,
-        "basis": pass_basis if passing_missions else fail_basis,
-        "mission_ids": [str(item.get("mission_id", "")) for item in passing_missions],
-        "count": len(passing_missions),
-    }
-
-
-def _first_json(paths: list[Path | None]) -> JSON:
-    for path in paths:
-        payload = _read_json(path)
-        if payload:
-            return payload
-    return {}
-
-
-def _latest_mission_id(project_root: str) -> str:
-    root = Path(project_root) / ".codex-oss" / "missions"
-    if not root.exists():
-        return ""
-    dirs = [path for path in root.iterdir() if path.is_dir()]
-    if not dirs:
-        return ""
-    return max(dirs, key=lambda path: path.stat().st_mtime).name
 
 
 def _listish(value: Any) -> list[Any]:

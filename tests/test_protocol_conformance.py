@@ -62,11 +62,6 @@ from bridge import _visible_event_stream_text
 from codex_oss.transport.chat_stream import ChatStreamAssembler
 from codex_oss.transport.response_builder import build_response_object_from_chat
 from codex_oss.doctor import DoctorReport, _check_agreements
-from codex_oss.desktop_tool_loop_probe import (
-    build_desktop_tool_loop_probe_response,
-    persist_desktop_tool_loop_adoption,
-    select_desktop_probe_tool,
-)
 from codex_oss.mission import InvalidHandoffError, _build_mission
 
 
@@ -1954,6 +1949,23 @@ def assert_declared_read_floor_completes_before_pending_adoption_recovery():
     assert not declared_read_floor_only(parse_task_envelope("OSS_HANDOFF_JSON:\n" + json.dumps(search_handoff)))
 
 
+def assert_human_mission_read_floor_allows_punctuation_and_negative_write_constraints():
+    handoff = (
+        "ROLE: oss_flash_context.\n"
+        "MISSION ID: punctuation_read_floor\n"
+        "GOAL: Inspect exactly one small source file.\n"
+        "TASK TYPE: scout.\n"
+        "OWNED PATHS: none.\n"
+        f"READ-ONLY PATHS: {ROOT}/codex_oss/mission_event_log.py.\n"
+        "VERIFICATION STEPS: read only; cite the inspected file; do not modify files.\n"
+        "DELIVERABLE: files_inspected, confidence, caveats.\n"
+    )
+    envelope = parse_task_envelope(handoff)
+    assert envelope["task_type"] == "scout", envelope
+    assert envelope["read_only_paths"] == ["codex_oss/mission_event_log.py"], envelope
+    assert declared_read_floor_only(envelope), envelope
+
+
 def assert_server_side_read_completion_falls_back_when_model_report_invalid():
     handoff = (
         "READ-ONLY PATHS: docs/visible-commentary.md\n"
@@ -2395,327 +2407,6 @@ def assert_doctor_rejects_embedded_mission_examples_in_agreements():
         assert checks["agreements.no_embedded_mission_examples"].status == "PASS", checks
 
 
-class _ProbeStoredResponse:
-    def __init__(
-        self,
-        response_id,
-        model_alias,
-        model_upstream,
-        messages,
-        pending_call_ids,
-        created_at,
-        output_items_json="[]",
-        tool_exchange_count=0,
-        task_max_exchanges=1,
-        previous_response_id="",
-        pending_replay_count=0,
-        adoption_probes_json="",
-    ):
-        self.response_id = response_id
-        self.model_alias = model_alias
-        self.model_upstream = model_upstream
-        self.messages = messages
-        self.pending_call_ids = pending_call_ids
-        self.created_at = created_at
-        self.output_items_json = output_items_json
-        self.tool_exchange_count = tool_exchange_count
-        self.task_max_exchanges = task_max_exchanges
-        self.previous_response_id = previous_response_id
-        self.pending_replay_count = pending_replay_count
-        self.adoption_probes_json = adoption_probes_json
-
-
-def _desktop_probe_mission(mission_id="desktop_probe_protocol", target_path="README.md"):
-    return {
-        "schema_version": "oss_agent_mission.v1",
-        "mission_id": mission_id,
-        "tier": "A3",
-        "mode": "managed_investigation",
-        "objective": "Probe Desktop tool-loop adoption.",
-        "write_allowed": False,
-        "allowed_paths": [target_path],
-        "allowed_roots": [],
-        "allowed_tool_classes": ["read"],
-        "required_outputs": ["confidence"],
-        "desktop_tool_loop_probe": {
-            "enabled": True,
-            "tool_intent": "safe_read",
-            "target_path": target_path,
-            "expected_resolution": "adopt_or_recover",
-            "max_pending_calls": 1,
-        },
-    }
-
-
-def assert_desktop_tool_loop_probe_schema_is_fail_closed():
-    raw = _desktop_probe_mission()
-    mission = _build_mission(raw)
-    assert mission.desktop_tool_loop_probe["enabled"] is True, mission
-    assert mission.desktop_tool_loop_probe["target_path"] == "README.md", mission
-
-    a5_probe = dict(raw)
-    a5_probe.update({
-        "tier": "A5",
-        "mode": "bounded_implementation",
-        "write_allowed": True,
-        "owned_paths": ["tmp/desktop-probe-owned.txt"],
-        "allowed_paths": ["README.md", "tmp/desktop-probe-owned.txt"],
-    })
-    mission = _build_mission(a5_probe)
-    assert mission.desktop_tool_loop_probe["enabled"] is True, mission
-    assert mission.write_allowed is True, mission
-
-    bad_tier = dict(raw)
-    bad_tier.update({"tier": "A6", "mode": "critical_implementation", "write_allowed": True, "owned_paths": ["README.md"]})
-    try:
-        _build_mission(bad_tier)
-    except InvalidHandoffError as exc:
-        assert "desktop_tool_loop_probe" in str(exc), exc
-    else:
-        raise AssertionError("A6 desktop_tool_loop_probe should fail closed")
-
-    bad_resolution = dict(raw)
-    bad_resolution["desktop_tool_loop_probe"] = dict(raw["desktop_tool_loop_probe"])
-    bad_resolution["desktop_tool_loop_probe"]["expected_resolution"] = "pretend_success"
-    try:
-        _build_mission(bad_resolution)
-    except InvalidHandoffError as exc:
-        assert "expected_resolution" in str(exc), exc
-    else:
-        raise AssertionError("unsupported desktop_tool_loop_probe expected_resolution should fail closed")
-
-
-def assert_desktop_probe_resolver_uses_incoming_manifest_only():
-    selected = select_desktop_probe_tool(
-        [{"type": "function", "name": "read_file", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}],
-        intent="safe_read",
-        target_path="README.md",
-    )
-    assert selected["name"] == "read_file", selected
-    assert selected["arguments"] == {"path": "README.md"}, selected
-
-    missing = select_desktop_probe_tool(
-        [{"type": "function", "name": "write_file", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}],
-        intent="safe_read",
-        target_path="README.md",
-    )
-    assert missing is None, missing
-
-    git_selected = select_desktop_probe_tool(
-        [{"type": "function", "name": "exec_command", "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}}}],
-        intent="safe_git",
-        target_path="README.md",
-    )
-    assert git_selected["name"] == "exec_command", git_selected
-    assert git_selected["arguments"] == {"cmd": "rtk git status --short"}, git_selected
-
-
-def assert_desktop_probe_emits_adoptable_responses_function_call_and_artifacts():
-    with tempfile.TemporaryDirectory(dir=ROOT) as d:
-        root = Path(d)
-        (root / "README.md").write_text("probe content\n", encoding="utf-8")
-        mission = _desktop_probe_mission()
-        body = {
-            "model": "mission-a3-deepseek",
-            "input": [{"role": "user", "content": "OSS_HANDOFF_JSON:\n" + json.dumps(mission)}],
-            "tools": [{
-                "type": "function",
-                "name": "read_file",
-                "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
-            }],
-        }
-        stored = []
-        result = build_desktop_tool_loop_probe_response(
-            body=body,
-            raw_model_alias="mission-a3-deepseek",
-            base_messages=[{"role": "user", "content": body["input"][0]["content"]}],
-            project_root=str(root),
-            state_put=stored.append,
-            stored_response_factory=_ProbeStoredResponse,
-            response_id="resp_probe",
-            created_at=123,
-            new_call_id=lambda prefix: {"call": "call_probe", "fc": "fc_probe"}.get(prefix, f"{prefix}_probe"),
-            json_dumps=lambda payload: json.dumps(payload, sort_keys=True),
-        )
-        assert result.handled is True, result
-        progress_items = [item for item in result.response_obj["output"] if item["type"] == "message"]
-        assert len(progress_items) == 3, result.response_obj["output"]
-        first_progress_text = progress_items[0]["content"][0]["text"]
-        assert first_progress_text == "Desktop tool-loop probe starting.", first_progress_text
-        assert "[OSS progress]" not in first_progress_text, first_progress_text
-        assert "oss-progress" not in first_progress_text, first_progress_text
-        assert not first_progress_text.startswith("I'm "), first_progress_text
-        assert progress_items[0]["metadata"]["oss_visible_event"]["event_id"] == "evt_0001", progress_items[0]
-        item = [item for item in result.response_obj["output"] if item["type"] == "function_call"][0]
-        assert item["type"] == "function_call", item
-        assert item["call_id"] == "call_probe", item
-        assert item["name"] == "read_file", item
-        assert stored[0].pending_call_ids == ["call_probe"], stored[0].pending_call_ids
-        mission_dir = root / ".codex-oss" / "missions" / mission["mission_id"]
-        pending_payload = json.loads((mission_dir / "tool_call_adoption_probes.json").read_text(encoding="utf-8"))
-        assert pending_payload["adoption_stats"]["total"] == 1, pending_payload
-        assert pending_payload["probes"][0]["consumer_adopted"] is False, pending_payload
-        delivery_payload = json.loads((mission_dir / "commentary_delivery.json").read_text(encoding="utf-8"))
-        assert len(delivery_payload["events"]) == 3, delivery_payload
-
-        adoption = persist_desktop_tool_loop_adoption(
-            project_root=str(root),
-            stored=stored[0],
-            call_id="call_probe",
-            tool_output_text="probe content\n",
-        )
-        assert adoption["handled"] is True, adoption
-        adoption_payload = json.loads((mission_dir / "adoption_or_recovery.json").read_text(encoding="utf-8"))
-        assert adoption_payload["status"] == "PASS", adoption_payload
-        assert adoption_payload["pending_tool_calls_emitted"] == 1, adoption_payload
-        probes_payload = json.loads((mission_dir / "tool_call_adoption_probes.json").read_text(encoding="utf-8"))
-        assert probes_payload["probes"][0]["consumer_adopted"] is True, probes_payload
-        report = json.loads((mission_dir / "report.json").read_text(encoding="utf-8"))
-        assert report["status"] == "COMPLETE", report
-
-
-def assert_desktop_probe_recovery_records_injected_failure():
-    with tempfile.TemporaryDirectory(dir=ROOT) as d:
-        root = Path(d)
-        (root / "README.md").write_text("probe content\n", encoding="utf-8")
-        mission = _desktop_probe_mission("desktop_probe_recovery_protocol")
-        mission["desktop_tool_loop_probe"] = dict(mission["desktop_tool_loop_probe"])
-        mission["desktop_tool_loop_probe"]["expected_resolution"] = "recover_after_tool_failure"
-        body = {
-            "model": "mission-a3-deepseek",
-            "input": [{"role": "user", "content": "OSS_HANDOFF_JSON:\n" + json.dumps(mission)}],
-            "tools": [{
-                "type": "function",
-                "name": "exec_command",
-                "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}},
-            }],
-        }
-        stored = []
-        result = build_desktop_tool_loop_probe_response(
-            body=body,
-            raw_model_alias="mission-a3-deepseek",
-            base_messages=[{"role": "user", "content": body["input"][0]["content"]}],
-            project_root=str(root),
-            state_put=stored.append,
-            stored_response_factory=_ProbeStoredResponse,
-            response_id="resp_recovery_probe",
-            created_at=123,
-            new_call_id=lambda prefix: {"call": "call_recovery", "fc": "fc_recovery"}.get(prefix, f"{prefix}_recovery"),
-            json_dumps=lambda payload: json.dumps(payload, sort_keys=True),
-        )
-        assert result.handled is True, result
-        function_call = [item for item in result.response_obj["output"] if item["type"] == "function_call"][0]
-        args = json.loads(function_call["arguments"])
-        assert args["cmd"].startswith("rtk read README.md.__codex_missing_recovery_probe__"), args
-
-        adoption = persist_desktop_tool_loop_adoption(
-            project_root=str(root),
-            stored=stored[0],
-            call_id="call_recovery",
-            tool_output_text="exit_code: 1\nNo such file or directory\n",
-        )
-        assert adoption["status"] == "RECOVERED", adoption
-        mission_dir = root / ".codex-oss" / "missions" / mission["mission_id"]
-        adoption_payload = json.loads((mission_dir / "adoption_or_recovery.json").read_text(encoding="utf-8"))
-        assert adoption_payload["status"] == "RECOVERED", adoption_payload
-        probes_payload = json.loads((mission_dir / "tool_call_adoption_probes.json").read_text(encoding="utf-8"))
-        assert probes_payload["probes"][0]["consumer_adopted"] is True, probes_payload
-        assert probes_payload["probes"][0]["recovery_used"] is True, probes_payload
-        recovery = json.loads((mission_dir / "recovery_proof.json").read_text(encoding="utf-8"))
-        assert recovery["status"] == "RECOVERED", recovery
-        probe_payload = json.loads((mission_dir / "desktop_tool_loop_probe.json").read_text(encoding="utf-8"))
-        assert probe_payload["status"] == "RECOVERED", probe_payload
-
-
-def assert_a5_desktop_probe_continues_to_runtime_implementation():
-    with tempfile.TemporaryDirectory(dir=ROOT) as d:
-        root = Path(d)
-        (root / "README.md").write_text("probe content\n", encoding="utf-8")
-        (root / "tests").mkdir()
-        (root / "tests" / "test_config.py").write_text("def test_existing():\n    assert True\n", encoding="utf-8")
-        mission = _desktop_probe_mission("desktop_probe_a5_implementation_protocol")
-        mission.update({
-            "tier": "A5",
-            "mode": "bounded_implementation",
-            "objective": "Append a focused test in the owned test file after Desktop tool-loop adoption.",
-            "write_allowed": True,
-            "owned_paths": ["tests/test_config.py"],
-            "read_only_paths": ["README.md", "tests/test_config.py"],
-            "allowed_paths": ["README.md", "tests/test_config.py"],
-            "allowed_tool_classes": ["read", "search"],
-            "required_outputs": ["patch", "verification", "rollback"],
-            "max_files_changed": 1,
-            "verification_policy": {
-                "allowed_commands": [["python3", "-m", "py_compile", "tests/test_config.py"]],
-                "max_commands": 1,
-                "timeout_seconds": 20,
-            },
-            "apply_mode": "isolated_worktree",
-        })
-        patch_intent = {
-            "patch_intent_version": "1.0",
-            "summary": "Append a py_compile-safe test function.",
-            "edits": [{
-                "path": "tests/test_config.py",
-                "operation": "append_to_file",
-                "content": "\n\ndef test_desktop_probe_a5_marker():\n    assert True\n",
-                "reason": "Add a bounded implementation marker test.",
-            }],
-            "verification_plan": [{
-                "command": ["python3", "-m", "py_compile", "tests/test_config.py"],
-                "reason": "Compile the changed test file.",
-            }],
-            "evidence_refs": ["file:tests/test_config.py"],
-            "caveats": [],
-        }
-        handoff = (
-            "OSS_HANDOFF_JSON:\n"
-            + json.dumps(mission)
-            + "\n<OSS_PATCH_INTENT_JSON>\n"
-            + json.dumps(patch_intent)
-            + "\n</OSS_PATCH_INTENT_JSON>\n"
-        )
-        body = {
-            "model": "mission-a5-deepseek",
-            "input": [{"role": "user", "content": handoff}],
-            "tools": [{
-                "type": "function",
-                "name": "exec_command",
-                "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}},
-            }],
-        }
-        stored = []
-        result = build_desktop_tool_loop_probe_response(
-            body=body,
-            raw_model_alias="mission-a5-deepseek",
-            base_messages=[{"role": "user", "content": handoff}],
-            project_root=str(root),
-            state_put=stored.append,
-            stored_response_factory=_ProbeStoredResponse,
-            response_id="resp_a5_probe",
-            created_at=123,
-            new_call_id=lambda prefix: {"call": "call_a5", "fc": "fc_a5"}.get(prefix, f"{prefix}_a5"),
-            json_dumps=lambda payload: json.dumps(payload, sort_keys=True),
-        )
-        assert result.handled is True, result
-        adoption = persist_desktop_tool_loop_adoption(
-            project_root=str(root),
-            stored=stored[0],
-            call_id="call_a5",
-            tool_output_text="probe content\n",
-        )
-        assert adoption["implementation_continued"] is True, adoption
-        assert adoption["status"] == "VERIFIED", adoption
-        assert "OSS_IMPLEMENTATION_REPORT_BEGIN" in adoption["report_text"], adoption
-        mission_dir = root / ".codex-oss" / "missions" / mission["mission_id"]
-        report = json.loads((mission_dir / "report.json").read_text(encoding="utf-8"))
-        assert report["status"] == "VERIFIED", report
-        assert report["implementation_authority"]["patch_authority"] == "bridge_runtime", report
-        assert (mission_dir / "canonical_patch_evidence.json").exists(), list(mission_dir.iterdir())
-        adoption_payload = json.loads((mission_dir / "adoption_or_recovery.json").read_text(encoding="utf-8"))
-        assert adoption_payload["status"] == "PASS", adoption_payload
-
-
 def main():
     assert_malformed_handoff_fails_closed()
     assert_visible_commentary_projection_preserves_identity()
@@ -2763,6 +2454,7 @@ def main():
     assert_obsolete_grouped_pending_read_does_not_downgrade_completed_floor()
     assert_blocked_read_outputs_do_not_count_as_successful_inspections()
     assert_declared_read_floor_completes_before_pending_adoption_recovery()
+    assert_human_mission_read_floor_allows_punctuation_and_negative_write_constraints()
     assert_server_side_read_completion_falls_back_when_model_report_invalid()
     assert_model_read_narrative_strips_authority_lines_before_merge()
     assert_model_read_narrative_accepts_natural_findings_without_magic_heading()
@@ -2776,11 +2468,6 @@ def main():
     assert_inline_required_paths_ignore_negative_mentions()
     assert_streamed_read_finalizer_sends_heartbeats_while_blocked()
     assert_doctor_rejects_embedded_mission_examples_in_agreements()
-    assert_desktop_tool_loop_probe_schema_is_fail_closed()
-    assert_desktop_probe_resolver_uses_incoming_manifest_only()
-    assert_desktop_probe_emits_adoptable_responses_function_call_and_artifacts()
-    assert_desktop_probe_recovery_records_injected_failure()
-    assert_a5_desktop_probe_continues_to_runtime_implementation()
     print("PASS: OSS bridge protocol conformance suite")
 
 

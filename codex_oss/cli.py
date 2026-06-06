@@ -256,10 +256,9 @@ def main():
     certify = sub.add_parser("certify", help="Run explicit certification gates and write certification artifacts")
     certify.add_argument("--project", type=str, default=None, help="Project root path")
     certify.add_argument("--target", choices=["runtime_backed", "open_investigation", "repo_hygiene", "raw_free_editing_smoke", "raw_free_editing", "native-like", "desktop-gold", "oss-native-parity", "all"], default="all")
-    certify.add_argument("--mission-id", default="", help="Mission ID for native-like/desktop-gold/oss-native-parity targets; defaults to latest mission artifact")
-    certify.add_argument("--handoff", default="", help="Canonical MissionV1 handoff file for --target native-like")
-    certify.add_argument("--transcript", default="", help="Captured Codex Desktop transcript for native-like/desktop-gold targets")
-    certify.add_argument("--route-authority", default="", help="RouteAuthorityV1 JSON file for native-like/desktop-gold targets")
+    certify.add_argument("--mission-id", default="", help="Mission ID for native-like/desktop-gold/oss-native-parity targets")
+    certify.add_argument("--run-id", default="", help="Event-backed run ID for native-like/desktop-gold targets")
+    certify.add_argument("--run-manifest", default="", help="RunManifestV1 JSON file for aggregate oss-native-parity")
     certify.add_argument("--no-refresh", action="store_true", help="Do not regenerate proof/operational evidence before certification")
     certify.add_argument("--json", action="store_true", help="Machine-readable output")
 
@@ -699,23 +698,21 @@ def main():
             report = certify_native_like_project(
                 project_root,
                 mission_id=args.mission_id,
-                handoff_path=args.handoff,
-                transcript_path=args.transcript,
-                route_authority_path=args.route_authority,
+                run_id=args.run_id,
             )
         elif args.target == "desktop-gold":
             from codex_oss.native_certification import certify_desktop_gold_project
             report = certify_desktop_gold_project(
                 project_root,
                 mission_id=args.mission_id,
-                transcript_path=args.transcript,
-                route_authority_path=args.route_authority,
+                run_id=args.run_id,
             )
         elif args.target == "oss-native-parity":
             from codex_oss.native_certification import certify_oss_native_parity_project
             report = certify_oss_native_parity_project(
                 project_root,
                 mission_id=args.mission_id,
+                run_manifest_path=args.run_manifest,
             )
         else:
             report = certify_project(project_root, target=args.target, refresh=not bool(args.no_refresh))

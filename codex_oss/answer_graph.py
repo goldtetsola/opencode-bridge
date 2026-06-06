@@ -58,7 +58,7 @@ def refresh_answer_graph(
         requirement_views = []
         for requirement in list(obligation.get("source_requirements", []) or []):
             requirement_views.append(_source_requirement_view(requirement, inspected_paths, command_refs, file_entries))
-            declared_requirement_paths.add(str(requirement.get("path", "") or ""))
+            declared_requirement_paths.add(_canonical_path_key(str(requirement.get("path", "") or "")))
         evidence_refs = _obligation_evidence_refs(obligation, claims, ledger, command_refs, requirement_views)
         linked_claims = _obligation_claim_ids(obligation, claims, requirement_views)
         missing_evidence = _missing_evidence_for_requirements(requirement_views)
@@ -77,7 +77,7 @@ def refresh_answer_graph(
         agenda_items.extend(_agenda_items_for_obligation(obligation_view))
 
     for path in list(plan.get("must_inspect", []) or []):
-        if not path or path in declared_requirement_paths:
+        if not path or _canonical_path_key(path) in declared_requirement_paths:
             continue
         source_state = _global_must_inspect_source_state(path, file_entries, command_refs)
         agenda_items.append({
@@ -524,6 +524,7 @@ def _fallback_obligations(mission: Any) -> list[dict[str, Any]]:
 
 def _source_requirement_view(requirement: dict[str, Any], inspected_paths: set[str], command_refs: list[dict[str, Any]], file_entries: dict[str, Any] | None = None) -> dict[str, Any]:
     path = str(requirement.get("path", "") or "")
+    path_key = _canonical_path_key(path)
     evidence_plane = _evidence_plane(requirement)
     command_requirement = dict(requirement.get("command_requirement", {}) or {})
     pattern = str(requirement.get("pattern", "") or command_requirement.get("pattern", "") or "")
@@ -531,7 +532,7 @@ def _source_requirement_view(requirement: dict[str, Any], inspected_paths: set[s
     failed_reads = []
     successful_read = False
     for item in command_refs:
-        if path and path == item.get("path"):
+        if path_key and path_key == _canonical_path_key(str(item.get("path") or "")):
             if evidence_plane == "command_result":
                 evidence_refs.append(str(item.get("ref")))
                 continue
@@ -540,16 +541,14 @@ def _source_requirement_view(requirement: dict[str, Any], inspected_paths: set[s
                 evidence_refs.append(str(item.get("ref")))
             else:
                 failed_reads.append(str(item.get("ref")))
-    file_entry = (file_entries or {}).get(path)
-    file_read_success = bool(
-        file_entry is not None
-        and getattr(file_entry, "complete", False)
-        and os.path.exists(path)
-        and (getattr(file_entry, "cached_text", "") or getattr(file_entry, "sha256", ""))
-    )
+    file_entry = {
+        _canonical_path_key(key): value
+        for key, value in (file_entries or {}).items()
+    }.get(path_key)
+    file_read_success = _file_entry_has_successful_content(file_entry)
     if file_read_success:
         successful_read = True
-        evidence_refs.append(f"file:{path}#extract:1")
+        evidence_refs.append(f"file:{path_key}#extract:1")
     required_shapes = [str(shape) for shape in (requirement.get("required_shapes", []) or []) if str(shape)]
     detected_shapes = _detected_shapes_for_path(path, requirement) if evidence_plane != "command_result" else _detected_command_shapes(path, command_refs)
     shape_match_policy = str(requirement.get("shape_match_policy", "") or "") or "all"
@@ -616,7 +615,7 @@ def _successful_file_read_paths(file_entries: dict[str, Any] | None) -> set[str]
     paths: set[str] = set()
     for path, entry in (file_entries or {}).items():
         if _file_entry_has_successful_content(entry):
-            paths.add(str(path))
+            paths.add(_canonical_path_key(str(path)))
     return paths
 
 
@@ -624,18 +623,32 @@ def _file_entry_has_successful_content(entry: Any) -> bool:
     return bool(
         entry is not None
         and getattr(entry, "complete", False)
-        and (getattr(entry, "cached_text", "") or getattr(entry, "sha256", ""))
+        and (getattr(entry, "cached_text", "") or getattr(entry, "full_content_cached", False))
     )
 
 
+def _canonical_path_key(path: str) -> str:
+    value = str(path or "").strip().strip("'\"")
+    if value.startswith("/"):
+        root = os.path.realpath(os.getcwd())
+        real = os.path.realpath(value)
+        if real == root or real.startswith(root + os.sep):
+            return os.path.relpath(real, root)
+    return value
+
+
 def _global_must_inspect_source_state(path: str, file_entries: dict[str, Any] | None, command_refs: list[dict[str, Any]]) -> str:
-    file_entry = (file_entries or {}).get(path)
+    expected = _canonical_path_key(path)
+    file_entry = {
+        _canonical_path_key(key): value
+        for key, value in (file_entries or {}).items()
+    }.get(expected)
     if _file_entry_has_successful_content(file_entry):
         return "read_satisfied"
 
     saw_failed_read = False
     for item in command_refs:
-        if path and path != item.get("path"):
+        if expected and expected != _canonical_path_key(str(item.get("path") or "")):
             continue
         tool_name = str(item.get("tool_name", "") or "")
         if tool_name not in ("rtk_read", "read"):

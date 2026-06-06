@@ -14,6 +14,8 @@ from dataclasses import fields, is_dataclass
 from pathlib import Path
 from typing import Any
 
+from codex_oss.mission_event_bridge import append_finalized_from_report, project_root_from_mission_dir
+from codex_oss.mission_event_log import MissionEventLog
 from codex_oss.read_evidence import build_canonical_read_evidence
 
 JSON = dict[str, Any]
@@ -64,6 +66,9 @@ def write_mission_authority_artifacts(
     _write_json(artifact_path / "mission_summary.json", summary_payload)
     if raw_handoff:
         (artifact_path / "mission_handoff_raw.txt").write_text(raw_handoff, encoding="utf-8")
+    project_root = project_root_from_mission_dir(artifact_path)
+    if project_root:
+        _ensure_admission_event(project_root, canonical, summary_payload)
     return canonical
 
 
@@ -271,67 +276,6 @@ def write_adoption_or_recovery(
     return payload
 
 
-def ensure_derived_desktop_gold_artifacts(mission_dir: str | Path) -> JSON:
-    mission_path = Path(mission_dir)
-    mission_path.mkdir(parents=True, exist_ok=True)
-    mission_id = mission_path.name
-    answer_graph = _read_json(mission_path / "answer_graph.json")
-    coverage_graph = _read_json(mission_path / "coverage_graph.json")
-    claim_graph = _read_json(mission_path / "claim_graph.json")
-    ledger = _read_json(mission_path / "ledger.json")
-    report = _read_json(mission_path / "report.json")
-    outputs: JSON = {"schema_version": "desktop_gold_artifact_backfill.v1", "mission_id": mission_id, "written": []}
-    bundle_path = mission_path / "canonical_evidence_bundle.json"
-    read_path = mission_path / "canonical_read_evidence.json"
-    read_payload = _read_json(read_path)
-    if not bundle_path.exists() and read_payload:
-        entitlement = read_payload.get("status_entitlement") if isinstance(read_payload.get("status_entitlement"), dict) else {}
-        bundle = {
-            "schema_version": "canonical_evidence_bundle.v1",
-            "mission_id": mission_id,
-            "task_class": "read_only",
-            "evidence_authority": "mission_v1_runtime",
-            "source_artifacts": {
-                "canonical_read_evidence": "canonical_read_evidence.json",
-                "report": "report.json",
-            },
-            "required_sources": _str_list(read_payload.get("required_paths")),
-            "observations": read_payload.get("fulfilled_paths", []) if isinstance(read_payload.get("fulfilled_paths"), list) else [],
-            "claims": [],
-            "coverage": {},
-            "coverage_status": read_payload.get("coverage_status", {}) if isinstance(read_payload.get("coverage_status"), dict) else {},
-            "verification": {},
-            "missing_required_sources": _str_list(read_payload.get("missing_required_sources")),
-            "status_entitlement": {
-                "can_complete": bool(entitlement.get("can_complete", False)),
-                "can_return_complete": bool(entitlement.get("can_return_complete", entitlement.get("can_complete", False))),
-                "reason": str(entitlement.get("reason") or "canonical_read_evidence_projection"),
-            },
-        }
-        _write_json(bundle_path, bundle)
-        outputs["written"].append("canonical_evidence_bundle.json")
-    elif not bundle_path.exists() and (answer_graph or ledger or report):
-        write_canonical_evidence_artifacts(
-            artifact_dir=mission_path,
-            mission_id=mission_id,
-            task_class="read_only",
-            answer_graph=answer_graph,
-            coverage_graph=coverage_graph,
-            claim_graph=claim_graph,
-            ledger_payload=ledger,
-            report=report,
-        )
-        outputs["written"].extend(["canonical_evidence_bundle.json", "canonical_read_evidence.json"])
-    elif bundle_path.exists() and not (mission_path / "canonical_read_evidence.json").exists():
-        bundle = _read_json(bundle_path)
-        _write_json(mission_path / "canonical_read_evidence.json", build_canonical_read_projection(bundle, mission_id=mission_id))
-        outputs["written"].append("canonical_read_evidence.json")
-    if not (mission_path / "adoption_or_recovery.json").exists():
-        write_adoption_or_recovery(artifact_dir=mission_path, mission_id=mission_id)
-        outputs["written"].extend(["adoption_or_recovery.json", "tool_call_adoption_probes.json"])
-    return outputs
-
-
 def _files_inspected(ledger_payload: JSON) -> list[JSON]:
     files = ledger_payload.get("files_inspected") if isinstance(ledger_payload.get("files_inspected"), list) else []
     return [dict(item) for item in files if isinstance(item, dict)]
@@ -374,3 +318,27 @@ def _read_json(path: Path) -> JSON:
 def _write_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _ensure_admission_event(project_root: Path, mission: JSON, summary_payload: JSON) -> None:
+    mission_id = str(mission.get("mission_id") or "")
+    if not mission_id:
+        return
+    log = MissionEventLog.for_project(project_root, mission_id, mission_id=mission_id)
+    if any(event.get("event_type") == "MissionAdmitted" for event in log.read_events(verify=True)):
+        append_finalized_from_report(project_root, mission_id, summary_payload)
+        return
+    log.append(
+        "MissionAdmitted",
+        {
+            "task_spec": mission,
+            "risk_tier": str(mission.get("risk_tier") or "low"),
+            "allowed_tool_classes": list(mission.get("allowed_tool_classes") or []),
+            "write_allowed": bool(mission.get("write_allowed", False)),
+            "model_alias": str(summary_payload.get("runtime_model_alias") or summary_payload.get("explorer_model") or ""),
+            "route_class": str(mission.get("mode") or summary_payload.get("route_class") or "managed_investigation"),
+        },
+        source_kind="runtime",
+        authority="runtime_authoritative",
+    )
+    append_finalized_from_report(project_root, mission_id, summary_payload)

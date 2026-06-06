@@ -10,6 +10,8 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Any, Tuple
 
 from codex_oss.native_work_ux import native_work_contract_text
+from codex_oss.native_runtime_contracts import record_phase_receipt
+from codex_oss.tool_turn_transaction import transaction_for_tool_result
 from codex_oss.visible_commentary import model_action_public_message, safe_tool_target_text
 
 JSON = Dict[str, Any]
@@ -1128,6 +1130,17 @@ def run_loop(mission: Any, ledger: Any, call_model_fn, tools, emitter,
                     )
                 ledger.spend_budget()
                 result = _exec_tool(tool_name, executor, action.arguments, path)
+                tool_turn_transaction = transaction_for_tool_result(
+                    call_id=_tool_turn_call_id(mission, len(ledger.commands_run), tool_name),
+                    tool_name=tool_name,
+                    result=result,
+                )
+                phase_receipt = _phase_receipt_for_tool_action(
+                    mission,
+                    action,
+                    result,
+                    phase=_mission_phase(ledger),
+                )
 
                 # Scan for secrets in result
                 if result and result.stdout:
@@ -1157,7 +1170,11 @@ def run_loop(mission: Any, ledger: Any, call_model_fn, tools, emitter,
                     mission, ledger, action, _mission_phase(ledger), "allowed",
                     "tool executed",
                     deadline, raw_arguments, action.arguments, [],
-                    result=_tool_result_summary(result),
+                    result=_tool_result_summary(
+                        result,
+                        tool_turn_transaction=tool_turn_transaction,
+                        phase_receipt=phase_receipt,
+                    ),
                 )
 
                 # Observation
@@ -1442,6 +1459,17 @@ def _runtime_prefetch_required_sources(
             )
         ledger.spend_budget()
         result = _exec_tool(tool_name, executor, action_args, resolved)
+        tool_turn_transaction = transaction_for_tool_result(
+            call_id=_tool_turn_call_id(mission, len(ledger.commands_run), tool_name),
+            tool_name=tool_name,
+            result=result,
+        )
+        phase_receipt = _phase_receipt_for_tool_action(
+            mission,
+            synthetic_action,
+            result,
+            phase=_mission_phase(ledger),
+        )
         if result and result.stdout:
             result.stdout, found_secret = scan_secrets(result.stdout)
             if found_secret:
@@ -1462,7 +1490,11 @@ def _runtime_prefetch_required_sources(
             {"path": raw_path, **({"pattern": pattern} if pattern else {})},
             {"path": resolved, **({"pattern": pattern} if pattern else {})},
             [],
-            result=_tool_result_summary(result),
+            result=_tool_result_summary(
+                result,
+                tool_turn_transaction=tool_turn_transaction,
+                phase_receipt=phase_receipt,
+            ),
         )
         answer_graph = refresh_answer_graph(mission, ledger, reason="runtime_prefetch", persist=True)
         if commentary is not None:
@@ -2311,17 +2343,53 @@ def _write_action_trace(mission: Any, entry: Any) -> None:
         handle.write(json.dumps(payload, sort_keys=True) + "\n")
 
 
-def _tool_result_summary(result: Any) -> dict:
-    if not result:
-        return {}
-    return {
-        "exit_code": getattr(result, "exit_code", None),
-        "stdout_chars": len(getattr(result, "stdout", "") or ""),
-        "stderr_chars": len(getattr(result, "stderr", "") or ""),
-        "matches_count": (getattr(result, "stdout", "") or "").count("\n"),
-        "complete": bool(getattr(result, "complete", False)),
-        "redactions_applied": bool(getattr(result, "redactions_applied", False)),
+def _tool_turn_call_id(mission: Any, turn: int, tool_name: str) -> str:
+    mission_id = str(getattr(mission, "mission_id", "mission") or "mission")
+    safe_tool = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(tool_name or "tool"))
+    return f"{mission_id}:tool:{turn}:{safe_tool}"
+
+
+def _phase_receipt_for_tool_action(mission: Any, action: Any, result: Any, *, phase: str) -> dict:
+    phase_name = "verify" if str(phase or "").upper() in {"VERIFY", "REPORT"} else "execute"
+    prompt = str(getattr(action, "reason", "") or getattr(action, "hypothesis", "") or getattr(action, "tool_name", "") or "")
+    args = getattr(action, "arguments", {}) if isinstance(getattr(action, "arguments", {}), dict) else {}
+    outputs = {
+        "exit_code": str(getattr(result, "exit_code", "")),
+        "stdout_sha256": str(getattr(result, "sha256", "") or ""),
+        "complete": str(bool(getattr(result, "complete", False))),
     }
+    return record_phase_receipt(
+        phase=phase_name,
+        prompt=prompt,
+        inputs={"arguments": json.dumps(args, sort_keys=True)},
+        outputs={key: str(value) for key, value in outputs.items()},
+        model=str(getattr(mission, "last_reasoning_model", "") or getattr(mission, "runtime_model_alias", "") or ""),
+        status="COMPLETE" if bool(getattr(result, "complete", False)) else "FAILED",
+    )
+
+
+def _tool_result_summary(
+    result: Any,
+    *,
+    tool_turn_transaction: Optional[dict] = None,
+    phase_receipt: Optional[dict] = None,
+) -> dict:
+    if not result:
+        summary: dict[str, Any] = {}
+    else:
+        summary = {
+            "exit_code": getattr(result, "exit_code", None),
+            "stdout_chars": len(getattr(result, "stdout", "") or ""),
+            "stderr_chars": len(getattr(result, "stderr", "") or ""),
+            "matches_count": (getattr(result, "stdout", "") or "").count("\n"),
+            "complete": bool(getattr(result, "complete", False)),
+            "redactions_applied": bool(getattr(result, "redactions_applied", False)),
+        }
+    if tool_turn_transaction is not None:
+        summary["tool_turn_transaction"] = dict(tool_turn_transaction)
+    if phase_receipt is not None:
+        summary["phase_receipt"] = dict(phase_receipt)
+    return summary
 
 
 def _estimate_information_gain(decision: str, result: dict) -> str:

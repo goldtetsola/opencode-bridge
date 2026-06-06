@@ -1491,6 +1491,13 @@ INTENT_PATTERNS = (
 
 MIN_REPORT_LENGTH = 80
 
+
+def _normalized_task_type(value: object) -> str:
+    """Return a stable task type token from human-readable handoff text."""
+    token = str(value or "").strip().lower()
+    token = re.sub(r"[^a-z0-9_ -]+$", "", token)
+    return re.sub(r"[\s-]+", "_", token)
+
 def parse_task_envelope(handoff_text: str) -> dict:
     """Parse structured task fields from OSS handoff text."""
     structured = _structured_handoff_to_envelope(handoff_text)
@@ -1514,9 +1521,9 @@ def parse_task_envelope(handoff_text: str) -> dict:
     if goal_section:
         envelope["goal"] = goal_section
     if task_type_section:
-        envelope["task_type"] = task_type_section
+        envelope["task_type"] = _normalized_task_type(task_type_section)
     elif "TASK TYPE:" in upper_all:
-        envelope["task_type"] = _extract_after(merged, "TASK TYPE:")
+        envelope["task_type"] = _normalized_task_type(_extract_after(merged, "TASK TYPE:"))
 
     read_section = _extract_labeled_section(handoff_text, "READ-ONLY PATHS")
     owned_section = _extract_labeled_section(handoff_text, "OWNED PATHS")
@@ -3556,17 +3563,26 @@ def verification_contract_requested(envelope: dict) -> bool:
     return False
 
 
+def _strip_negated_mutation_phrases(text: str) -> str:
+    """Remove safety constraints like 'do not modify files' before intent scanning."""
+    return re.sub(
+        r"\b(?:do not|don't|never|no)\s+(?:write|edit|append|patch|modify|change|mutate)\b[^.;,\n]*",
+        "",
+        text,
+    )
+
+
 def declared_read_floor_only(envelope: dict) -> bool:
     """Return true for simple read-only source floors the bridge can safely complete."""
     if not envelope.get("read_only_paths"):
         return False
     if envelope.get("write_allowed") or envelope.get("owned_paths"):
         return False
-    task_type = str(envelope.get("task_type") or "").strip().lower()
+    task_type = _normalized_task_type(envelope.get("task_type"))
     if task_type in {"bounded_write", "bounded_test_write", "implementation", "docs_support"}:
         return False
     for step in envelope.get("verification_steps", []):
-        lowered = str(step or "").lower()
+        lowered = _strip_negated_mutation_phrases(str(step or "").lower())
         if any(token in lowered for token in (
             "grep", "search", "find ", "locate", "test", "lint", "typecheck",
             "write", "edit", "append", "patch", "modify", "changed", "after the edit",
@@ -5452,39 +5468,6 @@ class Handler(BaseHTTPRequestHandler):
                 self._handle_continuation(body)
                 return
 
-            from codex_oss.desktop_tool_loop_probe import (
-                build_desktop_tool_loop_probe_response,
-                mission_requests_desktop_tool_loop_probe,
-            )
-            if mission_requests_desktop_tool_loop_probe(body):
-                base_messages, _ = extract_request_messages_and_tool_outputs(body)
-                response_id = new_id("resp")
-                created_at = now()
-                probe = build_desktop_tool_loop_probe_response(
-                    body=body,
-                    raw_model_alias=raw_model_alias,
-                    base_messages=base_messages,
-                    project_root=os.getcwd(),
-                    state_put=APP.state.put,
-                    stored_response_factory=StoredResponse,
-                    response_id=response_id,
-                    created_at=created_at,
-                    new_call_id=new_id,
-                    json_dumps=json_dumps,
-                )
-                if probe.handled:
-                    APP.log(
-                        "desktop_tool_loop_probe_route",
-                        mission_id=probe.mission_id,
-                        status=probe.status,
-                        reason=probe.reason,
-                    )
-                    if body.get("stream"):
-                        self._send_sse(probe.response_obj or APP.build_response_shell(body, raw_model_alias, response_id, created_at=created_at))
-                    else:
-                        self._send_json(200, probe.response_obj or APP.build_response_shell(body, raw_model_alias, response_id, created_at=created_at))
-                    return
-
             # ── v1 spec: A2/A3 managed investigation via runtime loop ──
             from codex_oss.managed_bridge import run_managed_mission_from_body, should_handle_managed_mission_body
             managed_emitter = None
@@ -5682,44 +5665,6 @@ class Handler(BaseHTTPRequestHandler):
                     sm.mark_completed(tool_call_id, tool_output_text)
                     adoption_state_machine_to_response(sm, prev_state)
                     APP.state.put(prev_state)
-                    try:
-                        from codex_oss.desktop_tool_loop_probe import persist_desktop_tool_loop_adoption
-                        probe_adoption = persist_desktop_tool_loop_adoption(
-                            project_root=os.getcwd(),
-                            stored=prev_state,
-                            call_id=tool_call_id,
-                            tool_output_text=tool_output_text,
-                        )
-                        if probe_adoption.get("handled"):
-                            APP.log(
-                                "desktop_tool_loop_probe_adopted",
-                                mission_id=probe_adoption.get("mission_id"),
-                                call_id=tool_call_id,
-                            )
-                            emitter = ResponseEmitter(self, new_id("resp"), model_alias, bool(body.get("stream")))
-                            report_text = str(probe_adoption.get("report_text") or "")
-                            if report_text:
-                                emitter.emit_text_message(report_text, phase="final_answer")
-                            else:
-                                outcome = str(probe_adoption.get("status") or "PASS").upper()
-                                if outcome == "RECOVERED":
-                                    summary = "Desktop recovery probe complete."
-                                    detail = "Outcome: recovered after Desktop returned the tool result."
-                                else:
-                                    summary = "Desktop tool-loop probe complete."
-                                    detail = "Outcome: Desktop adopted and returned the tool result."
-                                emitter.emit_text_message(
-                                    f"{summary}\n"
-                                    f"Mission: {probe_adoption.get('mission_id')}\n"
-                                    f"Tool call adopted: {tool_call_id}\n"
-                                    f"{detail}\n"
-                                    "Confidence: high",
-                                    phase="final_answer",
-                                )
-                            emitter.complete()
-                            return
-                    except Exception as exc:
-                        APP.log("desktop_tool_loop_probe_adoption_persist_failed", error=str(exc))
             # Try to find the tool name from the stored messages
             for msg in prev_state.messages:
                 tool_calls = msg.get("tool_calls") or []
